@@ -1,5 +1,5 @@
 mod commitment;
-mod types;
+pub mod types;
 mod storage;
 mod normalizer;
 mod decoder;

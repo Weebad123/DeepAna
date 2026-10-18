@@ -4,4 +4,32 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
+
+# Solana
+solana-client.workspace = true
+solana-sdk.workspace = true
+solana-transaction-status.workspace = true
+solana-account-decoder.workspace = true
+anchor-lang.workspace = true
+borsh.workspace = true
+
+# SPL
+spl-token.workspace = true
+spl-token-2022.workspace = true
+spl-associated-token-account.workspace = true
+
+# Arrow / Parquet
+arrow.workspace = true
+parquet.workspace = true
+arrow-schema.workspace = true
+
+# Utilities
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+backoff.workspace = true
+dashmap.workspace = true
+bs58.workspace = true
