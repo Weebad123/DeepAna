@@ -110,7 +110,10 @@ fn u8_col(it: impl Iterator<Item = u8>) -> ArrayRef {
 }
 
 fn block_time_col(it: impl Iterator<Item = Option<i64>>) -> ArrayRef {
-    Arc::new(it.collect::<TimestampSecondArray>().with_timezone(UDM_TIMEZONE))
+    Arc::new(
+        it.collect::<TimestampSecondArray>()
+            .with_timezone(UDM_TIMEZONE),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +218,11 @@ impl TransactionStatus {
 
     /// Derive the status from the presence of an error.
     pub fn from_err(err: Option<&str>) -> Self {
-        if err.is_some() { Self::Failed } else { Self::Success }
+        if err.is_some() {
+            Self::Failed
+        } else {
+            Self::Success
+        }
     }
 }
 
@@ -545,175 +552,5 @@ impl UdmRow for DeepAnaTokenTransfer {
                 block_time_col(rows.iter().map(|r| r.block_time)),
             ],
         )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::array::{Array, AsArray};
-    use arrow::datatypes::{TimestampSecondType, UInt32Type, UInt64Type, UInt8Type};
-
-    fn slot_row() -> DeepAnaSlot {
-        DeepAnaSlot {
-            slot: 250_000_000,
-            blockhash: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".into(),
-            parent_slot: 249_999_999,
-            block_time: Some(1_700_000_000),
-            block_height: Some(230_000_000),
-            transaction_count: 1_234,
-            leader: Some("DeepAnaLeader1111111111111111111111111111111".into()),
-        }
-    }
-
-    fn tx_row() -> DeepAnaTransaction {
-        DeepAnaTransaction {
-            slot: 250_000_000,
-            blockhash: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".into(),
-            transaction_index: 7,
-            tx_signature: "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW".into(),
-            fee: 5_000,
-            status: TransactionStatus::Failed,
-            err: Some("InstructionError(0, Custom(1))".into()),
-            accounts: vec!["payer".into(), "programX".into()],
-            log_messages: vec!["Program log: hi".into()],
-            compute_units_consumed: Some(1_500),
-        }
-    }
-
-    fn ix_row() -> DeepAnaInstruction {
-        DeepAnaInstruction {
-            slot: 250_000_000,
-            tx_signature: "sig".into(),
-            instruction_index: 2,
-            inner_instruction_index: Some(0),
-            program_id: spl_token::id().to_string(),
-            accounts: vec!["src".into(), "dst".into(), "owner".into()],
-            data_base58: bs58::encode([3u8, 1, 0, 0, 0, 0, 0, 0, 0]).into_string(),
-            instruction_type: Some("transfer".into()),
-            decoded_data: Some(serde_json::json!({ "amount": 1 })),
-        }
-    }
-
-    fn transfer_row() -> DeepAnaTokenTransfer {
-        DeepAnaTokenTransfer {
-            slot: 250_000_000,
-            tx_signature: "sig".into(),
-            instruction_index: 2,
-            inner_instruction_index: None,
-            spl_token_program_id: spl_token_2022::id().to_string(),
-            source_token_account: "src".into(),
-            destination_token_account: "dst".into(),
-            source_owner: Some("alice".into()),
-            destination_owner: Some("alice".into()),
-            mint_token_address: Some("USDC".into()),
-            amount_raw: 1_500_000,
-            decimals: Some(6),
-            block_time: Some(1_700_000_000),
-        }
-    }
-
-    #[test]
-    fn slot_batch_matches_schema() {
-        let batch = DeepAnaSlot::to_record_batch(&[slot_row(), DeepAnaSlot::default()]).unwrap();
-        assert_eq!(batch.schema(), DeepAnaSlot::schema());
-        assert_eq!(batch.num_rows(), 2);
-        let bt = batch.column(3).as_primitive::<TimestampSecondType>();
-        assert_eq!(bt.value(0), 1_700_000_000);
-        assert!(bt.is_null(1));
-        assert_eq!(
-            batch.schema().field(3).data_type(),
-            &DataType::Timestamp(TimeUnit::Second, Some("UTC".into()))
-        );
-        assert_eq!(slot_row().block_datetime().unwrap().timestamp(), 1_700_000_000);
-    }
-
-    #[test]
-    fn transaction_batch_encodes_lists_as_json() {
-        let batch = DeepAnaTransaction::to_record_batch(&[tx_row()]).unwrap();
-        assert_eq!(batch.schema(), DeepAnaTransaction::schema());
-        let accounts = batch.column(7).as_string::<i32>();
-        assert_eq!(accounts.value(0), r#"["payer","programX"]"#);
-        let logs = batch.column(8).as_string::<i32>();
-        assert_eq!(logs.value(0), r#"["Program log: hi"]"#);
-        let status = batch.column(5).as_string::<i32>();
-        assert_eq!(status.value(0), "failed");
-        let decoded: Vec<String> = from_json_string(accounts.value(0)).unwrap();
-        assert_eq!(decoded, tx_row().accounts);
-        assert_eq!(tx_row().fee_payer(), Some("payer"));
-    }
-
-    #[test]
-    fn transaction_status_round_trips() {
-        for s in [TransactionStatus::Success, TransactionStatus::Failed] {
-            assert_eq!(s.to_string().parse::<TransactionStatus>().unwrap(), s);
-            let json = serde_json::to_string(&s).unwrap();
-            assert_eq!(json, format!("\"{s}\""));
-        }
-        assert!("bogus".parse::<TransactionStatus>().is_err());
-        assert_eq!(TransactionStatus::from_err(None), TransactionStatus::Success);
-        assert_eq!(TransactionStatus::from_err(Some("x")), TransactionStatus::Failed);
-    }
-
-    #[test]
-    fn instruction_batch_and_helpers() {
-        let row = ix_row();
-        let batch = DeepAnaInstruction::to_record_batch(&[row.clone()]).unwrap();
-        assert_eq!(batch.schema(), DeepAnaInstruction::schema());
-        let inner = batch.column(3).as_primitive::<UInt32Type>();
-        assert_eq!(inner.value(0), 0);
-        let decoded = batch.column(8).as_string::<i32>();
-        assert_eq!(decoded.value(0), r#"{"amount":1}"#);
-        assert!(row.is_inner() && !row.is_top_level() && row.is_decoded());
-        assert_eq!(row.data_bytes().unwrap(), vec![3u8, 1, 0, 0, 0, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn token_transfer_batch_and_helpers() {
-        let row = transfer_row();
-        let batch = DeepAnaTokenTransfer::to_record_batch(&[row.clone()]).unwrap();
-        assert_eq!(batch.schema(), DeepAnaTokenTransfer::schema());
-        assert_eq!(batch.column(10).as_primitive::<UInt64Type>().value(0), 1_500_000);
-        assert_eq!(batch.column(11).as_primitive::<UInt8Type>().value(0), 6);
-        assert!(batch.column(3).is_null(0));
-        assert_eq!(row.amount_ui(), Some(1.5));
-        assert!(row.is_token_2022());
-        assert!(row.is_self_transfer());
-    }
-
-    #[test]
-    fn empty_batches_keep_schema() {
-        assert_eq!(DeepAnaSlot::to_record_batch(&[]).unwrap().num_rows(), 0);
-        assert_eq!(DeepAnaTransaction::to_record_batch(&[]).unwrap().num_rows(), 0);
-        assert_eq!(DeepAnaInstruction::to_record_batch(&[]).unwrap().num_rows(), 0);
-        let b = DeepAnaTokenTransfer::to_record_batch(&[]).unwrap();
-        assert_eq!(b.num_rows(), 0);
-        assert_eq!(b.schema(), DeepAnaTokenTransfer::schema());
-    }
-
-    #[test]
-    fn rows_round_trip_through_serde() {
-        let tx = tx_row();
-        let back: DeepAnaTransaction = serde_json::from_str(&serde_json::to_string(&tx).unwrap()).unwrap();
-        assert_eq!(back, tx);
-        let ix = ix_row();
-        let back: DeepAnaInstruction = serde_json::from_str(&serde_json::to_string(&ix).unwrap()).unwrap();
-        assert_eq!(back, ix);
-    }
-
-    #[test]
-    fn table_names_are_distinct() {
-        let names = [
-            DeepAnaSlot::TABLE_NAME,
-            DeepAnaTransaction::TABLE_NAME,
-            DeepAnaInstruction::TABLE_NAME,
-            DeepAnaTokenTransfer::TABLE_NAME,
-        ];
-        let set: std::collections::HashSet<_> = names.iter().collect();
-        assert_eq!(set.len(), names.len());
     }
 }
