@@ -33,3 +33,11 @@ thiserror.workspace = true
 backoff.workspace = true
 dashmap.workspace = true
 bs58.workspace = true
+
+# Async
+tokio.workspace = true
+async-trait.workspace = true
+governor.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

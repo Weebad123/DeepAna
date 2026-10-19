@@ -5,7 +5,7 @@ mod normalizer;
 mod decoder;
 mod ingestor;
 mod slot_processor;
-mod adapter;
+pub mod adapter;
 mod account_resolver;
 mod changelog;
 

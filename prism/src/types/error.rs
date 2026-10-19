@@ -9,7 +9,7 @@
 //!
 //! | Stage                       | Variants                                                               |
 //! |-----------------------------|------------------------------------------------------------------------|
-//! | `adapter/solana.rs`         | [`RpcError`], [`RateLimitError`]                                       |
+//! | `adapter/solana.rs`         | [`RpcError`], [`RateLimitError`], [`SlotSkipped`]                      |
 //! | `slot_processor/fetcher.rs` | [`RpcError`], [`RateLimitError`], [`SlotSkipped`]                      |
 //! | `normalizer/instruction.rs` | [`DeserializeError`]                                                   |
 //! | `decoder/spl_token.rs`      | [`DecodeError`]                                                        |
