@@ -138,6 +138,16 @@ impl SolanaAdapter {
     /// custom transport. `config.rpc_url` and `request_timeout_ms` are then
     /// the client's business and are not applied.
     pub fn with_client(config: SolanaAdapterConfig, client: RpcClient) -> PrismResult<Self> {
+        Self::with_shared_client(config, Arc::new(client))
+    }
+
+    /// Like [`Self::with_client`], for a client that is already shared, such
+    /// as the one an SDK hands out (the Helius SDK keeps its async client
+    /// behind an `Arc`).
+    pub fn with_shared_client(
+        config: SolanaAdapterConfig,
+        client: Arc<RpcClient>,
+    ) -> PrismResult<Self> {
         config.validate()?;
         let requests_per_second = NonZeroU32::new(config.requests_per_second)
             .ok_or_else(|| PrismError::config("requests_per_second", "must be greater than 0"))?;
@@ -147,7 +157,7 @@ impl SolanaAdapter {
         let quota = Quota::per_second(requests_per_second).allow_burst(NonZeroU32::MIN);
         Ok(Self {
             config,
-            client: Arc::new(client),
+            client,
             rate_limiter: Arc::new(RateLimiter::direct(quota)),
             metrics: Arc::new(AdapterMetrics::default()),
         })

@@ -3,7 +3,7 @@ pub mod types;
 mod storage;
 mod normalizer;
 mod decoder;
-mod ingestor;
+pub mod ingestor;
 mod slot_processor;
 pub mod adapter;
 mod account_resolver;

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "prism"
+    "prism",
 ]
 
 
@@ -10,12 +10,14 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 
 # Solana
-solana-client = "4.3.2"
+# 4.3.0, not newer: the helius SDK pins solana-client, solana-account-decoder
+# and the transaction-status types to exactly =4.3.0.
+solana-client = "4.3.0"
 solana-sdk = "4.1.0"
 # Without `agave-unstable-api` this crate compiles to nothing (the whole lib is
 # gated on it), so none of its block / transaction types would be importable.
-solana-transaction-status = { version = "4.3.2", features = ["agave-unstable-api"] }
-solana-account-decoder = "4.3.2"
+solana-transaction-status = { version = "4.3.0", features = ["agave-unstable-api"] }
+solana-account-decoder = "4.3.0"
 anchor-lang = "1.2.1"
 borsh = "1.8.1"
 
