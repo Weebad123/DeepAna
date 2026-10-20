@@ -6,8 +6,11 @@
 //! carries the exact Parquet paths that were written for a slot, so a
 //! subscriber knows which files to open without listing a directory.
 //!
-//! Events are emitted strictly once per slot, in slot order, after the slot's
-//! Parquet files are durably written. Wire format is JSON (see
+//! `New` and `Skip` events are emitted strictly once per slot, in slot order,
+//! after the slot's Parquet files are durably written. [`ChangeEvent::Final`]
+//! is a separate, coarser signal emitted by the commitment tracker whenever the
+//! finalized watermark moves: it says which slots, and so which already
+//! written files, can no longer be invalidated. Wire format is JSON (see
 //! [`ChangeEvent::to_json`]), with a top-level `"event"` discriminator so the
 //! stream stays forward-compatible when new variants are added.
 
@@ -103,6 +106,19 @@ pub enum ChangeEvent {
         /// Why it was skipped.
         reason: SkipReason,
     },
+    /// The finalized watermark advanced: every slot at or below `slot` is now
+    /// finalized and can never be rolled back. Rows written with
+    /// `is_finalized = false` for slots in `previous_slot + 1..=slot` are now
+    /// permanent.
+    Final {
+        /// The new finalized watermark.
+        slot: u64,
+        /// Blockhash of `slot`.
+        blockhash: String,
+        /// The watermark announced by the previous `Final` event (0 for the
+        /// first one of a run).
+        previous_slot: u64,
+    },
 }
 
 impl ChangeEvent {
@@ -125,10 +141,19 @@ impl ChangeEvent {
         Self::Skip { slot, reason }
     }
 
+    /// Build a [`ChangeEvent::Final`].
+    pub fn finalized(slot: u64, blockhash: impl Into<String>, previous_slot: u64) -> Self {
+        Self::Final {
+            slot,
+            blockhash: blockhash.into(),
+            previous_slot,
+        }
+    }
+
     /// The slot this event is about. Every variant has one.
     pub const fn slot(&self) -> u64 {
         match self {
-            Self::New { slot, .. } | Self::Skip { slot, .. } => *slot,
+            Self::New { slot, .. } | Self::Skip { slot, .. } | Self::Final { slot, .. } => *slot,
         }
     }
 
@@ -137,6 +162,7 @@ impl ChangeEvent {
         match self {
             Self::New { .. } => "new",
             Self::Skip { .. } => "skip",
+            Self::Final { .. } => "final",
         }
     }
 
@@ -148,11 +174,15 @@ impl ChangeEvent {
         matches!(self, Self::Skip { .. })
     }
 
-    /// Parquet paths written for this event. Empty for skips.
+    pub const fn is_final(&self) -> bool {
+        matches!(self, Self::Final { .. })
+    }
+
+    /// Parquet paths written for this event. Empty for skips and finals.
     pub fn parquet_paths(&self) -> &[String] {
         match self {
             Self::New { parquet_paths, .. } => parquet_paths,
-            Self::Skip { .. } => &[],
+            Self::Skip { .. } | Self::Final { .. } => &[],
         }
     }
 
@@ -160,7 +190,7 @@ impl ChangeEvent {
     pub const fn skip_reason(&self) -> Option<SkipReason> {
         match self {
             Self::Skip { reason, .. } => Some(*reason),
-            Self::New { .. } => None,
+            Self::New { .. } | Self::Final { .. } => None,
         }
     }
 
@@ -168,7 +198,7 @@ impl ChangeEvent {
     pub fn block_datetime(&self) -> Option<DateTime<Utc>> {
         match self {
             Self::New { block_time, .. } => block_time.and_then(unix_to_datetime),
-            Self::Skip { .. } => None,
+            Self::Skip { .. } | Self::Final { .. } => None,
         }
     }
 
@@ -199,6 +229,14 @@ impl fmt::Display for ChangeEvent {
                 parquet_paths.len()
             ),
             Self::Skip { slot, reason } => write!(f, "skip slot={slot} reason={reason}"),
+            Self::Final {
+                slot,
+                blockhash,
+                previous_slot,
+            } => write!(
+                f,
+                "final slot={slot} blockhash={blockhash} previous={previous_slot}"
+            ),
         }
     }
 }

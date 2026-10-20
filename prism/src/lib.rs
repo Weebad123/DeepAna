@@ -1,4 +1,4 @@
-mod commitment;
+pub mod commitment;
 pub mod types;
 mod storage;
 mod normalizer;
@@ -7,7 +7,7 @@ mod ingestor;
 mod slot_processor;
 pub mod adapter;
 mod account_resolver;
-mod changelog;
+pub mod changelog;
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right

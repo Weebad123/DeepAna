@@ -155,6 +155,36 @@ fn skip_event_json_wire_format() {
     assert_eq!(ChangeEvent::from_json(&json).unwrap(), ev);
 }
 
+// ----------------------------------------------------------- ChangeEvent::Final
+
+#[test]
+fn final_event_accessors() {
+    let ev = ChangeEvent::finalized(250_000_000, "abc", 249_999_968);
+    assert!(ev.is_final());
+    assert!(!ev.is_new());
+    assert!(!ev.is_skip());
+    assert_eq!(ev.kind(), "final");
+    assert_eq!(ev.slot(), 250_000_000);
+    assert_eq!(ev.skip_reason(), None);
+    assert!(ev.parquet_paths().is_empty());
+    assert_eq!(ev.block_datetime(), None);
+    assert_eq!(
+        ev.to_string(),
+        "final slot=250000000 blockhash=abc previous=249999968"
+    );
+}
+
+#[test]
+fn final_event_json_wire_format() {
+    let ev = ChangeEvent::finalized(42, "abc", 10);
+    let json = ev.to_json();
+    assert_eq!(
+        json,
+        r#"{"event":"final","slot":42,"blockhash":"abc","previous_slot":10}"#
+    );
+    assert_eq!(ChangeEvent::from_json(&json).unwrap(), ev);
+}
+
 // ------------------------------------------------------------------- Stream-level
 
 #[test]

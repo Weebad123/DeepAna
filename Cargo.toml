@@ -37,8 +37,10 @@ thiserror = "2.0.21"
 backoff = "0.4.0"
 dashmap = "6.2.1"
 bs58 = "0.5.1"
+bytes = "1.12.1"
 
 # Async
 tokio = { version = "1.53.3", features = ["time"] }
+tokio-util = "0.7.20"
 async-trait = "0.1.92"
 governor = { version = "0.10.4", default-features = false, features = ["std"] }
