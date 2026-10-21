@@ -1,10 +1,10 @@
 pub mod commitment;
 pub mod types;
 mod storage;
-mod normalizer;
+pub mod normalizer;
 mod decoder;
 pub mod ingestor;
-mod slot_processor;
+pub mod slot_processor;
 pub mod adapter;
 mod account_resolver;
 pub mod changelog;
