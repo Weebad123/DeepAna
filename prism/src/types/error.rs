@@ -11,7 +11,7 @@
 //! |-----------------------------|------------------------------------------------------------------------|
 //! | `adapter/solana.rs`         | [`RpcError`], [`RateLimitError`], [`SlotSkipped`]                      |
 //! | `slot_processor/fetcher.rs` | [`RpcError`], [`RateLimitError`], [`SlotSkipped`]                      |
-//! | `normalizer/instruction.rs` | [`DeserializeError`]                                                   |
+//! | `normalizer/`               | [`DeserializeError`]                                                   |
 //! | `decoder/spl_token.rs`      | [`DecodeError`]                                                        |
 //! | `account_resolver/`         | [`AccountResolveError`]                                                |
 //! | `storage/writer.rs`         | [`StorageError`]                                                       |

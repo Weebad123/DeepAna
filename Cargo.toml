@@ -18,6 +18,8 @@ solana-sdk = "4.1.0"
 # gated on it), so none of its block / transaction types would be importable.
 solana-transaction-status = { version = "4.3.0", features = ["agave-unstable-api"] }
 solana-account-decoder = "4.3.0"
+# Tests only: `solana_sdk::transaction` is a deprecated re-export.
+solana-transaction = "4.3.0"
 anchor-lang = "1.2.1"
 borsh = "1.8.1"
 
@@ -39,6 +41,7 @@ thiserror = "2.0.21"
 backoff = "0.4.0"
 dashmap = "6.2.1"
 bs58 = "0.5.1"
+base64 = "0.22.1"
 bytes = "1.12.1"
 
 # Async
