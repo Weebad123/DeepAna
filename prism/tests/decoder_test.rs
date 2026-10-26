@@ -39,7 +39,7 @@ use borsh::BorshSerialize;
 use helius::types::Cluster;
 use prism::adapter::solana::SolanaAdapter;
 use prism::adapter::{ChainAdapter, ChainBlock, CommitmentLevel};
-use prism::decoder::anchor::EVENT_TYPE_PREFIX;
+use prism::decoder::anchor::{EVENT_TYPE_PREFIX, IDL_TYPE_PREFIX, UNDESCRIBED_EVENT_TYPE};
 use prism::decoder::discriminant::{EVENT_IX_TAG, IDL_IX_TAG};
 use prism::decoder::spl_token::{SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID};
 use prism::decoder::{
@@ -780,6 +780,73 @@ fn emit_cpi_events_decode_from_the_self_invocation() {
     assert_eq!(result.token_transfer, None);
 }
 
+/// An on-chain IDL is often older than the deployed program, which then
+/// emits events the IDL does not list (seen on devnet: Raydium CP-Swap's
+/// `SwapEvent`, a prediction market's `TradeEvent`). The self-invocation is
+/// still an event: it is claimed, with its discriminant and raw body.
+#[test]
+fn emit_cpi_events_missing_from_the_idl_are_claimed_undecoded() {
+    let body = [1u8, 2, 3, 4, 5];
+    let data = [EVENT_IX_TAG.to_bytes(), sha_prefix("event:SwapEvent")].concat();
+    let data = [data, body.to_vec()].concat();
+    let result = vault().decode(&anchor_row(&data), &[]).unwrap();
+    assert_eq!(result.instruction_type, UNDESCRIBED_EVENT_TYPE);
+    assert_eq!(
+        result.decoded_data,
+        json!({ "discriminator": "40c6cde8260871e2", "data": "AQIDBAU=" })
+    );
+    assert_eq!(result.token_transfer, None);
+
+    // An event with no body is still an event.
+    let data = [EVENT_IX_TAG.to_bytes(), sha_prefix("event:Other")].concat();
+    let result = vault().decode(&anchor_row(&data), &[]).unwrap();
+    assert_eq!(result.decoded_data["data"], "");
+}
+
+/// An IDL that defines an event struct among its types without listing it
+/// under `events` still decodes the event.
+#[test]
+fn emit_cpi_events_decode_from_type_definitions_alone() {
+    let mut idl: Value = serde_json::from_str(VAULT_IDL).unwrap();
+    idl["events"] = json!([]);
+    let decoder = AnchorDecoder::from_json(&idl.to_string()).unwrap();
+    let event = DepositEvent { user: owner().to_bytes(), amount: 5 };
+    let result = decoder.decode(&anchor_row(&event_data(&event)), &[]).unwrap();
+    assert_eq!(result.instruction_type, format!("{EVENT_TYPE_PREFIX}DepositEvent"));
+    assert_eq!(result.decoded_data, json!({ "user": owner().to_string(), "amount": 5 }));
+}
+
+/// The legacy IDL-account instructions every pre-1.0 Anchor program
+/// accepts, encoded with Anchor's own `IdlInstruction` type.
+#[test]
+fn idl_account_instructions_decode() {
+    use anchor_lang::idl::IdlInstruction as Idl;
+    let decoder = vault();
+    let encode = |ix: &Idl| {
+        [IDL_IX_TAG.as_bytes().as_slice(), &anchor_lang::prelude::borsh::to_vec(ix).unwrap()].concat()
+    };
+    for (ix, operation, fields) in [
+        (Idl::Create { data_len: 4096 }, "create", json!({ "data_len": 4096 })),
+        (Idl::CreateBuffer, "create_buffer", json!({})),
+        (Idl::Write { data: vec![1, 2, 3] }, "write", json!({ "data": "AQID" })),
+        (Idl::SetBuffer, "set_buffer", json!({})),
+        (
+            Idl::SetAuthority { new_authority: anchor_lang::prelude::Pubkey::new_from_array([3; 32]) },
+            "set_authority",
+            json!({ "new_authority": owner().to_string() }),
+        ),
+        (Idl::Close, "close", json!({})),
+        (Idl::Resize { data_len: 10_240 }, "resize", json!({ "data_len": 10_240 })),
+    ] {
+        let result = decoder.decode(&anchor_row(&encode(&ix)), &[]).unwrap();
+        assert_eq!(result.instruction_type, format!("{IDL_TYPE_PREFIX}{operation}"));
+        assert_eq!(result.decoded_data, fields, "{operation}");
+    }
+    let bad = [IDL_IX_TAG.as_bytes().as_slice(), &[9]].concat();
+    let err = decoder.decode(&anchor_row(&bad), &[]).unwrap_err();
+    assert!(decode_reason(&err).contains("unknown operation tag 9"), "{err}");
+}
+
 #[test]
 fn anchor_can_decode_checks_program_and_discriminant() {
     let decoder = vault();
@@ -789,11 +856,16 @@ fn anchor_can_decode_checks_program_and_discriminant() {
     assert!(!decoder.can_decode(VAULT_PROGRAM_ID, &sha_prefix("global:unknown")));
     assert!(!decoder.can_decode(VAULT_PROGRAM_ID, &DEPOSIT[..5]), "too short");
     assert!(!decoder.can_decode(VAULT_PROGRAM_ID, &[]));
-    // The event tag alone, or with an unknown event, is not claimed.
+    // The event tag alone is not claimed; with an event the IDL does not
+    // describe, it is.
     assert!(!decoder.can_decode(VAULT_PROGRAM_ID, EVENT_IX_TAG.as_bytes()));
     let mut unknown_event = EVENT_IX_TAG.to_bytes().to_vec();
     unknown_event.extend(sha_prefix("event:Other"));
-    assert!(!decoder.can_decode(VAULT_PROGRAM_ID, &unknown_event));
+    assert!(decoder.can_decode(VAULT_PROGRAM_ID, &unknown_event));
+    assert_eq!(decoder.instruction_for(&unknown_event), None);
+    // The IDL tag alone is not claimed; with an operation, it is.
+    assert!(!decoder.can_decode(VAULT_PROGRAM_ID, IDL_IX_TAG.as_bytes()));
+    assert!(decoder.can_decode(VAULT_PROGRAM_ID, &[IDL_IX_TAG.as_bytes().as_slice(), &[5]].concat()));
     assert_eq!(decoder.instruction_for(&deposit).map(|ix| ix.name.as_str()), Some("deposit"));
 }
 
@@ -854,6 +926,8 @@ fn anchor_decoder_never_panics_on_arbitrary_bodies() {
         sha_prefix("global:withdraw").to_vec(),
         vec![7],
         [EVENT_IX_TAG.to_bytes(), DEPOSIT_EVENT].concat(),
+        EVENT_IX_TAG.to_bytes().to_vec(),
+        IDL_IX_TAG.to_bytes().to_vec(),
     ];
     for prefix in &prefixes {
         for len in 0..200 {
@@ -1146,7 +1220,11 @@ impl Tally {
             }
             Ok(None) => {
                 self.unclaimed += 1;
-                self.sample(ix, "no decoder recognised it".into());
+                let why = match ix.data_bytes().ok().as_deref().and_then(Discriminant::from_data) {
+                    Some(d) => format!("no decoder recognised it (discriminant {d} is not in the IDL)"),
+                    None => "no decoder recognised it".to_owned(),
+                };
+                self.sample(ix, why);
             }
             Err(err) => {
                 self.errors += 1;

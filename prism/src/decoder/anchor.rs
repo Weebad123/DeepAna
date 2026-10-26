@@ -20,7 +20,23 @@
 //!
 //! Events emitted with `emit_cpi!` are decoded too: the program invokes
 //! itself with `EVENT_IX_TAG ‖ event discriminant ‖ borsh(event)`, and such
-//! an instruction comes out with type `event:<EventName>`.
+//! an instruction comes out with type `event:<EventName>`. The event is
+//! looked up in the IDL's `events`, then among its type definitions (an IDL
+//! may define an event struct without listing it as an event).
+//!
+//! An IDL can be stale, most often the one uploaded to the on-chain
+//! `anchor:idl` account: the deployed program has instructions and events
+//! the IDL does not describe. Two kinds of instruction are recognised
+//! regardless, since Anchor itself fixes their prefix:
+//! * an `emit_cpi!` self-invocation whose event the IDL does not describe
+//!   comes out as [`UNDESCRIBED_EVENT_TYPE`], with the event discriminant
+//!   and the undecoded body;
+//! * the instructions that manage the legacy on-chain IDL account
+//!   ([`IDL_IX_TAG`]), which every Anchor program before 1.0 accepts but no
+//!   IDL lists, come out as `idl:<operation>`.
+//!
+//! An ordinary instruction the IDL does not describe stays unclaimed: its
+//! argument layout is not known, so nothing can be decoded from it.
 //!
 //! Borsh values map to JSON as follows. Integers up to 64 bits are JSON
 //! numbers; 128- and 256-bit integers are decimal strings, since JSON
@@ -38,7 +54,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anchor_lang_idl_spec::{
-    Idl, IdlArrayLen, IdlDefinedFields, IdlEvent, IdlField, IdlGenericArg, IdlInstruction,
+    Idl, IdlArrayLen, IdlDefinedFields, IdlField, IdlGenericArg, IdlInstruction,
     IdlSerialization, IdlType, IdlTypeDef, IdlTypeDefGeneric, IdlTypeDefTy,
 };
 use base64::Engine as _;
@@ -47,13 +63,20 @@ use borsh::BorshDeserialize;
 use serde_json::{Map, Number, Value};
 use solana_sdk::pubkey::Pubkey;
 
-use super::discriminant::{Discriminant, EVENT_IX_TAG};
+use super::discriminant::{Discriminant, EVENT_IX_TAG, IDL_IX_TAG};
 use super::{DecodeResult, Decoder, decode_error, instruction_data};
 use crate::types::error::{PrismError, PrismResult};
 use crate::types::udm::DeepAnaInstruction;
 
 /// Prefix of the `instruction_type` of an `emit_cpi!` event.
 pub const EVENT_TYPE_PREFIX: &str = "event:";
+
+/// `instruction_type` of an `emit_cpi!` event the IDL does not describe.
+/// Its `decoded_data` is `{ "discriminator": <hex>, "data": <base64> }`.
+pub const UNDESCRIBED_EVENT_TYPE: &str = "event:<undescribed>";
+
+/// Prefix of the `instruction_type` of a legacy IDL-account instruction.
+pub const IDL_TYPE_PREFIX: &str = "idl:";
 
 /// Deepest nesting of types the decoder follows. Real IDLs stay in single
 /// digits; the limit stops a self-referencing type from recursing forever.
@@ -63,8 +86,13 @@ const MAX_TYPE_DEPTH: usize = 64;
 #[derive(Debug, Clone, Copy)]
 enum Target<'a> {
     Instruction(&'a IdlInstruction),
-    /// An `emit_cpi!` self-invocation carrying this event.
-    Event(&'a IdlEvent),
+    /// An `emit_cpi!` self-invocation carrying the event of this type.
+    Event(&'a str),
+    /// An `emit_cpi!` self-invocation carrying an event the IDL does not
+    /// describe.
+    UndescribedEvent(Discriminant),
+    /// An instruction managing the legacy on-chain IDL account.
+    IdlAccount,
 }
 
 /// Decodes the instructions of one Anchor program, given its IDL.
@@ -78,8 +106,10 @@ pub struct AnchorDecoder {
     /// Instructions whose custom discriminant is not 8 bytes long, longest
     /// first so that the most specific prefix wins.
     custom_discriminants: Vec<(Vec<u8>, IdlInstruction)>,
-    /// Events by their 8-byte discriminant, for `emit_cpi!` instructions.
-    events: HashMap<Discriminant, IdlEvent>,
+    /// Type names of events by their 8-byte discriminant, for `emit_cpi!`
+    /// instructions: the IDL's events, then any other struct whose
+    /// `sha256("event:<Name>")[..8]` is not taken.
+    events: HashMap<Discriminant, String>,
     /// The IDL's type definitions by name.
     types: HashMap<String, IdlTypeDef>,
 }
@@ -151,7 +181,14 @@ impl AnchorDecoder {
                     )
                 })?
             };
-            events.insert(discriminant, event.clone());
+            events.insert(discriminant, event.name.clone());
+        }
+        for def in &idl.types {
+            if matches!(def.ty, IdlTypeDefTy::Struct { .. }) && def.generics.is_empty() {
+                events
+                    .entry(Discriminant::for_event(&def.name))
+                    .or_insert_with(|| def.name.clone());
+            }
         }
 
         Ok(Self {
@@ -194,13 +231,13 @@ impl AnchorDecoder {
     pub fn instruction_for(&self, data: &[u8]) -> Option<&IdlInstruction> {
         match self.target(data)? {
             Target::Instruction(instruction) => Some(instruction),
-            Target::Event(_) => None,
+            Target::Event(_) | Target::UndescribedEvent(_) | Target::IdlAccount => None,
         }
     }
 
     /// What the first bytes of `data` select. An 8-byte instruction
-    /// discriminant is tried first, then `emit_cpi!` events, then custom
-    /// discriminants, longest first.
+    /// discriminant is tried first, then `emit_cpi!` events, then the IDL
+    /// account instructions, then custom discriminants, longest first.
     fn target(&self, data: &[u8]) -> Option<Target<'_>> {
         let discriminant = Discriminant::from_data(data);
         if let Some(instruction) = discriminant.and_then(|d| self.discriminant_map.get(&d)) {
@@ -208,9 +245,14 @@ impl AnchorDecoder {
         }
         if discriminant == Some(EVENT_IX_TAG)
             && let Some(event) = Discriminant::from_data(&data[Discriminant::LEN..])
-                .and_then(|d| self.events.get(&d))
         {
-            return Some(Target::Event(event));
+            return Some(match self.events.get(&event) {
+                Some(name) => Target::Event(name),
+                None => Target::UndescribedEvent(event),
+            });
+        }
+        if discriminant == Some(IDL_IX_TAG) && data.len() > Discriminant::LEN {
+            return Some(Target::IdlAccount);
         }
         self.custom_discriminants
             .iter()
@@ -236,16 +278,31 @@ impl AnchorDecoder {
                     .map_err(|err| format!("instruction `{}`: {err}", instruction.name))?;
                 Ok((instruction.name.clone(), Value::Object(args)))
             }
-            Target::Event(event) => {
+            Target::Event(name) => {
                 reader.data = &data[2 * Discriminant::LEN..];
                 let ty = IdlType::Defined {
-                    name: event.name.clone(),
+                    name: name.to_owned(),
                     generics: Vec::new(),
                 };
                 let fields = reader
                     .read(&ty, &Generics::new(), 0)
-                    .map_err(|err| format!("event `{}`: {err}", event.name))?;
-                Ok((format!("{EVENT_TYPE_PREFIX}{}", event.name), fields))
+                    .map_err(|err| format!("event `{name}`: {err}"))?;
+                Ok((format!("{EVENT_TYPE_PREFIX}{name}"), fields))
+            }
+            Target::UndescribedEvent(discriminant) => {
+                let mut fields = Map::new();
+                fields.insert("discriminator".to_owned(), discriminant.to_string().into());
+                fields.insert(
+                    "data".to_owned(),
+                    BASE64.encode(&data[2 * Discriminant::LEN..]).into(),
+                );
+                Ok((UNDESCRIBED_EVENT_TYPE.to_owned(), Value::Object(fields)))
+            }
+            Target::IdlAccount => {
+                reader.data = &data[Discriminant::LEN..];
+                read_idl_account_instruction(&mut reader)
+                    .map(|(operation, fields)| (format!("{IDL_TYPE_PREFIX}{operation}"), fields))
+                    .map_err(|err| format!("IDL account instruction: {err}"))
             }
         }
     }
@@ -288,6 +345,37 @@ impl Decoder for AnchorDecoder {
             token_transfer: None,
         })
     }
+}
+
+/// The body of a legacy IDL-account instruction, Anchor's
+/// `anchor_lang::idl::IdlInstruction` enum: the operation and its fields.
+fn read_idl_account_instruction(reader: &mut BorshReader<'_, '_>) -> Result<(&'static str, Value), String> {
+    let mut fields = Map::new();
+    let operation = match reader.borsh::<u8>("operation tag")? {
+        0 => {
+            fields.insert("data_len".to_owned(), reader.borsh::<u64>("data_len")?.into());
+            "create"
+        }
+        1 => "create_buffer",
+        2 => {
+            let bytes = reader.borsh::<Vec<u8>>("data")?;
+            fields.insert("data".to_owned(), BASE64.encode(bytes).into());
+            "write"
+        }
+        3 => "set_buffer",
+        4 => {
+            let key: [u8; 32] = reader.borsh("new_authority")?;
+            fields.insert("new_authority".to_owned(), Pubkey::new_from_array(key).to_string().into());
+            "set_authority"
+        }
+        5 => "close",
+        6 => {
+            fields.insert("data_len".to_owned(), reader.borsh::<u64>("data_len")?.into());
+            "resize"
+        }
+        tag => return Err(format!("unknown operation tag {tag}")),
+    };
+    Ok((operation, Value::Object(fields)))
 }
 
 // ---------------------------------------------------------------------------
