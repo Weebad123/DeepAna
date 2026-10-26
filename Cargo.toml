@@ -21,11 +21,17 @@ solana-account-decoder = "4.3.0"
 # Tests only: `solana_sdk::transaction` is a deprecated re-export.
 solana-transaction = "4.3.0"
 anchor-lang = "1.2.1"
+# Anchor >= 0.30 IDL types (instructions carry explicit discriminators).
+anchor-lang-idl-spec = "0.1.0"
 borsh = "1.8.1"
 
 # SPL
 spl-token = { version = "9.0.0", features = ["no-entrypoint"] }
 spl-token-2022 = { version = "11.1.0", features = ["no-entrypoint"] }
+# `spl_token::instruction` and `spl_token_2022::instruction` are deprecated
+# re-exports of these two.
+spl-token-interface = "2.0.0"
+spl-token-2022-interface = "3.1.2"
 spl-associated-token-account = { version = "8.0.0", features = ["no-entrypoint"] }
 
 # Arrow / Parquet
@@ -43,6 +49,8 @@ dashmap = "6.2.1"
 bs58 = "0.5.1"
 base64 = "0.22.1"
 bytes = "1.12.1"
+sha2 = "0.10.9"
+flate2 = "1.1.10"
 
 # Async
 tokio = { version = "1.53.3", features = ["time"] }

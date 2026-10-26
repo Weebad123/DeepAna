@@ -2,7 +2,7 @@ pub mod commitment;
 pub mod types;
 mod storage;
 pub mod normalizer;
-mod decoder;
+pub mod decoder;
 pub mod ingestor;
 pub mod slot_processor;
 pub mod adapter;

@@ -1,0 +1,149 @@
+{
+  "address": "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS",
+  "metadata": {
+    "name": "vault",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Test IDL covering every IDL type the AnchorDecoder reads"
+  },
+  "instructions": [
+    {
+      "name": "initialize",
+      "discriminator": [175, 175, 109, 31, 13, 152, 155, 237],
+      "accounts": [
+        { "name": "vault", "writable": true },
+        { "name": "authority", "writable": true, "signer": true },
+        { "name": "system_program", "address": "11111111111111111111111111111111" }
+      ],
+      "args": []
+    },
+    {
+      "name": "deposit",
+      "discriminator": [242, 35, 198, 137, 82, 225, 242, 182],
+      "accounts": [
+        { "name": "vault", "writable": true },
+        {
+          "name": "transfer",
+          "accounts": [
+            { "name": "from", "writable": true },
+            { "name": "owner", "signer": true }
+          ]
+        }
+      ],
+      "args": [
+        { "name": "amount", "type": "u64" },
+        { "name": "memo", "type": { "option": "string" } }
+      ]
+    },
+    {
+      "name": "configure",
+      "discriminator": [245, 7, 108, 117, 95, 196, 54, 217],
+      "accounts": [{ "name": "vault", "writable": true }],
+      "args": [{ "name": "config", "type": { "defined": { "name": "Config" } } }]
+    },
+    {
+      "name": "wrap",
+      "discriminator": [178, 40, 10, 189, 228, 129, 186, 140],
+      "accounts": [],
+      "args": [
+        {
+          "name": "wrapped",
+          "type": {
+            "defined": {
+              "name": "Wrapper",
+              "generics": [
+                { "kind": "type", "type": "u32" },
+                { "kind": "const", "value": "2" }
+              ]
+            }
+          }
+        },
+        { "name": "id", "type": { "defined": { "name": "VaultId" } } }
+      ]
+    },
+    {
+      "name": "withdraw",
+      "discriminator": [],
+      "accounts": [],
+      "args": [{ "name": "amount", "type": "u64" }]
+    },
+    {
+      "name": "ping",
+      "discriminator": [7],
+      "accounts": [],
+      "args": [{ "name": "n", "type": "u8" }]
+    }
+  ],
+  "events": [
+    { "name": "DepositEvent", "discriminator": [120, 248, 61, 83, 31, 142, 107, 144] }
+  ],
+  "errors": [{ "code": 6000, "name": "Paused", "msg": "The vault is paused" }],
+  "types": [
+    {
+      "name": "Config",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "fee_bps", "type": "u16" },
+          { "name": "admins", "type": { "vec": "pubkey" } },
+          { "name": "mode", "type": { "defined": { "name": "Mode" } } },
+          { "name": "limits", "type": { "array": ["u64", 3] } },
+          { "name": "ratio", "type": "f64" },
+          { "name": "small", "type": "i8" },
+          { "name": "medium", "type": "i32" },
+          { "name": "signed", "type": "i64" },
+          { "name": "big", "type": "u128" },
+          { "name": "big_negative", "type": "i128" },
+          { "name": "flag", "type": "bool" },
+          { "name": "payload", "type": "bytes" },
+          { "name": "wide", "type": "u256" },
+          { "name": "wide_negative", "type": "i256" },
+          { "name": "pair", "type": { "defined": { "name": "Pair" } } }
+        ]
+      }
+    },
+    {
+      "name": "Mode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          { "name": "Off" },
+          { "name": "Fixed", "fields": [{ "name": "rate", "type": "u64" }] },
+          { "name": "Range", "fields": ["u32", "u32"] }
+        ]
+      }
+    },
+    {
+      "name": "Pair",
+      "type": { "kind": "struct", "fields": ["u8", "u16"] }
+    },
+    {
+      "name": "Wrapper",
+      "generics": [
+        { "kind": "type", "name": "T" },
+        { "kind": "const", "name": "N", "type": "usize" }
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "items", "type": { "array": [{ "generic": "T" }, { "generic": "N" }] } },
+          { "name": "extra", "type": { "option": { "generic": "T" } } }
+        ]
+      }
+    },
+    {
+      "name": "VaultId",
+      "type": { "kind": "type", "alias": { "array": ["u8", 4] } }
+    },
+    {
+      "name": "DepositEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "user", "type": "pubkey" },
+          { "name": "amount", "type": "u64" }
+        ]
+      }
+    }
+  ]
+}
