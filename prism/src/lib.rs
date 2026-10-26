@@ -6,7 +6,7 @@ pub mod decoder;
 pub mod ingestor;
 pub mod slot_processor;
 pub mod adapter;
-mod account_resolver;
+pub mod account_resolver;
 pub mod changelog;
 
 pub fn add(left: u64, right: u64) -> u64 {
