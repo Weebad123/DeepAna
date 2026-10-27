@@ -54,7 +54,8 @@ pub struct ProcessedSlot {
     pub udm_slot: Option<DeepAnaSlot>,
     pub udm_transactions: Vec<DeepAnaTransaction>,
     pub udm_instructions: Vec<DeepAnaInstruction>,
-    /// Filled once the decoder and account resolver exist; empty until then.
+    /// Left empty by the processor; the ingestor fills it in after the
+    /// decoder and account resolver have run.
     pub udm_transfers: Vec<DeepAnaTokenTransfer>,
     /// Wall time of the fetch, retries and backoff included.
     pub fetch_duration_ms: u64,

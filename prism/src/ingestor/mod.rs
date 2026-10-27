@@ -1,60 +1,78 @@
 //! The ingestor: the orchestration layer that turns PRISM's components into
 //! a running pipeline.
 //!
-//! Everything else in the crate is a component. [`Ingestor`] owns them, wires
-//! them together and drives them as three concurrent Tokio tasks:
+//! Everything else in the crate is a component. [`Ingestor`] builds and owns
+//! them (the [`SlotProcessor`], the [`DecoderRegistry`], the
+//! [`AccountResolver`] and the [`ParquetWriter`]), wires them together and
+//! drives them as two concurrent Tokio tasks joined by a bounded channel:
 //!
 //! ```text
-//!   fetch ──(bounded channel)──▶ process ──(SlotBuffer)──▶ flush ──▶ FlushSink
-//!     │                            │                         │
-//!   adapter.get_tip / get_block  cursor.record_processed   cursor.record_flush
+//!   process ──(processed channel: ProcessedSlot)──▶ writer
+//!     │                                               │
+//!   SlotProcessor: fetch, normalize,                skipped: cursor.record_skipped
+//!     GapHandler for skipped slots                  data:    ParquetWriter::append
+//!   DecoderRegistry::decode_block                            cursor.record_processed
+//!   AccountResolver::resolve                        flush:   ParquetWriter::flush
+//!                                                            ChangeLog: one New per slot
+//!                                                            cursor.record_flush
 //! ```
 //!
-//! * **fetch** follows the chain tip at [`IngestorConfig::commitment`] and
-//!   fetches every slot from the resume point upwards, in order. Skipped
-//!   slots are passed on as such; transient RPC failures are retried after
-//!   [`IngestorConfig::tip_poll_interval`]; anything else halts the pipeline.
-//! * **process** decodes each block into a [`BufferedSlot`], stamps it with
-//!   the [`CommitmentTracker`]'s finality, appends it to the in-memory
-//!   [`SlotBuffer`] and advances the cursor's processed edge.
-//! * **flush** drains the buffer into the [`FlushSink`] every
-//!   [`IngestorConfig::flush_interval`], or sooner once
-//!   [`IngestorConfig::flush_max_slots`] slots are waiting, and then moves
-//!   the cursor's flush edge, which persists it.
+//! * **process** follows the chain tip at [`IngestorConfig::commitment`] and
+//!   hands every slot from the resume point upwards, in order, to the slot
+//!   processor. The processor retries transient fetch failures itself and
+//!   publishes the `Skip` event of a skipped slot; the ingestor then decodes
+//!   the slot's instructions, resolves its token transfers and sends the
+//!   [`ProcessedSlot`] on. A slot the processor gives up on halts the
+//!   pipeline, so the cursor never moves past data that was never read.
+//! * **writer** appends each slot's rows to the [`ParquetWriter`] and moves
+//!   the cursor's processed edge. Every [`IngestorConfig::flush_interval`],
+//!   or sooner once [`IngestorConfig::flush_max_slots`] slots are buffered,
+//!   it flushes, emits one [`ChangeEvent::New`] per flushed slot carrying the
+//!   files written, and then moves the cursor's flush edge, which persists
+//!   it.
 //!
 //! | File        | Holds                                                    |
 //! |-------------|----------------------------------------------------------|
-//! | `mod.rs`    | [`Ingestor`], its config, the buffer and the Helius setup |
+//! | `mod.rs`    | [`Ingestor`], its config and the Helius setup             |
 //! | [`cursor`]  | [`IngestorCursor`], the persisted resume point            |
 //!
-//! Shutdown is graceful and cascades down the pipe: cancelling the token
-//! stops fetch, whose dropped sender lets process drain the channel and
-//! exit, after which flush writes whatever is left and persists the cursor.
-//! The same cascade runs when fetch reaches [`IngestorConfig::end_slot`].
+//! A failed flush keeps its rows buffered and is retried at the next
+//! interval; [`IngestorConfig::max_flush_failures`] failures in a row halt
+//! the pipeline. Files a flush wrote but the cursor never recorded (a crash
+//! or halt between the two) are removed by [`Ingestor::run`] before it
+//! starts, and their slots are ingested again, so every slot ends up on disk
+//! exactly once. Their `New` events may then be emitted twice: delivery to
+//! the change log is at least once.
 //!
-//! Until the Parquet writer exists, [`LogSink`] stands in for it.
+//! Shutdown is graceful and cascades down the pipe: cancelling the token
+//! stops process, whose dropped sender lets writer drain the channel, flush
+//! whatever is left and persist the cursor. The same cascade runs when
+//! process reaches [`IngestorConfig::end_slot`].
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use helius::HeliusBuilder;
 use helius::types::Cluster;
-use solana_sdk::message::VersionedMessage;
-use solana_transaction_status::{
-    EncodedTransaction, EncodedTransactionWithStatusMeta, UiMessage, UiTransactionStatusMeta,
-};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::account_resolver::{AccountResolver, ResolverMetrics};
 use crate::adapter::config::{SolanaAdapterConfig, TransactionEncoding};
 use crate::adapter::solana::SolanaAdapter;
-use crate::adapter::{ChainAdapter, ChainBlock, ChainBlockData, CommitmentLevel};
+use crate::adapter::{ChainAdapter, CommitmentLevel};
+use crate::changelog::ChangeLog;
 use crate::commitment::CommitmentTracker;
+use crate::decoder::DecoderRegistry;
+use crate::normalizer::{NormalizedBlock, Normalizer};
+use crate::slot_processor::{GapHandler, ProcessedSlot, SlotFetcher, SlotFetcherConfig, SlotProcessor};
+use crate::storage::{ParquetWriter, Storage, WriterMetrics};
 use crate::types::error::{PrismError, PrismResult};
+use crate::types::event::ChangeEvent;
+use crate::types::udm::DeepAnaSlot;
 
 pub mod cursor;
 
@@ -66,6 +84,12 @@ pub const HELIUS_API_KEY_ENV: &str = "HELIUS_API_KEY";
 /// Base58 id of the Solana vote program.
 pub const VOTE_PROGRAM_ID: &str = "Vote111111111111111111111111111111111111111";
 
+/// Name of the cursor file [`IngestorConfig::new`] puts in the data directory.
+pub const CURSOR_FILE_NAME: &str = "cursor.json";
+
+/// Name of the skip log [`IngestorConfig::new`] puts in the data directory.
+pub const SKIP_LOG_FILE_NAME: &str = "skipped_slots.log";
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -73,47 +97,68 @@ pub const VOTE_PROGRAM_ID: &str = "Vote111111111111111111111111111111111111111";
 /// How the ingestor runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestorConfig {
+    /// Where the Parquet files are written, under `solana/`.
+    pub data_dir: PathBuf,
     /// Where the cursor file lives.
     pub cursor_path: PathBuf,
+    /// Where the gap handler appends one line per skipped slot.
+    pub skip_log_path: PathBuf,
     /// First slot for a fresh cursor. `None` starts at the current tip. A
     /// cursor with history ignores this and resumes from its flush edge.
     pub start_slot: Option<u64>,
     /// Last slot to ingest (inclusive). `None` follows the tip until shut
     /// down.
     pub end_slot: Option<u64>,
-    /// Commitment of the tip that fetch follows.
+    /// Commitment of the tip that process follows.
     pub commitment: CommitmentLevel,
-    /// Pause between tip polls once caught up, and before retrying a slot
-    /// that failed transiently.
+    /// Pause between tip polls once caught up, and before retrying a tip
+    /// read that failed transiently.
     pub tip_poll_interval: Duration,
-    /// Blocks that may wait between fetch and process.
+    /// Retry and timeout policy for fetching a slot.
+    pub fetcher: SlotFetcherConfig,
+    /// Processed slots that may wait between process and writer.
     pub channel_capacity: usize,
-    /// Longest a processed slot waits in the buffer before being flushed.
+    /// Longest a slot waits in the writer's buffer before being flushed.
+    /// Also the pause before retrying a failed flush.
     pub flush_interval: Duration,
     /// Buffered slots that trigger a flush before `flush_interval` is up.
     pub flush_max_slots: usize,
+    /// Failed flushes in a row after which the pipeline halts.
+    pub max_flush_failures: u32,
 }
 
 impl IngestorConfig {
-    /// The defaults, with the cursor at `cursor_path`.
-    pub fn new(cursor_path: impl Into<PathBuf>) -> Self {
+    /// The defaults, writing under `data_dir`, with the cursor and the skip
+    /// log next to the tables.
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
         Self {
-            cursor_path: cursor_path.into(),
+            cursor_path: data_dir.join(CURSOR_FILE_NAME),
+            skip_log_path: data_dir.join(SKIP_LOG_FILE_NAME),
+            data_dir,
             start_slot: None,
             end_slot: None,
             commitment: CommitmentLevel::Confirmed,
             tip_poll_interval: Duration::from_millis(400),
+            fetcher: SlotFetcherConfig::default(),
             channel_capacity: 64,
             flush_interval: Duration::from_secs(10),
             flush_max_slots: 256,
+            max_flush_failures: 3,
         }
     }
 
     /// Check that the values can actually be used. The first offending field
     /// is reported as a [`PrismError::ConfigError`].
     pub fn validate(&self) -> PrismResult<()> {
-        if self.cursor_path.as_os_str().is_empty() {
-            return Err(PrismError::config("cursor_path", "must not be empty"));
+        for (field, path) in [
+            ("data_dir", &self.data_dir),
+            ("cursor_path", &self.cursor_path),
+            ("skip_log_path", &self.skip_log_path),
+        ] {
+            if path.as_os_str().is_empty() {
+                return Err(PrismError::config(field, "must not be empty"));
+            }
         }
         if let (Some(start), Some(end)) = (self.start_slot, self.end_slot)
             && end < start
@@ -126,6 +171,7 @@ impl IngestorConfig {
         if self.tip_poll_interval.is_zero() {
             return Err(PrismError::config("tip_poll_interval", "must be greater than 0"));
         }
+        self.fetcher.validate()?;
         if self.channel_capacity == 0 {
             return Err(PrismError::config("channel_capacity", "must be greater than 0"));
         }
@@ -135,289 +181,9 @@ impl IngestorConfig {
         if self.flush_max_slots == 0 {
             return Err(PrismError::config("flush_max_slots", "must be greater than 0"));
         }
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Buffered data
-// ---------------------------------------------------------------------------
-
-/// One transaction as held in the buffer, waiting to be written.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BufferedTransaction {
-    /// Position within the block.
-    pub index: usize,
-    /// First signature, base58: the transaction id.
-    pub signature: String,
-    /// `"legacy"`, `"0"` or `"1"`; `"unknown"` for JSON encodings.
-    pub version: String,
-    /// Whether it executed without error.
-    pub success: bool,
-    /// The on-chain error, when it failed.
-    pub error: Option<String>,
-    /// Fee paid, in lamports.
-    pub fee: u64,
-    /// Compute units consumed, when the node reports it.
-    pub compute_units: Option<u64>,
-    /// Top-level instructions.
-    pub instruction_count: usize,
-    /// Static account keys (address lookup table entries not included).
-    pub account_count: usize,
-    /// Base58 ids of the programs invoked by top-level instructions, in
-    /// first-seen order.
-    pub program_ids: Vec<String>,
-    /// Whether this is a validator vote.
-    pub is_vote: bool,
-}
-
-/// One slot as held in the buffer, waiting to be written.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BufferedSlot {
-    pub slot: u64,
-    pub blockhash: String,
-    pub parent_blockhash: String,
-    /// Unix timestamp in seconds, when the chain reports one.
-    pub block_time: Option<i64>,
-    /// Finality at the time the slot was buffered.
-    pub is_finalized: bool,
-    pub transactions: Vec<BufferedTransaction>,
-}
-
-impl BufferedSlot {
-    /// Decode `block` into its buffered form.
-    ///
-    /// Fails with [`PrismError::DeserializeError`] when a transaction cannot
-    /// be decoded.
-    pub fn from_block(block: &ChainBlock, is_finalized: bool) -> PrismResult<Self> {
-        let ChainBlockData::Solana(raw) = &block.raw;
-        let slot = block.slot_or_height;
-        let transactions = raw
-            .transactions
-            .iter()
-            .enumerate()
-            .map(|(index, tx)| decode_transaction(slot, index, tx))
-            .collect::<PrismResult<_>>()?;
-        Ok(Self {
-            slot,
-            blockhash: block.block_id.clone(),
-            parent_blockhash: block.parent_id.clone(),
-            block_time: block.timestamp,
-            is_finalized,
-            transactions,
-        })
-    }
-
-    /// Transactions that are not validator votes.
-    pub fn non_vote_transactions(&self) -> impl Iterator<Item = &BufferedTransaction> {
-        self.transactions.iter().filter(|tx| !tx.is_vote)
-    }
-}
-
-/// Signature, version and the shape of the message, whatever the encoding.
-struct DecodedMessage {
-    signature: String,
-    version: String,
-    account_keys: Vec<String>,
-    program_ids: Vec<String>,
-    instruction_count: usize,
-}
-
-fn decode_transaction(
-    slot: u64,
-    index: usize,
-    tx: &EncodedTransactionWithStatusMeta,
-) -> PrismResult<BufferedTransaction> {
-    let message = decode_message(&tx.transaction).ok_or_else(|| {
-        PrismError::deserialize(
-            Some(slot),
-            "transaction",
-            format!("transaction {index} has an undecodable encoding"),
-        )
-    })?;
-    let meta: Option<&UiTransactionStatusMeta> = tx.meta.as_ref();
-    let mut program_ids: Vec<String> = Vec::new();
-    for id in message.program_ids {
-        if !program_ids.contains(&id) {
-            program_ids.push(id);
+        if self.max_flush_failures == 0 {
+            return Err(PrismError::config("max_flush_failures", "must be greater than 0"));
         }
-    }
-    Ok(BufferedTransaction {
-        index,
-        signature: message.signature,
-        version: message.version,
-        success: meta.is_none_or(|meta| meta.err.is_none()),
-        error: meta.and_then(|meta| meta.err.as_ref().map(|err| format!("{err:?}"))),
-        fee: meta.map_or(0, |meta| meta.fee),
-        compute_units: meta.and_then(|meta| meta.compute_units_consumed.clone().into()),
-        instruction_count: message.instruction_count,
-        account_count: message.account_keys.len(),
-        is_vote: program_ids.iter().any(|id| id == VOTE_PROGRAM_ID),
-        program_ids,
-    })
-}
-
-fn decode_message(tx: &EncodedTransaction) -> Option<DecodedMessage> {
-    if let EncodedTransaction::Json(ui) = tx {
-        let signature = ui.signatures.first()?.clone();
-        return Some(match &ui.message {
-            UiMessage::Raw(raw) => DecodedMessage {
-                signature,
-                version: String::from("unknown"),
-                program_ids: raw
-                    .instructions
-                    .iter()
-                    .filter_map(|ix| raw.account_keys.get(usize::from(ix.program_id_index)))
-                    .cloned()
-                    .collect(),
-                instruction_count: raw.instructions.len(),
-                account_keys: raw.account_keys.clone(),
-            },
-            UiMessage::Parsed(parsed) => DecodedMessage {
-                signature,
-                version: String::from("unknown"),
-                // Parsed instructions name their program in differing shapes;
-                // the JSON encodings are not what the pipeline asks for.
-                program_ids: Vec::new(),
-                instruction_count: parsed.instructions.len(),
-                account_keys: parsed.account_keys.iter().map(|key| key.pubkey.clone()).collect(),
-            },
-        });
-    }
-    let decoded = tx.decode()?;
-    let account_keys: Vec<String> = decoded
-        .message
-        .static_account_keys()
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    let program_ids = decoded
-        .message
-        .instructions()
-        .iter()
-        .filter_map(|ix| account_keys.get(usize::from(ix.program_id_index)))
-        .cloned()
-        .collect();
-    Some(DecodedMessage {
-        signature: decoded.signatures.first()?.to_string(),
-        version: match decoded.message {
-            VersionedMessage::Legacy(_) => String::from("legacy"),
-            VersionedMessage::V0(_) => String::from("0"),
-            VersionedMessage::V1(_) => String::from("1"),
-        },
-        instruction_count: decoded.message.instructions().len(),
-        account_keys,
-        program_ids,
-    })
-}
-
-/// The processed-but-not-flushed window, shared by process and flush.
-#[derive(Debug, Default)]
-pub struct SlotBuffer {
-    inner: Mutex<BufferInner>,
-    filled: Notify,
-}
-
-#[derive(Debug, Default)]
-struct BufferInner {
-    slots: Vec<BufferedSlot>,
-    /// Highest slot processed into the buffer, skipped slots included.
-    high_water: Option<u64>,
-}
-
-/// What one drain of the buffer took out.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Drained {
-    pub slots: Vec<BufferedSlot>,
-    /// Highest slot covered, skipped slots included. The flush edge moves
-    /// here once `slots` are written.
-    pub high_water: u64,
-}
-
-impl SlotBuffer {
-    /// A copy of what is currently buffered.
-    pub fn snapshot(&self) -> Vec<BufferedSlot> {
-        self.lock().slots.clone()
-    }
-
-    /// Buffered slots (skipped slots are not buffered).
-    pub fn len(&self) -> usize {
-        self.lock().slots.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn push(&self, slot: BufferedSlot, flush_at: usize) {
-        let len = {
-            let mut inner = self.lock();
-            inner.high_water = Some(slot.slot);
-            inner.slots.push(slot);
-            inner.slots.len()
-        };
-        if len >= flush_at {
-            self.filled.notify_one();
-        }
-    }
-
-    fn mark_skipped(&self, slot: u64) {
-        self.lock().high_water = Some(slot);
-    }
-
-    /// Take everything out. `None` when nothing was processed since the last
-    /// drain.
-    fn drain(&self) -> Option<Drained> {
-        let mut inner = self.lock();
-        let high_water = inner.high_water.take()?;
-        Some(Drained {
-            slots: std::mem::take(&mut inner.slots),
-            high_water,
-        })
-    }
-
-    /// Put a drain back after a failed flush, ahead of anything newer.
-    fn restore(&self, drained: Drained) {
-        let mut inner = self.lock();
-        let mut slots = drained.slots;
-        slots.append(&mut inner.slots);
-        inner.slots = slots;
-        inner.high_water = Some(inner.high_water.map_or(drained.high_water, |h| h.max(drained.high_water)));
-    }
-
-    fn lock(&self) -> MutexGuard<'_, BufferInner> {
-        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sink
-// ---------------------------------------------------------------------------
-
-/// Where flushed slots go. The Parquet writer will implement this.
-#[async_trait]
-pub trait FlushSink: Send + Sync {
-    /// Write `slots` durably. Returns once they are on disk; an `Err` means
-    /// they are not, and the cursor's flush edge does not move.
-    async fn flush(&self, slots: &[BufferedSlot]) -> PrismResult<()>;
-}
-
-/// A sink that only logs what it is given: the stand-in until the Parquet
-/// writer exists.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LogSink;
-
-#[async_trait]
-impl FlushSink for LogSink {
-    async fn flush(&self, slots: &[BufferedSlot]) -> PrismResult<()> {
-        let transactions: usize = slots.iter().map(|slot| slot.transactions.len()).sum();
-        info!(
-            slots = slots.len(),
-            transactions,
-            first_slot = slots.first().map(|slot| slot.slot),
-            last_slot = slots.last().map(|slot| slot.slot),
-            "flushed (log sink)"
-        );
         Ok(())
     }
 }
@@ -474,21 +240,17 @@ pub async fn helius_solana_adapter(api_key: &str, cluster: Cluster) -> PrismResu
 // Ingestor
 // ---------------------------------------------------------------------------
 
-/// What fetch hands to process.
-#[derive(Debug)]
-enum Fetched {
-    Block(Box<ChainBlock>),
-    Skipped(u64),
-}
-
 /// Totals of one [`Ingestor::run`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IngestorReport {
     /// First slot fetched, `None` when the run fetched nothing.
     pub first_slot: Option<u64>,
+    /// Slots with data handed to the writer.
     pub slots_processed: u64,
     pub slots_skipped: u64,
     pub transactions_processed: u64,
+    /// Successful flushes, including those that only moved the flush edge
+    /// past skipped slots.
     pub flushes: u64,
     /// Cursor state after the final flush.
     pub cursor: CursorState,
@@ -498,33 +260,69 @@ pub struct IngestorReport {
 pub struct Ingestor {
     adapter: Arc<dyn ChainAdapter>,
     commitment_tracker: Arc<CommitmentTracker>,
+    changelog: Arc<dyn ChangeLog>,
+    processor: Arc<SlotProcessor>,
+    decoders: Arc<DecoderRegistry>,
+    resolver: Arc<AsyncMutex<AccountResolver>>,
+    resolver_metrics: Arc<ResolverMetrics>,
+    writer: Arc<Mutex<ParquetWriter>>,
     cursor: IngestorCursor,
     config: IngestorConfig,
     shutdown: CancellationToken,
-    buffer: Arc<SlotBuffer>,
-    sink: Arc<dyn FlushSink>,
+}
+
+impl std::fmt::Debug for Ingestor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ingestor")
+            .field("chain_id", &self.adapter.chain_id())
+            .field("config", &self.config)
+            .field("cursor", &self.cursor.state())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Ingestor {
-    /// Wire up a pipeline. Loads (or initialises) the cursor; no request is
-    /// made until [`Self::run`].
+    /// Wire up a pipeline: builds the slot processor (whose gap handler
+    /// publishes to `changelog`), a decoder registry for SPL Token and
+    /// Token-2022, the account resolver and a [`ParquetWriter`] under
+    /// [`IngestorConfig::data_dir`]. Loads (or initialises) the cursor. No
+    /// request is made and nothing is written until [`Self::run`].
     pub fn new(
         adapter: Arc<dyn ChainAdapter>,
         commitment_tracker: Arc<CommitmentTracker>,
+        changelog: Arc<dyn ChangeLog>,
         config: IngestorConfig,
-        sink: Arc<dyn FlushSink>,
     ) -> PrismResult<Self> {
         config.validate()?;
         let cursor = IngestorCursor::load_or_init(&config.cursor_path)?;
+        let processor = SlotProcessor::new(
+            SlotFetcher::new(Arc::clone(&adapter), config.fetcher)?,
+            GapHandler::new(Arc::clone(&changelog), &config.skip_log_path),
+            Normalizer::new(),
+        );
+        let resolver = AccountResolver::new(Arc::clone(&adapter));
+        let resolver_metrics = Arc::clone(resolver.metrics());
         Ok(Self {
             adapter,
             commitment_tracker,
+            changelog,
+            processor: Arc::new(processor),
+            decoders: Arc::new(DecoderRegistry::with_spl_token()),
+            resolver: Arc::new(AsyncMutex::new(resolver)),
+            resolver_metrics,
+            writer: Arc::new(Mutex::new(ParquetWriter::new(&config.data_dir))),
             cursor,
             config,
             shutdown: CancellationToken::new(),
-            buffer: Arc::new(SlotBuffer::default()),
-            sink,
         })
+    }
+
+    /// Decode with `registry` instead of the default SPL Token registry,
+    /// e.g. one with [`AnchorDecoder`](crate::decoder::AnchorDecoder)s added.
+    #[must_use]
+    pub fn with_decoders(mut self, registry: DecoderRegistry) -> Self {
+        self.decoders = Arc::new(registry);
+        self
     }
 
     pub fn config(&self) -> &IngestorConfig {
@@ -535,9 +333,31 @@ impl Ingestor {
         &self.cursor
     }
 
-    /// The in-memory window of processed, not yet flushed slots.
-    pub fn buffer(&self) -> &Arc<SlotBuffer> {
-        &self.buffer
+    pub fn commitment_tracker(&self) -> &Arc<CommitmentTracker> {
+        &self.commitment_tracker
+    }
+
+    /// The slot processor, for its fetcher, gap handler and own metrics.
+    pub fn processor(&self) -> &Arc<SlotProcessor> {
+        &self.processor
+    }
+
+    pub fn decoders(&self) -> &DecoderRegistry {
+        &self.decoders
+    }
+
+    pub fn resolver_metrics(&self) -> &Arc<ResolverMetrics> {
+        &self.resolver_metrics
+    }
+
+    /// The Parquet writer's counters.
+    pub fn writer_metrics(&self) -> Arc<WriterMetrics> {
+        Arc::clone(lock(&self.writer).metrics())
+    }
+
+    /// Slots appended to the writer and not yet flushed.
+    pub fn buffered_slot_count(&self) -> u64 {
+        lock(&self.writer).buffered_slot_count()
     }
 
     /// Cancel this to shut the pipeline down gracefully.
@@ -566,8 +386,12 @@ impl Ingestor {
     /// Run the pipeline until shut down, until [`IngestorConfig::end_slot`]
     /// is ingested, or until a component fails.
     ///
+    /// Before anything is fetched, files at or above the first slot are
+    /// rolled back: they were written by a flush the cursor never recorded,
+    /// and their slots are about to be written again.
+    ///
     /// The buffer is flushed and the cursor persisted on the way out in every
-    /// case where the sink still works. The first error any task hit is
+    /// case where the writer still works. The first error any task hit is
     /// returned.
     pub async fn run(&self) -> PrismResult<IngestorReport> {
         let first = self.starting_slot().await?;
@@ -578,56 +402,56 @@ impl Ingestor {
                 ..IngestorReport::default()
             });
         }
-        info!(first_slot = first, chain = self.adapter.chain_id(), "ingestor starting");
+        lock(&self.writer).rollback(first)?;
+        info!(
+            first_slot = first,
+            chain = self.adapter.chain_id(),
+            data_dir = %self.config.data_dir.display(),
+            "ingestor starting"
+        );
 
         let (tx, rx) = mpsc::channel(self.config.channel_capacity);
-        // Cancelled by process on exit: tells flush that nothing more comes.
-        let drained = CancellationToken::new();
-
-        let fetch = spawn_task(&self.shutdown, fetch_task(
+        let process = spawn_task(&self.shutdown, process_task(
             Arc::clone(&self.adapter),
+            Arc::clone(&self.processor),
+            Arc::clone(&self.decoders),
+            Arc::clone(&self.resolver),
             self.config.clone(),
             first,
             tx,
             self.shutdown.clone(),
         ));
-        let process = spawn_task(&self.shutdown, process_task(
-            Arc::clone(&self.commitment_tracker),
-            self.cursor.clone(),
-            Arc::clone(&self.buffer),
-            self.config.flush_max_slots,
-            rx,
-            drained.clone(),
-        ));
-        let flush = spawn_task(&self.shutdown, flush_task(
-            Arc::clone(&self.sink),
-            self.cursor.clone(),
-            Arc::clone(&self.buffer),
-            self.config.flush_interval,
-            drained,
-        ));
+        let writer = WriterTask {
+            writer: Arc::clone(&self.writer),
+            changelog: Arc::clone(&self.changelog),
+            cursor: self.cursor.clone(),
+            flush_max_slots: self.config.flush_max_slots as u64,
+            max_flush_failures: self.config.max_flush_failures,
+            pending: Vec::new(),
+            high_water: None,
+            consecutive_failures: 0,
+            totals: WriterTotals::default(),
+        };
+        let writer = spawn_task(&self.shutdown, writer.run(rx, self.config.flush_interval));
 
-        let fetch_result = self.join("fetch", fetch).await;
         let process_result = self.join("process", process).await;
-        let flush_result = self.join("flush", flush).await;
-
-        let slots_skipped = fetch_result?;
-        let (slots_processed, transactions_processed) = process_result?;
-        let flushes = flush_result?;
+        let writer_result = self.join("writer", writer).await;
+        process_result?;
+        let totals = writer_result?;
         let cursor = self.cursor.state();
         info!(
-            slots_processed,
-            slots_skipped,
-            transactions_processed,
+            slots_processed = totals.slots_processed,
+            slots_skipped = totals.slots_skipped,
+            transactions_processed = totals.transactions_processed,
             last_flush_slot = cursor.last_flush_slot,
             "ingestor stopped"
         );
         Ok(IngestorReport {
             first_slot: Some(first),
-            slots_processed,
-            slots_skipped,
-            transactions_processed,
-            flushes,
+            slots_processed: totals.slots_processed,
+            slots_skipped: totals.slots_skipped,
+            transactions_processed: totals.transactions_processed,
+            flushes: totals.flushes,
             cursor,
         })
     }
@@ -650,6 +474,12 @@ impl Ingestor {
     }
 }
 
+fn lock(writer: &Mutex<ParquetWriter>) -> MutexGuard<'_, ParquetWriter> {
+    // Appends and flushes leave the buffers whole or untouched, so a panic
+    // elsewhere cannot leave the writer half-updated.
+    writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Spawn a pipeline task that cancels `shutdown` when it fails, so the
 /// other tasks wind down right away instead of when the failure is joined.
 fn spawn_task<T: Send + 'static>(
@@ -666,22 +496,29 @@ fn spawn_task<T: Send + 'static>(
     })
 }
 
-/// Follow the tip and send every slot from `next` upwards. Returns the
-/// number of skipped slots.
-async fn fetch_task(
+// ---------------------------------------------------------------------------
+// Process task
+// ---------------------------------------------------------------------------
+
+/// Follow the tip and send every slot from `next` upwards, processed,
+/// decoded and resolved.
+#[allow(clippy::too_many_arguments)]
+async fn process_task(
     adapter: Arc<dyn ChainAdapter>,
+    processor: Arc<SlotProcessor>,
+    decoders: Arc<DecoderRegistry>,
+    resolver: Arc<AsyncMutex<AccountResolver>>,
     config: IngestorConfig,
     mut next: u64,
-    tx: mpsc::Sender<Fetched>,
+    tx: mpsc::Sender<ProcessedSlot>,
     shutdown: CancellationToken,
-) -> PrismResult<u64> {
-    let mut skipped = 0;
+) -> PrismResult<()> {
     loop {
         if config.end_slot.is_some_and(|end| next > end) {
-            return Ok(skipped);
+            return Ok(());
         }
         let tip = tokio::select! {
-            () = shutdown.cancelled() => return Ok(skipped),
+            () = shutdown.cancelled() => return Ok(()),
             tip = adapter.get_tip(config.commitment) => tip,
         };
         let tip = match tip {
@@ -689,7 +526,7 @@ async fn fetch_task(
             Err(err) if err.is_retryable() => {
                 warn!(error = %err, "tip unavailable; retrying");
                 if !pause(&shutdown, config.tip_poll_interval).await {
-                    return Ok(skipped);
+                    return Ok(());
                 }
                 continue;
             }
@@ -697,42 +534,53 @@ async fn fetch_task(
         };
         let upto = config.end_slot.map_or(tip, |end| end.min(tip));
         while next <= upto {
-            let block = tokio::select! {
-                () = shutdown.cancelled() => return Ok(skipped),
-                block = adapter.get_block(next) => block,
-            };
-            let item = match block {
-                Ok(block) => Fetched::Block(Box::new(block)),
-                Err(PrismError::SlotSkipped { slot }) => {
-                    skipped += 1;
-                    Fetched::Skipped(slot)
-                }
-                Err(err) if err.is_retryable() => {
-                    warn!(slot = next, error = %err, "block unavailable; retrying");
-                    if !pause(&shutdown, config.tip_poll_interval).await {
-                        return Ok(skipped);
-                    }
-                    continue;
-                }
-                Err(err) => return Err(err),
+            let processed = tokio::select! {
+                () = shutdown.cancelled() => return Ok(()),
+                processed = process_slot(&processor, &decoders, &resolver, next) => processed?,
             };
             let sent = tokio::select! {
-                () = shutdown.cancelled() => return Ok(skipped),
-                sent = tx.send(item) => sent,
+                () = shutdown.cancelled() => return Ok(()),
+                sent = tx.send(processed) => sent,
             };
             if sent.is_err() {
-                // Process is gone; its own error is what gets reported.
-                return Ok(skipped);
+                // The writer is gone; its own error is what gets reported.
+                return Ok(());
             }
             next += 1;
         }
         if config.end_slot.is_some_and(|end| next > end) {
-            return Ok(skipped);
+            return Ok(());
         }
         if !pause(&shutdown, config.tip_poll_interval).await {
-            return Ok(skipped);
+            return Ok(());
         }
     }
+}
+
+/// `slot` through the slot processor, then, when it has data, its
+/// instructions decoded and its token transfers resolved into
+/// [`ProcessedSlot::udm_transfers`].
+async fn process_slot(
+    processor: &SlotProcessor,
+    decoders: &DecoderRegistry,
+    resolver: &AsyncMutex<AccountResolver>,
+    slot: u64,
+) -> PrismResult<ProcessedSlot> {
+    let mut processed = processor.process(slot).await?;
+    let Some(udm_slot) = processed.udm_slot.take() else {
+        return Ok(processed);
+    };
+    let mut block = NormalizedBlock {
+        slot: udm_slot,
+        transactions: std::mem::take(&mut processed.udm_transactions),
+        instructions: std::mem::take(&mut processed.udm_instructions),
+    };
+    let transfers = decoders.decode_block(&mut block);
+    processed.udm_transfers = resolver.lock().await.resolve(transfers).await?;
+    processed.udm_slot = Some(block.slot);
+    processed.udm_transactions = block.transactions;
+    processed.udm_instructions = block.instructions;
+    Ok(processed)
 }
 
 /// Sleep for `duration`; `false` when shutdown came first.
@@ -743,80 +591,137 @@ async fn pause(shutdown: &CancellationToken, duration: Duration) -> bool {
     }
 }
 
-/// Decode fetched blocks into the buffer until fetch hangs up. Returns
-/// (slots processed, transactions processed).
-async fn process_task(
-    tracker: Arc<CommitmentTracker>,
-    cursor: IngestorCursor,
-    buffer: Arc<SlotBuffer>,
-    flush_at: usize,
-    mut rx: mpsc::Receiver<Fetched>,
-    drained: CancellationToken,
-) -> PrismResult<(u64, u64)> {
-    let _drained = drained.drop_guard();
-    let (mut slots, mut transactions) = (0, 0);
-    while let Some(item) = rx.recv().await {
-        match item {
-            Fetched::Block(block) => {
-                let buffered =
-                    BufferedSlot::from_block(&block, tracker.is_finalized(block.slot_or_height))?;
-                slots += 1;
-                transactions += buffered.transactions.len() as u64;
-                cursor.record_processed(buffered.slot, &buffered.blockhash);
-                buffer.push(buffered, flush_at);
-            }
-            Fetched::Skipped(slot) => {
-                cursor.record_skipped(slot);
-                buffer.mark_skipped(slot);
-            }
-        }
-    }
-    Ok((slots, transactions))
+// ---------------------------------------------------------------------------
+// Writer task
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct WriterTotals {
+    slots_processed: u64,
+    slots_skipped: u64,
+    transactions_processed: u64,
+    flushes: u64,
 }
 
-/// Flush the buffer on a timer or when it fills, and once more when process
-/// is done. Returns the number of flushes that wrote something.
-async fn flush_task(
-    sink: Arc<dyn FlushSink>,
+/// The consuming end of the pipeline: buffers processed slots in the
+/// [`ParquetWriter`], flushes them, announces them and moves the cursor.
+struct WriterTask {
+    writer: Arc<Mutex<ParquetWriter>>,
+    changelog: Arc<dyn ChangeLog>,
     cursor: IngestorCursor,
-    buffer: Arc<SlotBuffer>,
-    interval: Duration,
-    drained: CancellationToken,
-) -> PrismResult<u64> {
-    let mut flushes = 0;
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-    loop {
-        let done = tokio::select! {
-            () = drained.cancelled() => true,
-            _ = ticker.tick() => false,
-            () = buffer.filled.notified() => false,
+    flush_max_slots: u64,
+    max_flush_failures: u32,
+    /// Slot rows appended since the last successful flush, in slot order:
+    /// each gets a `New` event once its files are written.
+    pending: Vec<DeepAnaSlot>,
+    /// Highest slot received since the last successful flush, skipped slots
+    /// included. The flush edge moves here.
+    high_water: Option<u64>,
+    consecutive_failures: u32,
+    totals: WriterTotals,
+}
+
+impl WriterTask {
+    /// Consume the channel until process hangs up, then flush what is left
+    /// and persist the cursor.
+    async fn run(
+        mut self,
+        mut rx: mpsc::Receiver<ProcessedSlot>,
+        interval: Duration,
+    ) -> PrismResult<WriterTotals> {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                processed = rx.recv() => {
+                    let Some(processed) = processed else { break };
+                    if self.receive(processed)? {
+                        self.flush(false).await?;
+                    }
+                }
+                _ = ticker.tick() => self.flush(false).await?,
+            }
+        }
+        self.flush(true).await?;
+        self.cursor.persist()?;
+        Ok(self.totals)
+    }
+
+    /// Take one processed slot in. Returns whether the buffer is full enough
+    /// to flush now; not after a failed flush, which waits for the next
+    /// interval instead of retrying on every slot.
+    fn receive(&mut self, processed: ProcessedSlot) -> PrismResult<bool> {
+        let slot = processed.slot;
+        self.high_water = Some(slot);
+        if processed.was_skipped {
+            // The slot processor's gap handler has already published the
+            // `Skip` event and written the skip log.
+            self.cursor.record_skipped(slot);
+            self.totals.slots_skipped += 1;
+            return Ok(false);
+        }
+        let Some(udm_slot) = processed.udm_slot else {
+            return Err(PrismError::deserialize(
+                Some(slot),
+                "processed slot",
+                "not skipped, yet it has no slot row",
+            ));
         };
-        if flush_once(sink.as_ref(), &cursor, &buffer).await? {
-            flushes += 1;
-        }
-        if done {
-            cursor.persist()?;
-            return Ok(flushes);
-        }
+        let buffered = {
+            let mut writer = lock(&self.writer);
+            writer.append(
+                &udm_slot,
+                &processed.udm_transactions,
+                &processed.udm_instructions,
+                &processed.udm_transfers,
+            )?;
+            writer.buffered_slot_count()
+        };
+        self.cursor.record_processed(slot, &udm_slot.blockhash);
+        self.totals.slots_processed += 1;
+        self.totals.transactions_processed += processed.udm_transactions.len() as u64;
+        self.pending.push(udm_slot);
+        Ok(self.consecutive_failures == 0 && buffered >= self.flush_max_slots)
     }
-}
 
-/// Drain the buffer into the sink and move the flush edge. `false` when
-/// there was nothing to flush.
-async fn flush_once(
-    sink: &dyn FlushSink,
-    cursor: &IngestorCursor,
-    buffer: &SlotBuffer,
-) -> PrismResult<bool> {
-    let Some(drained) = buffer.drain() else {
-        return Ok(false);
-    };
-    if let Err(err) = sink.flush(&drained.slots).await {
-        buffer.restore(drained);
-        return Err(err);
+    /// Flush the writer, emit a `New` event per flushed slot, then move the
+    /// flush edge. Nothing to do when no slot came in since the last flush.
+    ///
+    /// A failed flush is logged and left for the next call, unless it is the
+    /// `last` one or the `max_flush_failures`th in a row, which is returned.
+    /// A change log failure is returned at once: the cursor has not moved,
+    /// so the slots are written and announced again after a restart.
+    async fn flush(&mut self, last: bool) -> PrismResult<()> {
+        let Some(high_water) = self.high_water else {
+            return Ok(());
+        };
+        let flushed = lock(&self.writer).flush();
+        let result = match flushed {
+            Ok(result) => result,
+            Err(err) => {
+                self.consecutive_failures += 1;
+                if last || self.consecutive_failures >= self.max_flush_failures {
+                    return Err(err);
+                }
+                warn!(
+                    failures = self.consecutive_failures,
+                    max = self.max_flush_failures,
+                    error = %err,
+                    "flush failed; rows stay buffered until the next interval"
+                );
+                return Ok(());
+            }
+        };
+        self.consecutive_failures = 0;
+        for slot in &self.pending {
+            let event = ChangeEvent::new_from_slot(slot, result.parquet_paths.clone());
+            self.changelog.emit(event).await?;
+        }
+        self.pending.clear();
+        self.cursor.record_flush(high_water)?;
+        self.high_water = None;
+        self.totals.flushes += 1;
+        Ok(())
     }
-    cursor.record_flush(drained.high_water)?;
-    Ok(true)
 }

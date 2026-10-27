@@ -1,36 +1,46 @@
 //! Tests for `prism::ingestor`.
 //!
 //! The pipeline tests run against a [`ScriptedChain`]: an in-memory chain
-//! with a movable tip, skipped slots and injectable failures. Flushed data
-//! lands in a [`RecordingSink`].
+//! with a movable tip, skipped slots, token transfers and injectable
+//! failures. Every run writes real Parquet files under a fresh temp
+//! directory, which the tests read back, and publishes to a
+//! [`RecordingChangeLog`].
 //!
-//! The `live_*` tests talk to Solana devnet through the Helius SDK and print
-//! the real transactions the ingestor buffers. They need `HELIUS_API_KEY`
-//! and are skipped (with a note) without it. To see the output:
+//! The `live_*` tests run the ingestor against Solana devnet through the
+//! Helius SDK and print what it wrote. They need `HELIUS_API_KEY` and are
+//! skipped (with a note) without it. To see the output:
 //!
 //! ```text
 //! HELIUS_API_KEY=... cargo test -p prism --test ingestor_test live_ -- --nocapture --test-threads=1
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arrow::array::{AsArray, RecordBatch};
+use arrow::datatypes::{UInt8Type, UInt64Type};
 use async_trait::async_trait;
 use helius::types::Cluster;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use prism::adapter::config::TransactionEncoding;
 use prism::adapter::{
     AccountData, ChainAdapter, ChainBlock, ChainBlockData, ChainFamily, ChainTip, CommitmentLevel,
 };
-use prism::adapter::config::TransactionEncoding;
+use prism::changelog::ChangeLog;
 use prism::commitment::{CommitmentTracker, FinalityWatermark};
+use prism::decoder::spl_token::SPL_TOKEN_PROGRAM_ID;
 use prism::ingestor::{
-    BufferedSlot, BufferedTransaction, CursorState, FlushSink, HELIUS_API_KEY_ENV, Ingestor,
-    IngestorConfig, IngestorCursor, LogSink, VOTE_PROGRAM_ID, helius_api_key_from_env,
-    helius_chain_id, helius_solana_adapter,
+    CURSOR_FILE_NAME, CursorState, HELIUS_API_KEY_ENV, Ingestor, IngestorConfig, IngestorCursor,
+    SKIP_LOG_FILE_NAME, helius_api_key_from_env, helius_chain_id, helius_solana_adapter,
 };
+use prism::slot_processor::SlotFetcherConfig;
+use prism::storage::{PartitionKey, TableKind};
 use prism::types::error::{PrismError, PrismResult};
+use prism::types::event::{ChangeEvent, SkipReason};
 use serde_json::{Value, json};
 use solana_client::client_error::ClientError;
 use solana_transaction_status::EncodedConfirmedBlock;
@@ -47,7 +57,7 @@ fn temp_path(name: &str) -> PathBuf {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&dir);
     dir.join(name)
 }
 
@@ -64,8 +74,22 @@ fn rpc_failure() -> PrismError {
 }
 
 const PAYER: &str = "11111111111111111111111111111112";
-const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGqPFXCWuBvf9Ss623VQ5DA";
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
+const SOURCE: &str = "Src1111111111111111111111111111111111111111";
+const DESTINATION: &str = "Dst1111111111111111111111111111111111111111";
+const MINT: &str = "Mint111111111111111111111111111111111111111";
+const TRANSFER_AMOUNT: u64 = 1_500_000;
+const TRANSFER_DECIMALS: u8 = 6;
+
+fn meta_json(err: Option<Value>, fee: u64) -> Value {
+    json!({
+        "err": err,
+        "status": if err.is_some() { json!({"Err": err}) } else { json!({"Ok": null}) },
+        "fee": fee,
+        "preBalances": [], "postBalances": [],
+        "computeUnitsConsumed": 1_000 + fee,
+    })
+}
 
 /// One transaction in the RPC's `json` encoding.
 fn tx_json(signature: &str, program_ids: &[&str], err: Option<Value>, fee: u64) -> Value {
@@ -91,13 +115,32 @@ fn tx_json(signature: &str, program_ids: &[&str], err: Option<Value>, fee: u64) 
                 "instructions": instructions,
             }
         },
-        "meta": {
-            "err": err,
-            "status": if err.is_some() { json!({"Err": err}) } else { json!({"Ok": null}) },
-            "fee": fee,
-            "preBalances": [], "postBalances": [],
-            "computeUnitsConsumed": 1_000 + fee,
-        }
+        "meta": meta_json(err, fee),
+    })
+}
+
+/// A transaction whose one instruction is an SPL Token `TransferChecked`
+/// of [`TRANSFER_AMOUNT`] [`MINT`] from [`SOURCE`] to [`DESTINATION`].
+fn transfer_checked_tx_json(signature: &str) -> Value {
+    let mut data = vec![12u8];
+    data.extend(TRANSFER_AMOUNT.to_le_bytes());
+    data.push(TRANSFER_DECIMALS);
+    json!({
+        "transaction": {
+            "signatures": [signature],
+            "message": {
+                "header": {"numRequiredSignatures": 1, "numReadonlySignedAccounts": 0, "numReadonlyUnsignedAccounts": 2},
+                "accountKeys": [PAYER, SOURCE, MINT, DESTINATION, SPL_TOKEN_PROGRAM_ID],
+                "recentBlockhash": "11111111111111111111111111111111",
+                "instructions": [{
+                    "programIdIndex": 4,
+                    "accounts": [1, 2, 3, 0],
+                    "data": bs58::encode(data).into_string(),
+                    "stackHeight": null,
+                }],
+            }
+        },
+        "meta": meta_json(None, 5_000),
     })
 }
 
@@ -129,6 +172,69 @@ fn simple_block(slot: u64, count: usize) -> ChainBlock {
     chain_block(slot, txs)
 }
 
+/// Transactions the [`ScriptedChain`] serves for `slot` without a token
+/// transfer.
+fn tx_count(slot: u64) -> u64 {
+    slot % 3 + 1
+}
+
+/// Every `.parquet` file of `table` under `data_dir`, by starting slot.
+fn table_files(data_dir: &Path, table: TableKind) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![PartitionKey::table_root(data_dir, table)];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort_by_key(|p| PartitionKey::from_path(p).expect("a path in the layout").from_slot());
+    files
+}
+
+/// Every batch of every file of `table`, in file order.
+fn read_table(data_dir: &Path, table: TableKind) -> Vec<RecordBatch> {
+    table_files(data_dir, table)
+        .iter()
+        .flat_map(|path| {
+            ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+                .unwrap()
+                .build()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The `slot` column of every row of `table`, across all files.
+fn table_slots(data_dir: &Path, table: TableKind) -> Vec<u64> {
+    read_table(data_dir, table)
+        .iter()
+        .flat_map(|b| b.column_by_name("slot").unwrap().as_primitive::<UInt64Type>().values().to_vec())
+        .collect()
+}
+
+fn table_rows(data_dir: &Path, table: TableKind) -> usize {
+    read_table(data_dir, table).iter().map(RecordBatch::num_rows).sum()
+}
+
+/// Waits up to 5 s for `done`.
+async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
 // ---------------------------------------------------------------------------
 // Fakes
 // ---------------------------------------------------------------------------
@@ -138,6 +244,8 @@ fn simple_block(slot: u64, count: usize) -> ChainBlock {
 struct ScriptedChain {
     tip: AtomicU64,
     skipped: Mutex<HashSet<u64>>,
+    /// Slots whose block holds one SPL Token `TransferChecked`.
+    with_transfer: Mutex<HashSet<u64>>,
     /// Transient failures still to be served, per slot.
     transient: Mutex<HashMap<u64, usize>>,
     /// Slots that fail permanently.
@@ -146,7 +254,7 @@ struct ScriptedChain {
     tip_failures: AtomicUsize,
     block_calls: Mutex<Vec<u64>>,
     /// When set, the tip moves up by one on every tip read.
-    advancing: std::sync::atomic::AtomicBool,
+    advancing: AtomicBool,
 }
 
 impl ScriptedChain {
@@ -209,9 +317,13 @@ impl ChainAdapter for ScriptedChain {
         if self.skipped.lock().unwrap().contains(&slot) {
             return Err(PrismError::slot_skipped(slot));
         }
-        Ok(simple_block(slot, (slot % 3) as usize + 1))
+        if self.with_transfer.lock().unwrap().contains(&slot) {
+            return Ok(chain_block(slot, vec![transfer_checked_tx_json(&format!("xfer-{slot}"))]));
+        }
+        Ok(simple_block(slot, tx_count(slot) as usize))
     }
 
+    /// No account exists: mints stay unresolved.
     async fn get_accounts(&self, addresses: &[String]) -> PrismResult<Vec<Option<AccountData>>> {
         Ok(vec![None; addresses.len()])
     }
@@ -221,40 +333,47 @@ impl ChainAdapter for ScriptedChain {
     }
 }
 
-/// Keeps every batch it is given; can be told to fail.
+/// Keeps every event it is given; can be told to refuse `New` events.
 #[derive(Default)]
-struct RecordingSink {
-    batches: Mutex<Vec<Vec<BufferedSlot>>>,
-    failures: AtomicUsize,
+struct RecordingChangeLog {
+    events: Mutex<Vec<ChangeEvent>>,
+    refuse_new: AtomicBool,
 }
 
-impl RecordingSink {
-    fn slots(&self) -> Vec<u64> {
-        self.batches
-            .lock()
-            .unwrap()
+impl RecordingChangeLog {
+    fn events(&self) -> Vec<ChangeEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    /// Slots of the `New` events, in emission order.
+    fn new_slots(&self) -> Vec<u64> {
+        self.events()
             .iter()
-            .flatten()
-            .map(|slot| slot.slot)
+            .filter_map(|e| match e {
+                ChangeEvent::New { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn skips(&self) -> Vec<(u64, SkipReason)> {
+        self.events()
+            .iter()
+            .filter_map(|e| match e {
+                ChangeEvent::Skip { slot, reason } => Some((*slot, *reason)),
+                _ => None,
+            })
             .collect()
     }
 }
 
 #[async_trait]
-impl FlushSink for RecordingSink {
-    async fn flush(&self, slots: &[BufferedSlot]) -> PrismResult<()> {
-        if self
-            .failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return Err(PrismError::storage(
-                "transactions",
-                (0, 0),
-                std::io::Error::other("disk full"),
-            ));
+impl ChangeLog for RecordingChangeLog {
+    async fn emit(&self, event: ChangeEvent) -> PrismResult<()> {
+        if matches!(event, ChangeEvent::New { .. }) && self.refuse_new.load(Ordering::SeqCst) {
+            return Err(PrismError::config("changelog", "unavailable"));
         }
-        self.batches.lock().unwrap().push(slots.to_vec());
+        self.events.lock().unwrap().push(event);
         Ok(())
     }
 }
@@ -263,20 +382,31 @@ fn tracker() -> Arc<CommitmentTracker> {
     Arc::new(CommitmentTracker::from_watermark(Arc::new(FinalityWatermark::new())))
 }
 
-fn fast_config(cursor_path: PathBuf) -> IngestorConfig {
+fn fast_fetcher() -> SlotFetcherConfig {
+    SlotFetcherConfig {
+        max_retries: 3,
+        base_delay_ms: 1,
+        max_delay_ms: 2,
+        request_timeout_ms: 1_000,
+    }
+}
+
+fn fast_config(data_dir: PathBuf) -> IngestorConfig {
     IngestorConfig {
         tip_poll_interval: Duration::from_millis(5),
         flush_interval: Duration::from_millis(20),
-        ..IngestorConfig::new(cursor_path)
+        fetcher: fast_fetcher(),
+        ..IngestorConfig::new(data_dir)
     }
 }
 
 fn ingestor(
     chain: Arc<ScriptedChain>,
     config: IngestorConfig,
-    sink: Arc<RecordingSink>,
+    changelog: &Arc<RecordingChangeLog>,
 ) -> Ingestor {
-    Ingestor::new(chain, tracker(), config, sink).expect("valid ingestor config")
+    Ingestor::new(chain, tracker(), Arc::clone(changelog) as Arc<dyn ChangeLog>, config)
+        .expect("valid ingestor config")
 }
 
 // ---------------------------------------------------------------------------
@@ -433,25 +563,37 @@ fn unreadable_cursor_path_is_a_cursor_error() {
     assert_eq!(err.kind(), "cursor_error");
 }
 
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
 #[test]
-fn default_config_is_valid() {
-    IngestorConfig::new("cursor.json").validate().unwrap();
+fn default_config_is_valid_and_keeps_its_files_in_the_data_dir() {
+    let config = IngestorConfig::new("/var/prism");
+    config.validate().unwrap();
+    assert_eq!(config.data_dir, Path::new("/var/prism"));
+    assert_eq!(config.cursor_path, Path::new("/var/prism").join(CURSOR_FILE_NAME));
+    assert_eq!(config.skip_log_path, Path::new("/var/prism").join(SKIP_LOG_FILE_NAME));
 }
 
 #[test]
 fn invalid_configs_name_the_offending_field() {
-    let base = IngestorConfig::new("cursor.json");
+    let base = IngestorConfig::new("data");
     let cases: Vec<(&str, IngestorConfig)> = vec![
+        ("data_dir", IngestorConfig { data_dir: PathBuf::new(), ..base.clone() }),
         ("cursor_path", IngestorConfig { cursor_path: PathBuf::new(), ..base.clone() }),
+        ("skip_log_path", IngestorConfig { skip_log_path: PathBuf::new(), ..base.clone() }),
         ("end_slot", IngestorConfig { start_slot: Some(10), end_slot: Some(9), ..base.clone() }),
         ("tip_poll_interval", IngestorConfig { tip_poll_interval: Duration::ZERO, ..base.clone() }),
+        (
+            "base_delay_ms",
+            IngestorConfig { fetcher: SlotFetcherConfig { base_delay_ms: 0, ..fast_fetcher() }, ..base.clone() },
+        ),
         ("channel_capacity", IngestorConfig { channel_capacity: 0, ..base.clone() }),
         ("flush_interval", IngestorConfig { flush_interval: Duration::ZERO, ..base.clone() }),
         ("flush_max_slots", IngestorConfig { flush_max_slots: 0, ..base.clone() }),
+        ("max_flush_failures", IngestorConfig { max_flush_failures: 0, ..base.clone() }),
     ];
     for (field, config) in cases {
         match config.validate() {
@@ -463,87 +605,21 @@ fn invalid_configs_name_the_offending_field() {
 
 #[test]
 fn ingestor_new_rejects_an_invalid_config() {
-    let config = IngestorConfig { channel_capacity: 0, ..IngestorConfig::new(temp_path("c.json")) };
-    let result = Ingestor::new(ScriptedChain::with_tip(1), tracker(), config, Arc::new(LogSink));
+    let config = IngestorConfig { channel_capacity: 0, ..IngestorConfig::new(temp_path("data")) };
+    let changelog: Arc<dyn ChangeLog> = Arc::new(RecordingChangeLog::default());
+    let result = Ingestor::new(ScriptedChain::with_tip(1), tracker(), changelog, config);
     assert!(matches!(result, Err(PrismError::ConfigError { .. })));
 }
 
-// ---------------------------------------------------------------------------
-// Decoding
-// ---------------------------------------------------------------------------
-
 #[test]
-fn block_decodes_into_buffered_transactions() {
-    let block = chain_block(
-        77,
-        vec![
-            tx_json("ok", &[SYSTEM_PROGRAM, TOKEN_PROGRAM, SYSTEM_PROGRAM], None, 5_000),
-            tx_json("failed", &[TOKEN_PROGRAM], Some(json!({"InstructionError": [0, {"Custom": 1}]})), 7_000),
-            tx_json("vote", &[VOTE_PROGRAM_ID], None, 5_000),
-        ],
-    );
-    let slot = BufferedSlot::from_block(&block, true).unwrap();
-    assert_eq!(slot.slot, 77);
-    assert_eq!(slot.blockhash, hash(77));
-    assert_eq!(slot.parent_blockhash, hash(76));
-    assert_eq!(slot.block_time, Some(1_700_000_077));
-    assert!(slot.is_finalized);
-    assert_eq!(slot.transactions.len(), 3);
-
-    let ok = &slot.transactions[0];
-    assert_eq!(
-        ok,
-        &BufferedTransaction {
-            index: 0,
-            signature: "ok".into(),
-            version: "unknown".into(),
-            success: true,
-            error: None,
-            fee: 5_000,
-            compute_units: Some(6_000),
-            instruction_count: 3,
-            account_count: 3,
-            program_ids: vec![SYSTEM_PROGRAM.into(), TOKEN_PROGRAM.into()],
-            is_vote: false,
-        }
-    );
-
-    let failed = &slot.transactions[1];
-    assert_eq!(failed.index, 1);
-    assert!(!failed.success);
-    assert!(failed.error.as_deref().unwrap().contains("InstructionError"));
-    assert_eq!(failed.fee, 7_000);
-
-    assert!(slot.transactions[2].is_vote);
-    let non_votes: Vec<_> = slot.non_vote_transactions().map(|tx| tx.signature.as_str()).collect();
-    assert_eq!(non_votes, ["ok", "failed"]);
-}
-
-#[test]
-fn empty_block_decodes_to_no_transactions() {
-    let slot = BufferedSlot::from_block(&chain_block(5, vec![]), false).unwrap();
-    assert!(slot.transactions.is_empty());
-    assert!(!slot.is_finalized);
-}
-
-#[test]
-fn transaction_without_meta_counts_as_successful_with_unknown_fee() {
-    let mut tx = tx_json("nometa", &[SYSTEM_PROGRAM], None, 0);
-    tx["meta"] = Value::Null;
-    let slot = BufferedSlot::from_block(&chain_block(5, vec![tx]), false).unwrap();
-    let tx = &slot.transactions[0];
-    assert!(tx.success);
-    assert_eq!(tx.fee, 0);
-    assert_eq!(tx.compute_units, None);
-}
-
-#[test]
-fn undecodable_transaction_is_a_deserialize_error() {
-    let mut tx = tx_json("x", &[SYSTEM_PROGRAM], None, 0);
-    tx["transaction"] = json!(["!!not base64!!", "base64"]);
-    let err = BufferedSlot::from_block(&chain_block(9, vec![tx]), false).unwrap_err();
-    assert_eq!(err.kind(), "deserialize_error");
-    assert_eq!(err.slot(), Some(9));
+fn ingestor_new_writes_nothing() {
+    let dir = temp_path("data");
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let ingestor = ingestor(ScriptedChain::with_tip(1), fast_config(dir.clone()), &changelog);
+    assert!(!dir.exists());
+    assert_eq!(ingestor.buffered_slot_count(), 0);
+    assert_eq!(ingestor.writer_metrics().snapshot().total_flushes, 0);
+    assert!(ingestor.decoders().has_decoder(SPL_TOKEN_PROGRAM_ID));
 }
 
 // ---------------------------------------------------------------------------
@@ -551,71 +627,165 @@ fn undecodable_transaction_is_a_deserialize_error() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn bounded_run_ingests_every_slot_in_order() {
+async fn bounded_run_writes_every_slot_to_parquet_and_announces_it_once() {
     let chain = ScriptedChain::with_tip(1_000);
     chain.skip(&[103, 106]);
-    let sink = Arc::new(RecordingSink::default());
-    let path = temp_path("cursor.json");
-    let config = IngestorConfig { start_slot: Some(100), end_slot: Some(110), ..fast_config(path.clone()) };
-    let ingestor = ingestor(Arc::clone(&chain), config, Arc::clone(&sink));
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let dir = temp_path("data");
+    let config = IngestorConfig { start_slot: Some(100), end_slot: Some(110), ..fast_config(dir.clone()) };
+    let ingestor = ingestor(Arc::clone(&chain), config, &changelog);
 
     let report = ingestor.run().await.unwrap();
 
-    assert_eq!(report.first_slot, Some(100));
-    assert_eq!(report.slots_processed, 9);
-    assert_eq!(report.slots_skipped, 2);
     let expected: Vec<u64> = (100..=110).filter(|s| ![103, 106].contains(s)).collect();
-    assert_eq!(sink.slots(), expected);
-    let txs: u64 = expected.iter().map(|s| s % 3 + 1).sum();
-    assert_eq!(report.transactions_processed, txs);
+    let txs: u64 = expected.iter().copied().map(tx_count).sum();
+    assert_eq!(report.first_slot, Some(100));
+    assert_eq!((report.slots_processed, report.slots_skipped, report.transactions_processed), (9, 2, txs));
     assert_eq!(chain.block_calls(), (100..=110).collect::<Vec<_>>());
+
+    // On disk: every slot with data, once, in order; every transaction.
+    assert_eq!(table_slots(&dir, TableKind::Slots), expected);
+    assert_eq!(table_rows(&dir, TableKind::Transactions) as u64, txs);
+    assert_eq!(table_rows(&dir, TableKind::Instructions) as u64, txs, "one instruction per transaction");
+    assert!(table_files(&dir, TableKind::TokenTransfers).is_empty(), "no transfers, no file");
+
+    // The change log: one Skip per skipped slot (published by the slot
+    // processor, not again by the writer) and one New per slot with data,
+    // in slot order, naming files that exist and cover the slot.
+    assert_eq!(changelog.skips(), [(103, SkipReason::ValidatorSkipped), (106, SkipReason::ValidatorSkipped)]);
+    assert_eq!(changelog.new_slots(), expected);
+    for event in changelog.events() {
+        let ChangeEvent::New { slot, blockhash, parquet_paths, transaction_count, .. } = event else { continue };
+        assert_eq!(blockhash, hash(slot));
+        assert_eq!(u64::from(transaction_count), tx_count(slot));
+        assert_eq!(parquet_paths.len(), 3, "slots, transactions, instructions");
+        for path in &parquet_paths {
+            let key = PartitionKey::from_path(Path::new(path)).expect("a path in the layout");
+            assert!(Path::new(path).exists() && key.contains_slot(slot), "{slot}: {path}");
+        }
+    }
+    let skip_log = fs::read_to_string(dir.join(SKIP_LOG_FILE_NAME)).unwrap();
+    assert_eq!(skip_log.lines().count(), 2);
 
     assert_eq!(report.cursor.last_processed_slot, 110);
     assert_eq!(report.cursor.last_processed_blockhash, hash(110));
     assert_eq!(report.cursor.last_flush_slot, 110);
-    assert!(ingestor.buffer().is_empty());
-    assert_eq!(IngestorCursor::load_or_init(&path).unwrap().state(), report.cursor);
+    assert_eq!(ingestor.buffered_slot_count(), 0);
+    assert_eq!(IngestorCursor::load_or_init(dir.join(CURSOR_FILE_NAME)).unwrap().state(), report.cursor);
+    let m = ingestor.writer_metrics().snapshot();
+    assert_eq!(m.total_flushes, report.flushes);
+    assert_eq!(m.flush_errors, 0);
+}
+
+#[tokio::test]
+async fn token_transfers_are_decoded_resolved_and_written() {
+    let chain = ScriptedChain::with_tip(1_000);
+    chain.with_transfer.lock().unwrap().extend([6, 8]);
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let dir = temp_path("data");
+    let config = IngestorConfig {
+        start_slot: Some(5),
+        end_slot: Some(8),
+        // One flush, so every New event of the run shares one batch.
+        flush_interval: Duration::from_secs(3_600),
+        ..fast_config(dir.clone())
+    };
+    let ingestor = ingestor(chain, config, &changelog);
+
+    ingestor.run().await.unwrap();
+
+    let batches = read_table(&dir, TableKind::TokenTransfers);
+    let slots: Vec<u64> = batches
+        .iter()
+        .flat_map(|b| b.column_by_name("slot").unwrap().as_primitive::<UInt64Type>().values().to_vec())
+        .collect();
+    assert_eq!(slots, [6, 8]);
+    for batch in &batches {
+        let col = |name: &str| batch.column_by_name(name).unwrap().clone();
+        assert!(col("amount_raw").as_primitive::<UInt64Type>().values().iter().all(|a| *a == TRANSFER_AMOUNT));
+        assert!(col("decimals").as_primitive::<UInt8Type>().iter().all(|d| d == Some(TRANSFER_DECIMALS)));
+        assert!(col("mint_token_address").as_string::<i32>().iter().all(|m| m == Some(MINT)));
+        assert!(col("source_token_account").as_string::<i32>().iter().all(|s| s == Some(SOURCE)));
+        assert!(col("destination_token_account").as_string::<i32>().iter().all(|d| d == Some(DESTINATION)));
+    }
+    // The instruction rows carry the decoder's verdict.
+    let types: Vec<Option<String>> = read_table(&dir, TableKind::Instructions)
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("instruction_type").unwrap().as_string::<i32>().iter().map(|t| t.map(str::to_owned)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(types.iter().filter(|t| t.as_deref() == Some("TransferChecked")).count(), 2);
+
+    // The resolver saw both transfers; the chain has no mint account.
+    let r = ingestor.resolver_metrics().snapshot();
+    assert_eq!((r.total_transfers_processed, r.mint_fetches_attempted), (2, 1));
+    // The New events of the transfer slots name the transfer file too.
+    for event in changelog.events() {
+        if let ChangeEvent::New { slot, parquet_paths, .. } = event {
+            let has_transfers = parquet_paths.iter().any(|p| p.contains("/token_transfers/"));
+            assert!(has_transfers, "slot {slot}: the batch has transfers");
+        }
+    }
 }
 
 #[tokio::test]
 async fn trailing_skipped_slots_still_move_the_flush_edge() {
     let chain = ScriptedChain::with_tip(1_000);
     chain.skip(&[9, 10]);
-    let sink = Arc::new(RecordingSink::default());
-    let config = IngestorConfig { start_slot: Some(8), end_slot: Some(10), ..fast_config(temp_path("c.json")) };
-    let report = ingestor(chain, config, Arc::clone(&sink)).run().await.unwrap();
-    assert_eq!(sink.slots(), [8]);
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let dir = temp_path("data");
+    let config = IngestorConfig { start_slot: Some(8), end_slot: Some(10), ..fast_config(dir.clone()) };
+    let report = ingestor(chain, config, &changelog).run().await.unwrap();
+    assert_eq!(table_slots(&dir, TableKind::Slots), [8]);
+    assert_eq!(changelog.new_slots(), [8]);
+    assert_eq!(changelog.skips().len(), 2);
     assert_eq!(report.cursor.last_processed_slot, 10);
     assert_eq!(report.cursor.last_processed_blockhash, hash(8));
     assert_eq!(report.cursor.last_flush_slot, 10);
 }
 
 #[tokio::test]
-async fn restart_resumes_one_past_the_last_flush() {
-    let path = temp_path("cursor.json");
+async fn a_run_of_only_skipped_slots_writes_no_file_but_moves_the_cursor() {
     let chain = ScriptedChain::with_tip(1_000);
-    let sink = Arc::new(RecordingSink::default());
-    let first = IngestorConfig { start_slot: Some(50), end_slot: Some(54), ..fast_config(path.clone()) };
-    ingestor(Arc::clone(&chain), first, Arc::clone(&sink)).run().await.unwrap();
+    chain.skip(&[20, 21]);
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let dir = temp_path("data");
+    let config = IngestorConfig { start_slot: Some(20), end_slot: Some(21), ..fast_config(dir.clone()) };
+    let report = ingestor(chain, config, &changelog).run().await.unwrap();
+    assert!(table_files(&dir, TableKind::Slots).is_empty());
+    assert!(changelog.new_slots().is_empty());
+    assert_eq!(report.cursor.last_flush_slot, 21);
+}
+
+#[tokio::test]
+async fn restart_resumes_one_past_the_last_flush() {
+    let dir = temp_path("data");
+    let chain = ScriptedChain::with_tip(1_000);
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let first = IngestorConfig { start_slot: Some(50), end_slot: Some(54), ..fast_config(dir.clone()) };
+    ingestor(Arc::clone(&chain), first, &changelog).run().await.unwrap();
 
     // start_slot is ignored once the cursor has history.
-    let second = IngestorConfig { start_slot: Some(1), end_slot: Some(57), ..fast_config(path.clone()) };
-    let report = ingestor(Arc::clone(&chain), second, Arc::clone(&sink)).run().await.unwrap();
+    let second = IngestorConfig { start_slot: Some(1), end_slot: Some(57), ..fast_config(dir.clone()) };
+    let report = ingestor(Arc::clone(&chain), second, &changelog).run().await.unwrap();
 
     assert_eq!(report.first_slot, Some(55));
-    assert_eq!(sink.slots(), (50..=57).collect::<Vec<_>>());
+    assert_eq!(table_slots(&dir, TableKind::Slots), (50..=57).collect::<Vec<_>>());
+    assert_eq!(changelog.new_slots(), (50..=57).collect::<Vec<_>>());
     assert_eq!(report.cursor.last_flush_slot, 57);
 }
 
 #[tokio::test]
 async fn fresh_cursor_without_start_slot_begins_at_the_tip() {
     let chain = ScriptedChain::with_tip(500);
-    let sink = Arc::new(RecordingSink::default());
-    let config = IngestorConfig { end_slot: Some(502), ..fast_config(temp_path("c.json")) };
-    let ingestor = ingestor(Arc::clone(&chain), config, Arc::clone(&sink));
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let dir = temp_path("data");
+    let config = IngestorConfig { end_slot: Some(502), ..fast_config(dir.clone()) };
+    let ingestor = ingestor(Arc::clone(&chain), config, &changelog);
     assert_eq!(ingestor.starting_slot().await.unwrap(), 500);
 
-    // The fetch loop waits for the tip to reach end_slot.
+    // The process loop waits for the tip to reach end_slot.
     let mover = {
         let chain = Arc::clone(&chain);
         tokio::spawn(async move {
@@ -628,23 +798,24 @@ async fn fresh_cursor_without_start_slot_begins_at_the_tip() {
     let report = tokio::time::timeout(Duration::from_secs(5), ingestor.run()).await.unwrap().unwrap();
     mover.await.unwrap();
     assert_eq!(report.first_slot, Some(500));
-    assert_eq!(sink.slots(), [500, 501, 502]);
+    assert_eq!(table_slots(&dir, TableKind::Slots), [500, 501, 502]);
 }
 
 #[tokio::test]
 async fn end_below_resume_point_is_a_no_op() {
-    let path = temp_path("cursor.json");
-    let cursor = IngestorCursor::load_or_init(&path).unwrap();
+    let dir = temp_path("data");
+    let cursor = IngestorCursor::load_or_init(dir.join(CURSOR_FILE_NAME)).unwrap();
     cursor.record_processed(90, "h90");
     cursor.record_flush(90).unwrap();
 
     let chain = ScriptedChain::with_tip(1_000);
-    let sink = Arc::new(RecordingSink::default());
-    let config = IngestorConfig { end_slot: Some(80), ..fast_config(path) };
-    let report = ingestor(Arc::clone(&chain), config, Arc::clone(&sink)).run().await.unwrap();
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let config = IngestorConfig { end_slot: Some(80), ..fast_config(dir) };
+    let report = ingestor(Arc::clone(&chain), config, &changelog).run().await.unwrap();
     assert_eq!(report.first_slot, None);
     assert_eq!(report.slots_processed, 0);
     assert!(chain.block_calls().is_empty());
+    assert!(changelog.events().is_empty());
     assert_eq!(report.cursor.last_flush_slot, 90);
 }
 
@@ -653,147 +824,238 @@ async fn transient_failures_are_retried() {
     let chain = ScriptedChain::with_tip(1_000);
     chain.transient.lock().unwrap().insert(21, 2);
     chain.tip_failures.store(2, Ordering::SeqCst);
-    let sink = Arc::new(RecordingSink::default());
-    let config = IngestorConfig { start_slot: Some(20), end_slot: Some(22), ..fast_config(temp_path("c.json")) };
-    let report = ingestor(Arc::clone(&chain), config, Arc::clone(&sink)).run().await.unwrap();
-    assert_eq!(sink.slots(), [20, 21, 22]);
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let dir = temp_path("data");
+    let config = IngestorConfig { start_slot: Some(20), end_slot: Some(22), ..fast_config(dir.clone()) };
+    let ingestor = ingestor(Arc::clone(&chain), config, &changelog);
+    let report = ingestor.run().await.unwrap();
+    assert_eq!(table_slots(&dir, TableKind::Slots), [20, 21, 22]);
     assert_eq!(chain.block_calls(), [20, 21, 21, 21, 22]);
+    assert!(changelog.skips().is_empty());
+    assert_eq!(ingestor.processor().fetcher().metrics().snapshot().total_retries, 2);
     assert_eq!(report.cursor.last_flush_slot, 22);
 }
 
 #[tokio::test]
+async fn exhausted_retries_record_a_data_gap_and_halt_before_it() {
+    let dir = temp_path("data");
+    let chain = ScriptedChain::with_tip(1_000);
+    chain.transient.lock().unwrap().insert(21, usize::MAX);
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let config = IngestorConfig { start_slot: Some(20), end_slot: Some(25), ..fast_config(dir.clone()) };
+
+    let err = ingestor(Arc::clone(&chain), config, &changelog).run().await.unwrap_err();
+
+    assert_eq!(err.kind(), "rpc_error");
+    assert_eq!(changelog.skips(), [(21, SkipReason::RpcUnavailable)]);
+    assert_eq!(chain.block_calls().iter().filter(|s| **s == 21).count(), 1 + fast_fetcher().max_retries as usize);
+    assert!(!chain.block_calls().contains(&22));
+    // Slot 20 is flushed on the way out; 21 is fetched again on restart.
+    assert_eq!(table_slots(&dir, TableKind::Slots), [20]);
+    let cursor = IngestorCursor::load_or_init(dir.join(CURSOR_FILE_NAME)).unwrap();
+    assert_eq!(cursor.resume_slot(), Some(21));
+}
+
+#[tokio::test]
 async fn permanent_failure_halts_and_keeps_what_was_flushed() {
-    let path = temp_path("cursor.json");
+    let dir = temp_path("data");
     let chain = ScriptedChain::with_tip(1_000);
     chain.fatal.lock().unwrap().insert(33);
-    let sink = Arc::new(RecordingSink::default());
-    let config = IngestorConfig { start_slot: Some(30), end_slot: Some(40), ..fast_config(path.clone()) };
-    let ingestor = ingestor(Arc::clone(&chain), config, Arc::clone(&sink));
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let config = IngestorConfig { start_slot: Some(30), end_slot: Some(40), ..fast_config(dir.clone()) };
 
-    let err = ingestor.run().await.unwrap_err();
+    let err = ingestor(Arc::clone(&chain), config, &changelog).run().await.unwrap_err();
+
     assert_eq!(err.kind(), "deserialize_error");
     assert_eq!(err.slot(), Some(33));
-    // Slots before the failure are flushed on the way out.
-    assert_eq!(sink.slots(), [30, 31, 32]);
-    let cursor = IngestorCursor::load_or_init(&path).unwrap();
+    assert_eq!(table_slots(&dir, TableKind::Slots), [30, 31, 32]);
+    assert_eq!(changelog.new_slots(), [30, 31, 32]);
+    let cursor = IngestorCursor::load_or_init(dir.join(CURSOR_FILE_NAME)).unwrap();
     assert_eq!(cursor.state().last_flush_slot, 32);
     assert_eq!(cursor.resume_slot(), Some(33));
     assert!(!chain.block_calls().contains(&34));
 }
 
+/// Makes every flush under `dir` fail: `solana/slots` is a file, so the
+/// slot table's date directory cannot be created. The startup rollback's
+/// scan skips it.
+fn block_writes(dir: &Path) {
+    fs::create_dir_all(PartitionKey::chain_root(dir)).unwrap();
+    fs::write(PartitionKey::table_root(dir, TableKind::Slots), b"in the way").unwrap();
+}
+
+fn unblock_writes(dir: &Path) {
+    fs::remove_file(PartitionKey::table_root(dir, TableKind::Slots)).unwrap();
+}
+
 #[tokio::test]
-async fn sink_failure_halts_without_moving_the_flush_edge() {
-    let path = temp_path("cursor.json");
-    let chain = ScriptedChain::with_tip(1_000);
-    let sink = Arc::new(RecordingSink::default());
-    sink.failures.store(usize::MAX, Ordering::SeqCst);
-    let config = IngestorConfig { start_slot: Some(60), end_slot: Some(62), ..fast_config(path.clone()) };
-    let ingestor = ingestor(chain, config, Arc::clone(&sink));
+async fn repeated_flush_failures_halt_without_moving_the_flush_edge() {
+    let dir = temp_path("data");
+    block_writes(&dir);
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let config = IngestorConfig { start_slot: Some(60), end_slot: Some(62), ..fast_config(dir.clone()) };
+    let ingestor = ingestor(ScriptedChain::with_tip(1_000), config, &changelog);
 
     let err = ingestor.run().await.unwrap_err();
+
     assert_eq!(err.kind(), "storage_error");
-    assert!(sink.slots().is_empty());
-    // The unwritten slots stay buffered, in order.
-    let buffered: Vec<u64> = ingestor.buffer().snapshot().iter().map(|s| s.slot).collect();
-    assert!(!buffered.is_empty());
-    assert!(buffered.windows(2).all(|w| w[0] < w[1]), "{buffered:?}");
+    assert!(changelog.new_slots().is_empty(), "nothing announced");
+    assert!(ingestor.writer_metrics().snapshot().flush_errors >= 1);
+    // The rows stay buffered and the flush edge stays put.
+    assert!(ingestor.buffered_slot_count() > 0);
     assert_eq!(ingestor.cursor().state().last_flush_slot, 59);
+    assert_eq!(ingestor.cursor().resume_slot(), Some(60));
+}
+
+#[tokio::test]
+async fn a_failed_flush_keeps_its_rows_and_is_retried_at_the_next_interval() {
+    let dir = temp_path("data");
+    block_writes(&dir);
+    let changelog = Arc::new(RecordingChangeLog::default());
+    // No end slot: the run keeps going until shut down, so the failures
+    // happen on the timer rather than in the final flush.
+    let config = IngestorConfig { start_slot: Some(60), max_flush_failures: 1_000, ..fast_config(dir.clone()) };
+    let ingestor = Arc::new(ingestor(ScriptedChain::with_tip(62), config, &changelog));
+    let run = tokio::spawn({
+        let ingestor = Arc::clone(&ingestor);
+        async move { ingestor.run().await }
+    });
+
+    wait_for("a failed flush", || ingestor.writer_metrics().snapshot().flush_errors >= 2).await;
+    assert!(!run.is_finished(), "a failed flush does not halt");
+    assert_eq!(ingestor.cursor().state().last_flush_slot, 59);
+    assert!(changelog.new_slots().is_empty());
+
+    unblock_writes(&dir);
+    wait_for("the retried flush", || ingestor.cursor().state().last_flush_slot == 62).await;
+    ingestor.shutdown();
+    let report = run.await.unwrap().unwrap();
+
+    assert_eq!(table_slots(&dir, TableKind::Slots), [60, 61, 62]);
+    assert_eq!(table_files(&dir, TableKind::Slots).len(), 1, "one file, written by the retry");
+    assert_eq!(changelog.new_slots(), [60, 61, 62]);
+    assert_eq!(report.cursor.last_flush_slot, 62);
+}
+
+#[tokio::test]
+async fn files_of_an_unrecorded_flush_are_rolled_back_on_restart() {
+    let dir = temp_path("data");
+    let chain = ScriptedChain::with_tip(1_000);
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let first = IngestorConfig { start_slot: Some(66), end_slot: Some(69), ..fast_config(dir.clone()) };
+    ingestor(Arc::clone(&chain), first, &changelog).run().await.unwrap();
+
+    // Second run: 70..=71 are flushed, but their New events are refused, so
+    // the cursor never records the flush and the run halts.
+    let refusing = Arc::new(RecordingChangeLog::default());
+    refusing.refuse_new.store(true, Ordering::SeqCst);
+    let second = IngestorConfig {
+        end_slot: Some(72),
+        flush_interval: Duration::from_secs(3_600),
+        flush_max_slots: 2,
+        ..fast_config(dir.clone())
+    };
+    let err = ingestor(Arc::clone(&chain), second, &refusing).run().await.unwrap_err();
+    assert_eq!(err.kind(), "config_error", "the change log's error");
+    assert_eq!(table_slots(&dir, TableKind::Slots), (66..=71).collect::<Vec<_>>(), "70, 71 written, not recorded");
+    let cursor = IngestorCursor::load_or_init(dir.join(CURSOR_FILE_NAME)).unwrap();
+    assert_eq!(cursor.resume_slot(), Some(70));
+
+    // Third run: the orphaned file goes, and 70..=72 are written once.
+    let third = IngestorConfig { end_slot: Some(72), ..fast_config(dir.clone()) };
+    let report = ingestor(Arc::clone(&chain), third, &changelog).run().await.unwrap();
+
+    assert_eq!(report.first_slot, Some(70));
+    assert_eq!(table_slots(&dir, TableKind::Slots), (66..=72).collect::<Vec<_>>());
+    assert_eq!(changelog.new_slots(), (66..=72).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn files_left_before_the_first_cursor_save_are_rolled_back_too() {
+    let dir = temp_path("data");
+    let chain = ScriptedChain::with_tip(1_000);
+    let refusing = Arc::new(RecordingChangeLog::default());
+    refusing.refuse_new.store(true, Ordering::SeqCst);
+    let config = |flush_max_slots| IngestorConfig {
+        start_slot: Some(70),
+        end_slot: Some(72),
+        flush_interval: Duration::from_secs(3_600),
+        flush_max_slots,
+        ..fast_config(dir.clone())
+    };
+    ingestor(Arc::clone(&chain), config(2), &refusing).run().await.unwrap_err();
+    assert!(!dir.join(CURSOR_FILE_NAME).exists(), "the cursor was never saved");
+    assert_eq!(table_slots(&dir, TableKind::Slots), [70, 71]);
+
+    // A different flush grouping, so the retry's file does not simply
+    // overwrite the orphaned one.
+    let changelog = Arc::new(RecordingChangeLog::default());
+    ingestor(Arc::clone(&chain), config(1_000), &changelog).run().await.unwrap();
+    assert_eq!(table_slots(&dir, TableKind::Slots), [70, 71, 72]);
+    assert_eq!(table_files(&dir, TableKind::Slots).len(), 1);
 }
 
 #[tokio::test]
 async fn full_buffer_triggers_a_flush_before_the_interval() {
     let chain = ScriptedChain::with_tip(1);
     chain.advancing.store(true, Ordering::SeqCst);
-    let sink = Arc::new(RecordingSink::default());
+    let changelog = Arc::new(RecordingChangeLog::default());
+    let dir = temp_path("data");
     let config = IngestorConfig {
         start_slot: Some(1),
         flush_interval: Duration::from_secs(3_600),
         flush_max_slots: 2,
-        ..fast_config(temp_path("c.json"))
+        ..fast_config(dir.clone())
     };
-    let ingestor = Arc::new(ingestor(chain, config, Arc::clone(&sink)));
+    let ingestor = Arc::new(ingestor(chain, config, &changelog));
     let run = tokio::spawn({
         let ingestor = Arc::clone(&ingestor);
         async move { ingestor.run().await }
     });
     // Neither the hour-long interval nor shutdown can explain a flush here.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while sink.slots().len() < 4 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("size-triggered flush");
+    wait_for("size-triggered flushes", || changelog.new_slots().len() >= 4).await;
     assert!(!run.is_finished());
     assert!(ingestor.cursor().state().last_flush_slot >= 2);
+    assert!(table_files(&dir, TableKind::Slots).len() >= 2);
 
     ingestor.shutdown();
     let report = run.await.unwrap().unwrap();
     assert!(report.flushes >= 2, "flushes: {}", report.flushes);
-    let flushed = sink.slots();
-    assert_eq!(flushed, (1..=*flushed.last().unwrap()).collect::<Vec<_>>());
+    let written = table_slots(&dir, TableKind::Slots);
+    assert_eq!(written, (1..=*written.last().unwrap()).collect::<Vec<_>>());
+    assert_eq!(changelog.new_slots(), written);
 }
 
 #[tokio::test]
 async fn shutdown_flushes_the_buffer_and_persists_the_cursor() {
-    let path = temp_path("cursor.json");
+    let dir = temp_path("data");
     let chain = ScriptedChain::with_tip(10);
     chain.advancing.store(true, Ordering::SeqCst);
-    let sink = Arc::new(RecordingSink::default());
+    let changelog = Arc::new(RecordingChangeLog::default());
     let config = IngestorConfig {
         start_slot: Some(10),
         flush_interval: Duration::from_secs(3_600),
-        ..fast_config(path.clone())
+        ..fast_config(dir.clone())
     };
-    let ingestor = Arc::new(ingestor(chain, config, Arc::clone(&sink)));
+    let ingestor = Arc::new(ingestor(chain, config, &changelog));
 
     let run = tokio::spawn({
         let ingestor = Arc::clone(&ingestor);
         async move { ingestor.run().await }
     });
-    // Wait until something is buffered, then stop.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while ingestor.buffer().len() < 3 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(sink.slots().is_empty(), "nothing flushed before shutdown");
+    wait_for("buffered slots", || ingestor.buffered_slot_count() >= 3).await;
+    assert!(table_files(&dir, TableKind::Slots).is_empty(), "nothing flushed before shutdown");
     ingestor.shutdown();
 
     let report = tokio::time::timeout(Duration::from_secs(5), run).await.unwrap().unwrap().unwrap();
-    assert!(ingestor.buffer().is_empty());
-    let flushed = sink.slots();
-    assert!(flushed.len() >= 3);
-    assert_eq!(flushed[0], 10);
-    assert_eq!(report.cursor.last_flush_slot, *flushed.last().unwrap());
+    assert_eq!(ingestor.buffered_slot_count(), 0);
+    let written = table_slots(&dir, TableKind::Slots);
+    assert!(written.len() >= 3);
+    assert_eq!(written[0], 10);
+    assert_eq!(changelog.new_slots(), written);
+    assert_eq!(report.cursor.last_flush_slot, *written.last().unwrap());
     assert_eq!(report.cursor.last_flush_slot, report.cursor.last_processed_slot);
-    assert_eq!(IngestorCursor::load_or_init(&path).unwrap().state(), report.cursor);
-}
-
-#[tokio::test]
-async fn buffered_slots_carry_the_trackers_finality() {
-    let watermark = Arc::new(FinalityWatermark::new());
-    let _ = watermark.advance_confirmed(110, &hash(110));
-    let _ = watermark.advance_finalized(102, &hash(102));
-    let tracker = Arc::new(CommitmentTracker::from_watermark(watermark));
-    let sink = Arc::new(RecordingSink::default());
-    let config = IngestorConfig { start_slot: Some(100), end_slot: Some(104), ..fast_config(temp_path("c.json")) };
-    Ingestor::new(ScriptedChain::with_tip(1_000), tracker, config, Arc::clone(&sink) as Arc<dyn FlushSink>)
-        .unwrap()
-        .run()
-        .await
-        .unwrap();
-    let finality: Vec<(u64, bool)> = sink
-        .batches
-        .lock()
-        .unwrap()
-        .iter()
-        .flatten()
-        .map(|s| (s.slot, s.is_finalized))
-        .collect();
-    assert_eq!(finality, [(100, true), (101, true), (102, true), (103, false), (104, false)]);
+    assert_eq!(IngestorCursor::load_or_init(dir.join(CURSOR_FILE_NAME)).unwrap().state(), report.cursor);
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +1089,7 @@ async fn helius_adapter_rejects_an_empty_key() {
     assert_eq!(err.kind(), "config_error");
 }
 
+
 // ---------------------------------------------------------------------------
 // Live: Solana devnet through Helius
 // ---------------------------------------------------------------------------
@@ -838,38 +1101,6 @@ async fn live_adapter() -> Option<Arc<prism::adapter::solana::SolanaAdapter>> {
         return None;
     };
     Some(Arc::new(helius_solana_adapter(&key, Cluster::Devnet).await.expect("helius adapter")))
-}
-
-fn print_slot(slot: &BufferedSlot, limit: usize) {
-    println!(
-        "\n=== slot {} | blockhash {} | parent {} | block_time {:?} | finalized {} | {} txs ({} non-vote) ===",
-        slot.slot,
-        slot.blockhash,
-        slot.parent_blockhash,
-        slot.block_time,
-        slot.is_finalized,
-        slot.transactions.len(),
-        slot.non_vote_transactions().count(),
-    );
-    // Non-vote transactions first: they are the interesting ones.
-    let mut txs: Vec<&BufferedTransaction> = slot.non_vote_transactions().collect();
-    txs.extend(slot.transactions.iter().filter(|tx| tx.is_vote));
-    for tx in txs.into_iter().take(limit) {
-        println!(
-            "  #{:<4} {} v{:<6} {} fee={:<7} cu={:<8} ix={} accts={} vote={} programs={:?}{}",
-            tx.index,
-            tx.signature,
-            tx.version,
-            if tx.success { "ok  " } else { "FAIL" },
-            tx.fee,
-            tx.compute_units.map_or("-".into(), |cu| cu.to_string()),
-            tx.instruction_count,
-            tx.account_count,
-            tx.is_vote,
-            tx.program_ids,
-            tx.error.as_ref().map(|e| format!(" err={e}")).unwrap_or_default(),
-        );
-    }
 }
 
 /// Walk back from the confirmed tip to the newest block holding at least
@@ -907,91 +1138,71 @@ async fn live_devnet_tip_is_reachable() {
     assert!(!confirmed.block_id.is_empty());
 }
 
+/// Runs the whole pipeline over recent devnet slots around a busy block,
+/// then checks what landed on disk and in the change log against the run's
+/// report, and prints it.
 #[tokio::test]
-async fn live_recent_slot_decodes_and_prints_at_least_ten_transactions() {
-    let Some(adapter) = live_adapter().await else { return };
-    let block = recent_busy_block(adapter.as_ref(), 10).await;
-    let slot = BufferedSlot::from_block(&block, false).unwrap();
-
-    print_slot(&slot, slot.transactions.len().clamp(10, 25));
-
-    assert!(slot.transactions.len() >= 10);
-    let mut signatures = HashSet::new();
-    for (i, tx) in slot.transactions.iter().enumerate() {
-        assert_eq!(tx.index, i);
-        assert!(bs58::decode(&tx.signature).into_vec().is_ok_and(|b| b.len() == 64), "{}", tx.signature);
-        assert!(signatures.insert(tx.signature.clone()), "duplicate {}", tx.signature);
-        assert!(["legacy", "0", "1"].contains(&tx.version.as_str()));
-        assert!(tx.instruction_count > 0);
-        assert!(tx.account_count > 0);
-        assert!(!tx.program_ids.is_empty());
-        assert_eq!(tx.success, tx.error.is_none());
-    }
-}
-
-/// Runs the real pipeline over recent devnet slots with a flush interval long
-/// enough that everything stays buffered, prints the buffer, then shuts down.
-#[tokio::test]
-async fn live_ingestor_buffers_real_devnet_transactions() {
+async fn live_ingestor_writes_real_devnet_slots_to_parquet() {
     let Some(adapter) = live_adapter().await else { return };
     let busy = recent_busy_block(adapter.as_ref(), 10).await.slot_or_height;
-    let start = busy.saturating_sub(2);
-    let end = busy + 2;
+    let (start, end) = (busy.saturating_sub(2), busy + 2);
 
-    let path = temp_path("cursor.json");
-    let sink = Arc::new(RecordingSink::default());
+    let dir = temp_path("data");
+    let changelog = Arc::new(RecordingChangeLog::default());
     let config = IngestorConfig {
         start_slot: Some(start),
         end_slot: Some(end),
+        // One flush, at the end: the whole range lands in one file per table.
         flush_interval: Duration::from_secs(3_600),
         flush_max_slots: 1_000,
-        ..IngestorConfig::new(&path)
+        ..IngestorConfig::new(&dir)
     };
-    let ingestor = Arc::new(
-        Ingestor::new(adapter, tracker(), config, Arc::clone(&sink) as Arc<dyn FlushSink>).unwrap(),
-    );
-    let run = tokio::spawn({
-        let ingestor = Arc::clone(&ingestor);
-        async move { ingestor.run().await }
-    });
+    let ingestor = Ingestor::new(
+        adapter,
+        tracker(),
+        Arc::clone(&changelog) as Arc<dyn ChangeLog>,
+        config,
+    )
+    .unwrap();
 
-    // Watch the in-memory buffer fill up.
-    let mut seen = 0;
-    let buffered = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let snapshot = ingestor.buffer().snapshot();
-            if snapshot.len() != seen {
-                seen = snapshot.len();
-                let state = ingestor.cursor().state();
-                println!(
-                    "buffer: {} slots | cursor processed={} flushed={} unflushed={}",
-                    seen, state.last_processed_slot, state.last_flush_slot, state.unflushed_slots()
-                );
-            }
-            if snapshot.last().is_some_and(|s| s.slot >= busy) || run.is_finished() {
-                return snapshot;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("buffer filled within 60 s");
-
-    println!("\n##### in-memory buffer (not yet flushed) #####");
-    for slot in &buffered {
-        print_slot(slot, 12);
-    }
-    let total: usize = buffered.iter().map(|s| s.transactions.len()).sum();
-    assert!(total >= 10, "only {total} transactions buffered");
-
-    let report = run.await.unwrap().unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(120), ingestor.run())
+        .await
+        .expect("run finished within 120 s")
+        .unwrap();
     println!("\nreport: {report:?}");
+
     assert_eq!(report.first_slot, Some(start));
     assert_eq!(report.slots_processed + report.slots_skipped, end - start + 1);
     assert_eq!(report.cursor.last_flush_slot, end);
-    assert!(ingestor.buffer().is_empty());
-    let flushed = sink.slots();
-    assert!(flushed.contains(&busy));
-    assert!(flushed.windows(2).all(|w| w[0] < w[1]));
-    assert_eq!(IngestorCursor::load_or_init(&path).unwrap().resume_slot(), Some(end + 1));
+    assert_eq!(ingestor.buffered_slot_count(), 0);
+
+    let written = table_slots(&dir, TableKind::Slots);
+    assert!(written.contains(&busy));
+    assert_eq!(written.len() as u64, report.slots_processed);
+    assert_eq!(table_rows(&dir, TableKind::Transactions) as u64, report.transactions_processed);
+    assert!(report.transactions_processed >= 10);
+    assert_eq!(changelog.new_slots(), written);
+    assert_eq!(changelog.skips().len() as u64, report.slots_skipped);
+
+    let r = ingestor.resolver_metrics().snapshot();
+    println!(
+        "\n  devnet slots {start}..={end}: {} with data, {} skipped\n  \
+         rows: {} transactions, {} instructions, {} token transfers ({} fully enriched)",
+        report.slots_processed,
+        report.slots_skipped,
+        report.transactions_processed,
+        table_rows(&dir, TableKind::Instructions),
+        table_rows(&dir, TableKind::TokenTransfers),
+        r.fully_enriched,
+    );
+    for table in TableKind::ALL {
+        for path in table_files(&dir, table) {
+            println!("    {} ({} bytes)", path.display(), fs::metadata(&path).unwrap().len());
+        }
+    }
+    assert_eq!(
+        IngestorCursor::load_or_init(dir.join(CURSOR_FILE_NAME)).unwrap().resume_slot(),
+        Some(end + 1)
+    );
+    let _ = fs::remove_dir_all(&dir);
 }
