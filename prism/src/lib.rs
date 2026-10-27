@@ -1,6 +1,6 @@
 pub mod commitment;
 pub mod types;
-mod storage;
+pub mod storage;
 pub mod normalizer;
 pub mod decoder;
 pub mod ingestor;
