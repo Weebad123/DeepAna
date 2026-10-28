@@ -39,6 +39,13 @@ arrow = "60.0.0"
 parquet = "60.0.0"
 arrow-schema = "60.0.0"
 
+# Query engine (LENS)
+# 55.2 is built on arrow/parquet 59, not the 60 above. LENS only ever uses
+# the copies DataFusion re-exports (`datafusion::arrow`, `datafusion::parquet`)
+# so its Arrow types always match the engine's.
+datafusion = "55.2.0"
+url = "2.5.8"
+
 # Utilities
 chrono = "0.4.45"
 tracing = "0.1.44"
