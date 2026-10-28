@@ -19,7 +19,7 @@
 //!
 //! | File          | Holds                                                               |
 //! |---------------|---------------------------------------------------------------------|
-//! | `mod.rs`      | [`QueryEngine`], [`QueryResult`], [`EngineMetrics`], [`EngineMetricsSnapshot`] |
+//! | `mod.rs`      | [`QueryEngine`], [`EngineMetrics`], [`EngineMetricsSnapshot`]; builds the [`QueryResult`] |
 //! | [`session`]   | [`create_session`], [`SessionSettings`]: DataFusion configuration and memory limits |
 //!
 //! # Read-only
@@ -63,7 +63,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::execution::context::SQLOptions;
 use datafusion::physical_plan::collect;
@@ -79,6 +78,7 @@ pub use session::{
 use crate::catalog::{CatalogMetrics, PrismCatalog, RefreshReport, TableStatus};
 use crate::config::LensConfig;
 use crate::error::{LensError, LensResult};
+use crate::result::QueryResult;
 
 /// Longest SQL text [`QueryEngine::execute`] accepts, in bytes, after
 /// trimming.
@@ -90,37 +90,6 @@ pub const LATENCY_WINDOW: usize = 1_024;
 
 /// How much of an oversized SQL text goes into its error, in characters.
 const SQL_PREVIEW_CHARS: usize = 200;
-
-// ---------------------------------------------------------------------------
-// QueryResult
-// ---------------------------------------------------------------------------
-
-/// The rows a query returned, with what the API needs to describe them.
-#[derive(Debug, Clone)]
-pub struct QueryResult {
-    /// Column names and types. Set even when no row came back.
-    pub schema: SchemaRef,
-    /// The rows, at most `max_query_rows` of them in total. Holds no empty
-    /// batch.
-    pub batches: Vec<RecordBatch>,
-    /// Rows across `batches`.
-    pub row_count: usize,
-    /// Whether the query produced more than `max_query_rows` rows and the
-    /// rest were dropped.
-    pub truncated: bool,
-    /// Wall time from the start of planning to the last row, in milliseconds.
-    pub duration_ms: u64,
-}
-
-impl QueryResult {
-    pub fn column_count(&self) -> usize {
-        self.schema.fields().len()
-    }
-
-    pub fn column_names(&self) -> Vec<&str> {
-        self.schema.fields().iter().map(|field| field.name().as_str()).collect()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Metrics
@@ -494,7 +463,16 @@ async fn run_query(ctx: Arc<SessionContext>, sql: String, max_rows: usize) -> Le
         .await
         .map_err(|err| LensError::query_execution(sql.as_str(), err))?;
     let (batches, row_count, truncated) = truncate(batches, max_rows);
-    Ok(QueryResult { schema, batches, row_count, truncated, duration_ms: 0 })
+    Ok(QueryResult {
+        sql,
+        batches,
+        row_count,
+        schema,
+        duration_ms: 0,
+        truncated,
+        // Past the limit only one extra row is read, so the total is unknown.
+        total_rows_before_limit: (!truncated).then_some(row_count),
+    })
 }
 
 /// The first `max_rows` rows of `batches`, without empty batches, with
