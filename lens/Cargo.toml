@@ -15,11 +15,12 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 url.workspace = true
+# Only the binary uses it, to run the ingestor in-process when started with
+# `--parquet-directory`. The catalog tests also use it to write the Parquet
+# files LENS reads, so they exercise PRISM's real output rather than a copy.
+prism = { path = "../prism" }
 
 [dev-dependencies]
-# Writes the Parquet files LENS reads in the catalog tests, so they exercise
-# PRISM's real output rather than a copy of it.
-prism = { path = "../prism" }
 arrow.workspace = true
 chrono.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "io-util"] }

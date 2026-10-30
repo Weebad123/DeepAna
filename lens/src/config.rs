@@ -2,7 +2,8 @@
 //!
 //! Every field comes from a `LENS_*` environment variable. All of them have a
 //! default except `LENS_DATA_DIR`, which must point at the same directory
-//! PRISM's `ParquetWriter` was given. PRISM lays its tables out under a
+//! PRISM's `ParquetWriter` was given (the `lens` binary sets it itself when
+//! started with `--parquet-directory`). PRISM lays its tables out under a
 //! per-chain directory, so with the default chain LENS reads:
 //!
 //! ```text

@@ -54,7 +54,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use helius::HeliusBuilder;
-use helius::types::Cluster;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -77,6 +76,9 @@ use crate::types::udm::DeepAnaSlot;
 pub mod cursor;
 
 pub use cursor::{CursorState, IngestorCursor};
+/// Re-exported so callers of [`helius_solana_adapter`] need not depend on
+/// the Helius SDK themselves.
+pub use helius::types::Cluster;
 
 /// Environment variable the Helius API key is read from.
 pub const HELIUS_API_KEY_ENV: &str = "HELIUS_API_KEY";
