@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# The change log's wire format and the checkpoint file. FORGE mirrors PRISM's
+# envelope instead of depending on the prism crate: they share only a file.
+serde.workspace = true
+serde_json.workspace = true
+# Fingerprint of the change log's first line, to recognise a replaced file.
+sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
