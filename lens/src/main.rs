@@ -7,7 +7,8 @@
 //! ```
 //!
 //! With `--parquet-directory`, PRISM's ingestor runs in the same process and
-//! writes its Parquet files, cursor and skip log under `DIR`, and `DIR` is
+//! writes its Parquet files, cursor, skip log and change log
+//! (`changelog.jsonl`, the file FORGE tails) under `DIR`, and `DIR` is
 //! used as `LENS_DATA_DIR` (the flag wins over the variable). PRISM follows
 //! the Solana devnet tip through Helius and needs `HELIUS_API_KEY`. The two
 //! stop together: on Ctrl-C or SIGTERM, or as soon as either one fails.
@@ -20,17 +21,15 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use lens::config::ENV_DATA_DIR;
 use lens::{LensConfig, LensError, LensResult, QueryEngine};
 use prism::adapter::ChainAdapter;
-use prism::changelog::ChangeLog;
+use prism::changelog::{ChangeLog, LocalChangeLog};
 use prism::commitment::CommitmentTracker;
 use prism::ingestor::{Cluster, Ingestor, IngestorConfig, helius_api_key_from_env, helius_solana_adapter};
 use prism::storage::TableKind;
 use prism::storage::partition::CHAIN_DIR;
 use prism::types::error::PrismResult;
-use prism::types::event::ChangeEvent;
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 
@@ -214,25 +213,17 @@ fn create_table_dirs(dir: &Path) -> LensResult<()> {
 }
 
 /// PRISM's ingestor over Helius, writing under `data_dir`.
+///
+/// One change log, `{data_dir}/changelog.jsonl`, is shared by all three
+/// producers: the finality poller (`Final`), and through the ingestor the
+/// gap handler (`Skip`) and the writer task (`New`). LENS itself does not
+/// read it; it finds new files by re-scanning the directory.
 async fn build_ingestor(data_dir: &Path) -> PrismResult<Ingestor> {
     let api_key = helius_api_key_from_env()?;
     let adapter: Arc<dyn ChainAdapter> = Arc::new(helius_solana_adapter(&api_key, PRISM_CLUSTER).await?);
-    let changelog: Arc<dyn ChangeLog> = Arc::new(TracingChangeLog);
+    let changelog: Arc<dyn ChangeLog> = Arc::new(LocalChangeLog::open(data_dir, adapter.chain_id())?);
     let tracker = CommitmentTracker::spawn(Arc::clone(&adapter), Arc::clone(&changelog));
     Ingestor::new(adapter, Arc::new(tracker), changelog, IngestorConfig::new(data_dir))
-}
-
-/// Logs PRISM's change events. PRISM ships no change log sink yet, and
-/// nothing in this process needs one: LENS finds new files by re-scanning
-/// the directory.
-struct TracingChangeLog;
-
-#[async_trait]
-impl ChangeLog for TracingChangeLog {
-    async fn emit(&self, event: ChangeEvent) -> PrismResult<()> {
-        tracing::debug!(kind = event.kind(), slot = event.slot(), "{event}");
-        Ok(())
-    }
 }
 
 #[cfg(test)]

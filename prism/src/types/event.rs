@@ -13,6 +13,15 @@
 //! written files, can no longer be invalidated. Wire format is JSON (see
 //! [`ChangeEvent::to_json`]), with a top-level `"event"` discriminator so the
 //! stream stays forward-compatible when new variants are added.
+//!
+//! On disk every event is wrapped in an [`EventEnvelope`] that the change log
+//! stamps with a gap-free, strictly increasing `id`. The envelope's fields sit
+//! next to the event's own, so a line still has the `"event"` discriminator at
+//! the top level:
+//!
+//! ```text
+//! {"id":7,"emitted_at":1761040000,"chain":"solana-devnet","event":"skip","slot":350123457,"reason":"validator_skipped"}
+//! ```
 
 use std::fmt;
 use std::str::FromStr;
@@ -246,5 +255,33 @@ impl From<&DeepAnaSlot> for ChangeEvent {
     /// when the written files are known.
     fn from(slot: &DeepAnaSlot) -> Self {
         Self::new_from_slot(slot, Vec::new())
+    }
+}
+
+/// A [`ChangeEvent`] as the change log records it: one line of the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    /// Position in the log. The first event is `1`; every later one is the
+    /// previous `id + 1`, with no gaps, across restarts.
+    pub id: u64,
+    /// Unix timestamp (seconds, UTC) at which the event was recorded.
+    pub emitted_at: i64,
+    /// Chain id the event is about: `"solana-mainnet"`, `"solana-devnet"`, ...
+    pub chain: String,
+    /// The event itself, flattened into the envelope.
+    #[serde(flatten)]
+    pub event: ChangeEvent,
+}
+
+impl EventEnvelope {
+    /// Serialise to a single JSON line (no trailing newline), the change
+    /// log's wire format.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("EventEnvelope is always JSON-serialisable")
+    }
+
+    /// Parse one JSON line produced by [`Self::to_json`].
+    pub fn from_json(line: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(line)
     }
 }

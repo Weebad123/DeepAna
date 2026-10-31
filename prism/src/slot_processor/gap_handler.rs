@@ -115,7 +115,7 @@ impl GapHandler {
     /// Returns the change log's error when the event could not be published;
     /// nothing is written to the skip log or counted in that case.
     pub async fn handle(&self, slot: u64, reason: SkipReason) -> PrismResult<()> {
-        self.changelog.emit(ChangeEvent::skip(slot, reason)).await?;
+        self.changelog.emit(ChangeEvent::skip(slot, reason))?;
         let line = skip_log_line(chrono::Utc::now().timestamp(), slot, reason);
         if let Err(err) = append_line(&self.skip_log_path, &line) {
             warn!(

@@ -16,6 +16,7 @@
 //! | `account_resolver/`         | [`AccountResolveError`]                                                |
 //! | `storage/writer.rs`         | [`StorageError`]                                                       |
 //! | `ingestor/cursor.rs`        | [`CursorError`]                                                        |
+//! | `changelog/local.rs`        | [`ChangeLogError`]                                                     |
 //! | `lib.rs` / `main`           | receives all of them (plus [`ConfigError`]) and picks the action       |
 //!
 //! There are deliberately no blanket `From<ClientError>` / `From<io::Error>`
@@ -38,6 +39,7 @@
 //! [`AccountResolveError`]: PrismError::AccountResolveError
 //! [`StorageError`]: PrismError::StorageError
 //! [`CursorError`]: PrismError::CursorError
+//! [`ChangeLogError`]: PrismError::ChangeLogError
 //! [`ConfigError`]: PrismError::ConfigError
 
 use std::time::Duration;
@@ -128,6 +130,19 @@ pub enum PrismError {
         path: String,
         /// The underlying I/O error.
         source: std::io::Error,
+    },
+
+    /// The change log could not record, persist or recover events. Once one
+    /// write or sync has failed the log refuses every later event, so this
+    /// always halts the pipeline.
+    #[error("change log {path} failed to {operation}: {source}")]
+    ChangeLogError {
+        /// Filesystem path of the change log file.
+        path: String,
+        /// What was being done: `"open"`, `"append event 42"`, `"sync"`, ...
+        operation: String,
+        /// The underlying error (I/O, a corrupt record, ...).
+        source: BoxError,
     },
 
     /// An account referenced by an instruction could not be resolved.
@@ -230,6 +245,19 @@ impl PrismError {
         }
     }
 
+    /// Build a [`PrismError::ChangeLogError`].
+    pub fn changelog(
+        path: impl Into<String>,
+        operation: impl Into<String>,
+        source: impl Into<BoxError>,
+    ) -> Self {
+        Self::ChangeLogError {
+            path: path.into(),
+            operation: operation.into(),
+            source: source.into(),
+        }
+    }
+
     /// Build a [`PrismError::AccountResolveError`].
     pub fn account_resolve(pubkey: impl Into<String>, source: impl Into<BoxError>) -> Self {
         Self::AccountResolveError {
@@ -256,6 +284,7 @@ impl PrismError {
             Self::DecodeError { .. } => "decode_error",
             Self::StorageError { .. } => "storage_error",
             Self::CursorError { .. } => "cursor_error",
+            Self::ChangeLogError { .. } => "changelog_error",
             Self::AccountResolveError { .. } => "account_resolve_error",
             Self::ConfigError { .. } => "config_error",
         }
@@ -273,6 +302,7 @@ impl PrismError {
             | Self::DecodeError { .. }
             | Self::StorageError { .. }
             | Self::CursorError { .. }
+            | Self::ChangeLogError { .. }
             | Self::AccountResolveError { .. }
             | Self::ConfigError { .. } => None,
         }

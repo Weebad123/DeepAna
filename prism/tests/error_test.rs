@@ -37,6 +37,11 @@ fn all_variants() -> Vec<PrismError> {
             "/var/lib/prism/cursor.json",
             io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
         ),
+        PrismError::changelog(
+            "/var/lib/prism/changelog.jsonl",
+            "append event 42",
+            io::Error::new(io::ErrorKind::StorageFull, "no space left on device"),
+        ),
         PrismError::account_resolve(MINT, "account not found"),
         PrismError::config("rpc_url", "must not be empty"),
     ]
@@ -187,6 +192,8 @@ fn display_carries_context_and_cause() {
             "storage failure on table transactions for slots 250000000..=250000099: \
              Parquet error: disk full",
             "cursor file /var/lib/prism/cursor.json is unusable: permission denied",
+            "change log /var/lib/prism/changelog.jsonl failed to append event 42: \
+             no space left on device",
             "failed to resolve account EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: \
              account not found",
             "invalid config field rpc_url: must not be empty",
@@ -238,6 +245,9 @@ fn source_is_preserved_and_downcastable() {
         .unwrap();
     assert_eq!(io_err.kind(), io::ErrorKind::NotFound);
 
+    let changelog = PrismError::changelog("/tmp/changelog.jsonl", "recover line 3", bad_json());
+    assert!(changelog.source().unwrap().is::<serde_json::Error>());
+
     let resolve = PrismError::account_resolve(MINT, bad_json());
     assert!(resolve.source().unwrap().is::<serde_json::Error>());
 }
@@ -287,6 +297,7 @@ fn kind_is_a_distinct_snake_case_label_per_variant() {
             "decode_error",
             "storage_error",
             "cursor_error",
+            "changelog_error",
             "account_resolve_error",
             "config_error",
         ]
@@ -303,6 +314,7 @@ fn slot_reports_the_single_slot_when_there_is_one() {
             Some(250_000_001),
             None,
             Some(250_000_002),
+            None,
             None,
             None,
             None,
@@ -376,6 +388,7 @@ fn decide(err: &PrismError) -> Action {
         | PrismError::AccountResolveError { .. } => Action::Skip,
         PrismError::StorageError { .. }
         | PrismError::CursorError { .. }
+        | PrismError::ChangeLogError { .. }
         | PrismError::ConfigError { .. } => Action::Halt,
     }
 }
@@ -450,6 +463,7 @@ fn every_variant_maps_to_an_action() {
             Action::Retry(Some(Duration::from_millis(1_500))),
             Action::Skip,
             Action::Skip,
+            Action::Halt,
             Action::Halt,
             Action::Halt,
             Action::Skip,

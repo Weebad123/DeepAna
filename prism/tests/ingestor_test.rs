@@ -30,17 +30,17 @@ use prism::adapter::config::TransactionEncoding;
 use prism::adapter::{
     AccountData, ChainAdapter, ChainBlock, ChainBlockData, ChainFamily, ChainTip, CommitmentLevel,
 };
-use prism::changelog::ChangeLog;
+use prism::changelog::{CHANGELOG_FILE_NAME, ChangeLog, LocalChangeLog};
 use prism::commitment::{CommitmentTracker, FinalityWatermark};
 use prism::decoder::spl_token::SPL_TOKEN_PROGRAM_ID;
 use prism::ingestor::{
-    CURSOR_FILE_NAME, CursorState, HELIUS_API_KEY_ENV, Ingestor, IngestorConfig, IngestorCursor,
+    CURSOR_FILE_NAME, CursorState, HELIUS_API_KEY_ENV, Ingestor, IngestorConfig, IngestorCursor, IngestorReport,
     SKIP_LOG_FILE_NAME, helius_api_key_from_env, helius_chain_id, helius_solana_adapter,
 };
 use prism::slot_processor::SlotFetcherConfig;
 use prism::storage::{PartitionKey, TableKind};
 use prism::types::error::{PrismError, PrismResult};
-use prism::types::event::{ChangeEvent, SkipReason};
+use prism::types::event::{ChangeEvent, EventEnvelope, SkipReason};
 use serde_json::{Value, json};
 use solana_client::client_error::ClientError;
 use solana_transaction_status::EncodedConfirmedBlock;
@@ -333,11 +333,13 @@ impl ChainAdapter for ScriptedChain {
     }
 }
 
-/// Keeps every event it is given; can be told to refuse `New` events.
+/// Keeps every event it is given; can be told to refuse `New` or `Final`
+/// events.
 #[derive(Default)]
 struct RecordingChangeLog {
     events: Mutex<Vec<ChangeEvent>>,
     refuse_new: AtomicBool,
+    refuse_final: AtomicBool,
 }
 
 impl RecordingChangeLog {
@@ -367,13 +369,20 @@ impl RecordingChangeLog {
     }
 }
 
-#[async_trait]
 impl ChangeLog for RecordingChangeLog {
-    async fn emit(&self, event: ChangeEvent) -> PrismResult<()> {
+    fn emit(&self, event: ChangeEvent) -> PrismResult<u64> {
         if matches!(event, ChangeEvent::New { .. }) && self.refuse_new.load(Ordering::SeqCst) {
             return Err(PrismError::config("changelog", "unavailable"));
         }
-        self.events.lock().unwrap().push(event);
+        if matches!(event, ChangeEvent::Final { .. }) && self.refuse_final.load(Ordering::SeqCst) {
+            return Err(PrismError::changelog("changelog.jsonl", "append event 1", "disk full"));
+        }
+        let mut events = self.events.lock().unwrap();
+        events.push(event);
+        Ok(events.len() as u64)
+    }
+
+    fn flush(&self) -> PrismResult<()> {
         Ok(())
     }
 }
@@ -1056,6 +1065,152 @@ async fn shutdown_flushes_the_buffer_and_persists_the_cursor() {
     assert_eq!(report.cursor.last_flush_slot, *written.last().unwrap());
     assert_eq!(report.cursor.last_flush_slot, report.cursor.last_processed_slot);
     assert_eq!(IngestorCursor::load_or_init(dir.join(CURSOR_FILE_NAME)).unwrap().state(), report.cursor);
+}
+
+// ---------------------------------------------------------------------------
+// With the local change log
+// ---------------------------------------------------------------------------
+
+/// Every envelope in `{dir}/changelog.jsonl`, after checking that the ids
+/// run 1, 2, 3, ... in file order.
+fn gap_free_envelopes(dir: &Path) -> Vec<EventEnvelope> {
+    let contents = fs::read_to_string(dir.join(CHANGELOG_FILE_NAME)).unwrap();
+    assert!(contents.ends_with('\n'), "partial last line");
+    let envelopes: Vec<EventEnvelope> =
+        contents.lines().map(|line| EventEnvelope::from_json(line).unwrap()).collect();
+    for (index, envelope) in envelopes.iter().enumerate() {
+        assert_eq!(envelope.id, index as u64 + 1, "line {}", index + 1);
+        assert_eq!(envelope.chain, "solana-scripted");
+    }
+    envelopes
+}
+
+/// One `LocalChangeLog`, shared by all three producers at once: the gap
+/// handler and the writer task through the ingestor, and a finality poller
+/// polling every 2 ms while they run.
+async fn run_with_local_changelog(dir: &Path, chain: &Arc<ScriptedChain>, range: (u64, u64)) -> IngestorReport {
+    let changelog: Arc<dyn ChangeLog> = Arc::new(LocalChangeLog::open(dir, chain.chain_id()).unwrap());
+    let tracker = Arc::new(
+        CommitmentTracker::spawn_with_interval(
+            Arc::clone(chain) as Arc<dyn ChainAdapter>,
+            Arc::clone(&changelog),
+            Duration::from_millis(2),
+        )
+        .unwrap(),
+    );
+    let config = IngestorConfig {
+        start_slot: Some(range.0),
+        end_slot: Some(range.1),
+        flush_max_slots: 7,
+        ..fast_config(dir.to_path_buf())
+    };
+    let ingestor = Ingestor::new(
+        Arc::clone(chain) as Arc<dyn ChainAdapter>,
+        Arc::clone(&tracker),
+        changelog,
+        config,
+    )
+    .unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(10), ingestor.run())
+        .await
+        .expect("run finished")
+        .unwrap();
+    drop(ingestor);
+    // Stop the poller before the file is read, and release the file lock.
+    Arc::try_unwrap(tracker).ok().expect("only owner left").shutdown().await;
+    report
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_three_producers_share_one_local_change_log_with_gap_free_ids() {
+    let dir = temp_path("data");
+    let chain = ScriptedChain::with_tip(1_000);
+    chain.advancing.store(true, Ordering::SeqCst);
+    chain.skip(&[103, 106, 130, 131]);
+
+    let report = run_with_local_changelog(&dir, &chain, (100, 140)).await;
+    assert_eq!(report.slots_skipped, 4);
+
+    let envelopes = gap_free_envelopes(&dir);
+    let events: Vec<&ChangeEvent> = envelopes.iter().map(|e| &e.event).collect();
+    let new_slots: Vec<u64> = events.iter().filter(|e| e.is_new()).map(|e| e.slot()).collect();
+    let skip_slots: Vec<u64> = events.iter().filter(|e| e.is_skip()).map(|e| e.slot()).collect();
+    assert_eq!(new_slots, table_slots(&dir, TableKind::Slots), "one New per written slot, in order");
+    assert_eq!(skip_slots, [103, 106, 130, 131]);
+
+    // Finals chain up: each names the slot the one before it announced.
+    let finals: Vec<(u64, u64)> = events
+        .iter()
+        .filter_map(|e| match e {
+            ChangeEvent::Final { slot, previous_slot, .. } => Some((*slot, *previous_slot)),
+            _ => None,
+        })
+        .collect();
+    assert!(!finals.is_empty(), "the poller announced finality during the run");
+    let mut previous = 0;
+    for (slot, previous_slot) in finals {
+        assert_eq!(previous_slot, previous);
+        assert!(slot > previous);
+        previous = slot;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ids_continue_gap_free_when_the_pipeline_restarts_on_the_same_data_dir() {
+    let dir = temp_path("data");
+    let chain = ScriptedChain::with_tip(1_000);
+    chain.advancing.store(true, Ordering::SeqCst);
+    chain.skip(&[52]);
+
+    run_with_local_changelog(&dir, &chain, (50, 60)).await;
+    let first_run = gap_free_envelopes(&dir).len();
+    // The second run resumes from the cursor (61), whatever range it is given.
+    run_with_local_changelog(&dir, &chain, (50, 70)).await;
+    let envelopes = gap_free_envelopes(&dir);
+    assert!(envelopes.len() > first_run);
+    let new_slots: Vec<u64> = envelopes.iter().filter(|e| e.event.is_new()).map(|e| e.event.slot()).collect();
+    let expected: Vec<u64> = (50..=70).filter(|s| *s != 52).collect();
+    assert_eq!(new_slots, expected, "each slot announced once across both runs");
+}
+
+#[tokio::test]
+async fn a_change_log_failure_in_the_finality_poller_halts_the_ingestor() {
+    let dir = temp_path("data");
+    let chain = ScriptedChain::with_tip(10);
+    chain.advancing.store(true, Ordering::SeqCst);
+    let changelog = Arc::new(RecordingChangeLog::default());
+    changelog.refuse_final.store(true, Ordering::SeqCst);
+    let tracker = Arc::new(
+        CommitmentTracker::spawn_with_interval(
+            Arc::clone(&chain) as Arc<dyn ChainAdapter>,
+            Arc::clone(&changelog) as Arc<dyn ChangeLog>,
+            Duration::from_millis(5),
+        )
+        .unwrap(),
+    );
+    // No end slot: only the halt can stop this run.
+    let config = IngestorConfig { start_slot: Some(10), ..fast_config(dir.clone()) };
+    let ingestor = Ingestor::new(
+        chain,
+        Arc::clone(&tracker),
+        Arc::clone(&changelog) as Arc<dyn ChangeLog>,
+        config,
+    )
+    .unwrap();
+
+    let err = tokio::time::timeout(Duration::from_secs(5), ingestor.run())
+        .await
+        .expect("the halt stops the run")
+        .unwrap_err();
+    assert_eq!(err.kind(), "changelog_error", "{err}");
+    assert!(!tracker.is_running());
+    // The writer still flushed and announced what it had on the way out.
+    let written = table_slots(&dir, TableKind::Slots);
+    assert_eq!(changelog.new_slots(), written);
+    let cursor = IngestorCursor::load_or_init(dir.join(CURSOR_FILE_NAME)).unwrap().state();
+    if let Some(last) = written.last() {
+        assert!(cursor.last_flush_slot >= *last, "the cursor covers every announced slot");
+    }
 }
 
 // ---------------------------------------------------------------------------

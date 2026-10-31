@@ -261,13 +261,17 @@ impl RecordingChangeLog {
     }
 }
 
-#[async_trait]
 impl ChangeLog for RecordingChangeLog {
-    async fn emit(&self, event: ChangeEvent) -> PrismResult<()> {
+    fn emit(&self, event: ChangeEvent) -> PrismResult<u64> {
         if self.failing.load(Ordering::Relaxed) {
             return Err(PrismError::config("changelog", "unavailable"));
         }
-        self.events.lock().unwrap().push(event);
+        let mut events = self.events.lock().unwrap();
+        events.push(event);
+        Ok(events.len() as u64)
+    }
+
+    fn flush(&self) -> PrismResult<()> {
         Ok(())
     }
 }

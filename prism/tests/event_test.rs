@@ -1,6 +1,6 @@
 //! Tests for `prism::types::event`.
 
-use prism::types::event::{ChangeEvent, SkipReason};
+use prism::types::event::{ChangeEvent, EventEnvelope, SkipReason};
 use prism::types::udm::DeepAnaSlot;
 
 fn slot_row() -> DeepAnaSlot {
@@ -210,4 +210,48 @@ fn unknown_event_kind_is_rejected() {
     let err = ChangeEvent::from_json(r#"{"event":"reorg","slot":1}"#).unwrap_err();
     assert!(err.to_string().contains("reorg"), "{err}");
     assert!(ChangeEvent::from_json("garbage").is_err());
+}
+
+// ---------------------------------------------------------------- EventEnvelope
+
+fn envelope(id: u64, event: ChangeEvent) -> EventEnvelope {
+    EventEnvelope {
+        id,
+        emitted_at: 1_761_040_000,
+        chain: "solana-devnet".into(),
+        event,
+    }
+}
+
+#[test]
+fn envelope_json_wire_format_keeps_the_event_discriminator_at_the_top_level() {
+    let env = envelope(7, ChangeEvent::skip(42, SkipReason::ValidatorSkipped));
+    let json = env.to_json();
+    assert_eq!(
+        json,
+        r#"{"id":7,"emitted_at":1761040000,"chain":"solana-devnet","event":"skip","slot":42,"reason":"validator_skipped"}"#
+    );
+    assert_eq!(EventEnvelope::from_json(&json).unwrap(), env);
+}
+
+#[test]
+fn envelope_round_trips_every_variant() {
+    for (id, event) in [
+        (1, ChangeEvent::new_from_slot(&slot_row(), paths())),
+        (2, ChangeEvent::skip(250_000_001, SkipReason::RpcUnavailable)),
+        (3, ChangeEvent::finalized(250_000_000, "abc", 249_999_968)),
+    ] {
+        let env = envelope(id, event);
+        let parsed = EventEnvelope::from_json(&env.to_json()).unwrap();
+        assert_eq!(parsed, env);
+        assert_eq!(parsed.clone(), env, "Clone + PartialEq");
+    }
+}
+
+#[test]
+fn envelope_without_its_header_or_event_is_rejected() {
+    // A bare event, as written before envelopes existed, has no id.
+    assert!(EventEnvelope::from_json(&ChangeEvent::skip(1, SkipReason::BelowCursor).to_json()).is_err());
+    assert!(EventEnvelope::from_json(r#"{"id":1,"emitted_at":0,"chain":"c"}"#).is_err());
+    assert!(EventEnvelope::from_json(r#"{"id":1,"emitted_at":0,"chain":"c","event":"reorg","slot":1}"#).is_err());
 }

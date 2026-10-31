@@ -150,6 +150,7 @@ impl ChainAdapter for ScriptedAdapter {
 struct RecordingChangeLog {
     events: Mutex<Vec<ChangeEvent>>,
     failures_left: AtomicUsize,
+    flushes: AtomicUsize,
 }
 
 impl RecordingChangeLog {
@@ -159,30 +160,40 @@ impl RecordingChangeLog {
 
     fn failing(times: usize) -> Arc<Self> {
         Arc::new(Self {
-            events: Mutex::default(),
             failures_left: AtomicUsize::new(times),
+            ..Self::default()
         })
     }
 
     fn events(&self) -> Vec<ChangeEvent> {
         self.events.lock().unwrap().clone()
     }
+
+    fn flushes(&self) -> usize {
+        self.flushes.load(Ordering::SeqCst)
+    }
 }
 
-#[async_trait]
 impl ChangeLog for RecordingChangeLog {
-    async fn emit(&self, event: ChangeEvent) -> PrismResult<()> {
+    fn emit(&self, event: ChangeEvent) -> PrismResult<u64> {
         let fail = self
             .failures_left
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok();
         if fail {
-            return Err(PrismError::cursor(
+            return Err(PrismError::changelog(
                 "changelog.jsonl",
+                "append event 1",
                 io::Error::other("disk full"),
             ));
         }
-        self.events.lock().unwrap().push(event);
+        let mut events = self.events.lock().unwrap();
+        events.push(event);
+        Ok(events.len() as u64)
+    }
+
+    fn flush(&self) -> PrismResult<()> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -395,7 +406,7 @@ async fn poll_once_fetches_confirmed_then_finalized() {
     let adapter = ScriptedAdapter::new([Reply::Tip(150)], [Reply::Tip(118)]);
     let changelog = RecordingChangeLog::new();
     let (mut poller, _) = poller(&adapter, &changelog);
-    poller.poll_once().await;
+    poller.poll_once().await.unwrap();
     assert_eq!(adapter.calls(), vec![Confirmed, Finalized]);
 }
 
@@ -404,7 +415,7 @@ async fn poll_once_advances_both_watermarks_and_emits_final() {
     let adapter = ScriptedAdapter::new([Reply::Tip(150)], [Reply::Tip(118)]);
     let changelog = RecordingChangeLog::new();
     let (mut poller, wm) = poller(&adapter, &changelog);
-    poller.poll_once().await;
+    poller.poll_once().await.unwrap();
 
     assert_eq!(wm.confirmed_tip(), (150, hash(150)));
     assert_eq!(wm.finalized_tip(), (118, hash(118)));
@@ -420,7 +431,7 @@ async fn final_is_emitted_once_per_advance_with_the_previous_watermark() {
     let changelog = RecordingChangeLog::new();
     let (mut poller, _) = poller(&adapter, &changelog);
     for _ in 0..4 {
-        poller.poll_once().await;
+        poller.poll_once().await.unwrap();
     }
     assert_eq!(
         changelog.events(),
@@ -434,7 +445,7 @@ async fn a_failed_confirmed_fetch_does_not_block_finalized() {
     let adapter = ScriptedAdapter::new([Reply::Fail], [Reply::Tip(118)]);
     let changelog = RecordingChangeLog::new();
     let (mut poller, wm) = poller(&adapter, &changelog);
-    poller.poll_once().await;
+    poller.poll_once().await.unwrap();
     assert_eq!(wm.finalized_slot(), 118);
     assert_eq!(wm.confirmed_slot(), 118, "finalized implies confirmed");
     assert_eq!(changelog.events(), vec![final_event(118, 0)]);
@@ -445,7 +456,7 @@ async fn a_failed_finalized_fetch_still_advances_confirmed() {
     let adapter = ScriptedAdapter::new([Reply::Tip(150)], [Reply::Fail]);
     let changelog = RecordingChangeLog::new();
     let (mut poller, wm) = poller(&adapter, &changelog);
-    poller.poll_once().await;
+    poller.poll_once().await.unwrap();
     assert_eq!(wm.confirmed_slot(), 150);
     assert_eq!(wm.finalized_slot(), 0);
     assert!(changelog.events().is_empty());
@@ -458,36 +469,71 @@ async fn a_tip_at_the_wrong_commitment_is_ignored() {
     let adapter = ScriptedAdapter::new([Reply::Mislabeled(150)], [Reply::Mislabeled(118)]);
     let changelog = RecordingChangeLog::new();
     let (mut poller, wm) = poller(&adapter, &changelog);
-    poller.poll_once().await;
+    poller.poll_once().await.unwrap();
     assert_eq!(wm.snapshot(), WatermarkSnapshot::default());
     assert!(changelog.events().is_empty());
 }
 
 #[tokio::test]
-async fn a_failed_emit_is_retried_and_covers_the_whole_gap() {
+async fn each_poll_flushes_the_change_log_once() {
     let adapter = ScriptedAdapter::new(
-        [Reply::Tip(150), Reply::Tip(160)],
-        [Reply::Tip(118), Reply::Tip(128)],
+        [Reply::Tip(150), Reply::Tip(155), Reply::Fail],
+        [Reply::Tip(118), Reply::Tip(118), Reply::Fail],
     );
-    let changelog = RecordingChangeLog::failing(1);
-    let (mut poller, wm) = poller(&adapter, &changelog);
-
-    poller.poll_once().await;
-    assert_eq!(wm.finalized_slot(), 118, "the watermark is not held back");
-    assert!(changelog.events().is_empty());
-
-    poller.poll_once().await;
-    assert_eq!(changelog.events(), vec![final_event(128, 0)]);
+    let changelog = RecordingChangeLog::new();
+    let (mut poller, _) = poller(&adapter, &changelog);
+    for _ in 0..3 {
+        poller.poll_once().await.unwrap();
+    }
+    assert_eq!(changelog.events(), vec![final_event(118, 0)]);
+    assert_eq!(changelog.flushes(), 3, "one flush per poll, with or without an event");
 }
 
 #[tokio::test]
-async fn a_failed_emit_is_retried_even_if_finalized_does_not_move() {
+async fn a_failed_emit_is_returned_and_not_marked_announced() {
     let adapter = ScriptedAdapter::new([Reply::Tip(150)], [Reply::Tip(118)]);
     let changelog = RecordingChangeLog::failing(1);
-    let (mut poller, _) = poller(&adapter, &changelog);
-    poller.poll_once().await;
-    poller.poll_once().await;
-    assert_eq!(changelog.events(), vec![final_event(118, 0)]);
+    let (mut poller, wm) = poller(&adapter, &changelog);
+
+    let err = poller.poll_once().await.unwrap_err();
+    assert_eq!(err.kind(), "changelog_error");
+    assert_eq!(wm.finalized_slot(), 118, "the watermark is not held back");
+    assert!(changelog.events().is_empty());
+    assert_eq!(changelog.flushes(), 0, "no flush after a failed emit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_change_log_failure_halts_the_tracker_with_its_error() {
+    let adapter = ScriptedAdapter::new([Reply::Tip(150), Reply::Tip(160)], [Reply::Tip(118), Reply::Tip(128)]);
+    let changelog = RecordingChangeLog::failing(1);
+    let mut tracker = CommitmentTracker::spawn(adapter.clone(), changelog.clone());
+
+    tokio::time::timeout(Duration::from_secs(1), tracker.halted())
+        .await
+        .expect("the tracker halts on the first poll");
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!tracker.is_running());
+    let err = tracker.take_error().expect("the error is kept");
+    assert_eq!(err.kind(), "changelog_error");
+    assert!(tracker.take_error().is_none(), "handed over once");
+
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(adapter.calls().len(), 2, "no polling after the halt");
+    assert!(changelog.events().is_empty());
+    tracker.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_clean_shutdown_is_not_a_halt() {
+    let adapter = ScriptedAdapter::new([Reply::Tip(150)], [Reply::Tip(118)]);
+    let mut tracker = CommitmentTracker::spawn(adapter, RecordingChangeLog::new());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tracker.shutdown().await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(60), tracker.halted()).await.is_err(),
+        "halted() stays pending"
+    );
+    assert!(tracker.take_error().is_none());
 }
 
 #[tokio::test]
@@ -505,9 +551,9 @@ async fn a_poller_over_a_seeded_watermark_does_not_reannounce_it() {
     )
     .unwrap();
 
-    poller.poll_once().await;
+    poller.poll_once().await.unwrap();
     assert!(changelog.events().is_empty());
-    poller.poll_once().await;
+    poller.poll_once().await.unwrap();
     assert_eq!(changelog.events(), vec![final_event(128, 118)]);
 }
 
@@ -855,7 +901,9 @@ async fn watermark_never_moves_backwards_under_any_condition() {
                 Tip(228),
             ],
         );
-        let changelog = RecordingChangeLog::failing(1);
+        // A healthy change log: a failing one halts the poller (see
+        // `a_failed_emit_is_returned_and_not_marked_announced`).
+        let changelog = RecordingChangeLog::new();
         let (mut poller, wm) = poller(&adapter, &changelog);
 
         let expected = [
@@ -871,7 +919,7 @@ async fn watermark_never_moves_backwards_under_any_condition() {
         ];
         let mut previous = wm.snapshot();
         for (poll, want) in expected.into_iter().enumerate() {
-            poller.poll_once().await;
+            poller.poll_once().await.unwrap();
             let now = wm.snapshot();
             assert!(now.confirmed_slot >= previous.confirmed_slot, "poll {poll}: confirmed");
             assert!(now.finalized_slot >= previous.finalized_slot, "poll {poll}: finalized");
@@ -1089,7 +1137,7 @@ async fn is_finalized_column_round_trips_through_parquet_with_integrity() {
     assert!(slots.contains(&1_000_008) && slots.contains(&1_000_009));
 
     // 1. Nothing finalized yet (both fetches failed).
-    poller.poll_once().await;
+    poller.poll_once().await.unwrap();
     assert_eq!(tracker.finalized_slot(), 0);
     for (table, batch) in write_every_table(&slots, &tracker) {
         assert_is_finalized_integrity(table, &batch, 0);
@@ -1098,7 +1146,7 @@ async fn is_finalized_column_round_trips_through_parquet_with_integrity() {
     }
 
     // 2. Finalized up to 1_000_008, confirmed up to 1_000_040.
-    poller.poll_once().await;
+    poller.poll_once().await.unwrap();
     let finalized_at_write = tracker.finalized_slot();
     assert_eq!(finalized_at_write, 1_000_008);
     let written = write_every_table(&slots, &tracker);
@@ -1119,7 +1167,7 @@ async fn is_finalized_column_round_trips_through_parquet_with_integrity() {
     // 3. Finality moves on to 1_000_030 after the files were written. A
     //    row's current finality is its stored flag, or a later Final event
     //    covering its slot; that must equal what the watermark says now.
-    poller.poll_once().await;
+    poller.poll_once().await.unwrap();
     assert_eq!(tracker.finalized_slot(), 1_000_030);
     let events = changelog.events();
     assert_eq!(

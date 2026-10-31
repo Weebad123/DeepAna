@@ -30,7 +30,7 @@ downstream systems.
 
 | Module | What it does |
 |--------|--------------|
-| `types` | The shared contracts. `udm` defines the four row types (`DeepAnaSlot`, `DeepAnaTransaction`, `DeepAnaInstruction`, `DeepAnaTokenTransfer`) and their Arrow schemas. `event` defines `ChangeEvent` (`New`, `Skip`, `Final`). `error` defines `PrismError`, the single error type every module returns. |
+| `types` | The shared contracts. `udm` defines the four row types (`DeepAnaSlot`, `DeepAnaTransaction`, `DeepAnaInstruction`, `DeepAnaTokenTransfer`) and their Arrow schemas. `event` defines `ChangeEvent` (`New`, `Skip`, `Final`) and `EventEnvelope`, the numbered form the change log stores. `error` defines `PrismError`, the single error type every module returns. |
 | `adapter` | The boundary with the chain. `ChainAdapter` is the chain-agnostic trait (tip, block, accounts). `SolanaAdapter` implements it, adding rate limiting, retries and error mapping. |
 | `slot_processor` | Takes one slot number to one processed slot. `SlotFetcher` fetches the block with retries. `GapHandler` records skipped or unreachable slots as `Skip` events and in an audit log. |
 | `normalizer` | Splits a raw block into a slot row, transaction rows and a flattened list of instruction rows (inner instructions included). A block is normalized in full or not at all. |
@@ -38,7 +38,7 @@ downstream systems.
 | `account_resolver` | Fills in the mint decimals of token transfers. `MintCache` ensures each mint is fetched from the RPC only once and remembers recent misses for a while. |
 | `commitment` | Tracks the boundary between `confirmed` and `finalized` slots and emits a `Final` event whenever the finalized watermark advances. It can say whether a slot is finalized, but the UDM rows do not carry an `is_finalized` column yet, so nothing is stamped onto the Parquet files. |
 | `storage` | `Storage` is the backend trait. `ParquetWriter` buffers rows in memory and on each flush writes one file per table. `PartitionKey` computes the file paths. Flushes are all-or-nothing, and `rollback` removes slots at or above a given slot (e.g. after a fork). |
-| `changelog` | `ChangeLog`, the async sink every change event goes through. Three producers publish to it: the gap handler (`Skip`, as soon as a slot is found skipped or unreachable), the ingestor's writer task (`New`, one per slot once its files are on disk) and the commitment tracker (`Final`). No implementation ships yet: the local file sink (`local.rs`) is still empty, so callers supply their own. |
+| `changelog` | `ChangeLog`, the sink every change event goes through: `emit` records an event and returns its id, `flush` makes everything recorded durable. Three producers publish to it: the gap handler (`Skip`, as soon as a slot is found skipped or unreachable), the ingestor's writer task (`New`, one per slot once its files are on disk) and the commitment tracker (`Final`). `LocalChangeLog` appends them to `{data_dir}/changelog.jsonl`, see [The change log file](#the-change-log-file). |
 | `ingestor` | The orchestration layer. It builds and owns the slot processor, decoder registry, account resolver and `ParquetWriter`, and runs them as two Tokio tasks joined by a bounded channel of `ProcessedSlot`s: *process* (fetch, normalize, decode, resolve) and *writer* (append, flush, announce, move the cursor). It persists an `IngestorCursor` so a restart resumes after the last flushed slot. It also builds the Helius-backed adapter. See [Running the ingestor](#running-the-ingestor). |
 
 
@@ -69,7 +69,7 @@ When something goes wrong:
 | Slot fetch fails after every retry | An `RpcUnavailable` skip is recorded and the pipeline halts before that slot. A restart fetches it again. |
 | Non-retryable fetch or decode error | The pipeline halts. Slots before it are flushed on the way out. |
 | Flush fails | The rows stay buffered and the flush is retried at the next interval. After `max_flush_failures` failures in a row (default 3) the pipeline halts. If the final flush at shutdown fails, its error is returned right away. |
-| Change log refuses an event | The pipeline halts and the cursor does not move. A restart writes and announces those slots again. |
+| Change log fails (emit or flush, from any producer) | The pipeline halts and the cursor does not move. A restart writes and announces those slots again. The finality poller stops too and halts the ingestor with its error. |
 | Crash between a flush and the cursor save | On startup, `run()` deletes files at or above its first slot, then ingests those slots again. Every slot ends up on disk once. |
 
 ### Change events
@@ -78,7 +78,7 @@ When something goes wrong:
 |-------|------------|------|
 | `Skip` | gap handler | As soon as a slot is found skipped (`validator_skipped`) or unreachable after retries (`rpc_unavailable`). |
 | `New` | writer task | Once per slot with data, after its flush succeeded. Carries the paths of every file in that flush. |
-| `Final` | commitment tracker | When the finalized watermark advances. |
+| `Final` | commitment tracker | When the finalized watermark advances: one event per newly finalized watermark, then one change log flush per poll. |
 
 Delivery is at least once: a `New` event can repeat after a restart. A
 `Skip` can arrive before the `New` events of earlier slots that are still
@@ -88,6 +88,7 @@ buffered, so consumers that need strict slot order should sort by slot.
 
 ```text
 {data_dir}/
+  changelog.jsonl       change events, one numbered JSON envelope per line
   cursor.json           resume point: last processed and last flushed slot
   skipped_slots.log     one line per skip: {unix_time},{slot},{reason}
   solana/
@@ -100,6 +101,33 @@ buffered, so consumers that need strict slot order should sort by slot.
 Slot ranges include both ends. The date is the UTC day of the first slot in
 the batch. List-shaped and decoded columns are stored as JSON strings, so
 any Parquet reader can open the files.
+
+## The change log file
+
+`LocalChangeLog::open(data_dir, chain)` opens `{data_dir}/changelog.jsonl`
+(creating it if needed) and holds an exclusive lock on it until dropped, so
+only one PRISM can write a data directory. Each line is one event wrapped in
+an envelope:
+
+```text
+{"id":7,"emitted_at":1761040000,"chain":"solana-devnet","event":"skip","slot":350123457,"reason":"validator_skipped"}
+```
+
+- **Ids** start at 1 and go up by one per event, in file order, however many
+  producers emit at once. On open, numbering continues after the last
+  complete line, so ids have no gaps across restarts either.
+- **Crash safety.** Each line is written with one unbuffered `write_all`. A
+  partial last line left by a crash is cut off on the next open. Any other
+  bad line (unparseable, out of sequence, another chain) makes `open` fail.
+- **Durability.** An emitted event survives a process crash right away and
+  a power failure after the next `flush`. The writer task flushes before it
+  moves the cursor, and the finality poller flushes once per poll.
+- **Failure.** If a write or sync fails, the partial line is cut off and the
+  log refuses every later call with `PrismError::ChangeLogError`, which names
+  the original failure. Fix the cause and restart.
+
+`lens --parquet-directory DIR` opens the log at `DIR/changelog.jsonl`, the
+file FORGE reads through `FORGE_CHANGELOG_PATH`.
 
 ## Tests
 

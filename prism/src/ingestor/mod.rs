@@ -394,7 +394,8 @@ impl Ingestor {
     ///
     /// The buffer is flushed and the cursor persisted on the way out in every
     /// case where the writer still works. The first error any task hit is
-    /// returned.
+    /// returned. The commitment tracker's poller counts as one of those
+    /// tasks: if the change log fails it, the pipeline halts with its error.
     pub async fn run(&self) -> PrismResult<IngestorReport> {
         let first = self.starting_slot().await?;
         if self.config.end_slot.is_some_and(|end| end < first) {
@@ -435,9 +436,22 @@ impl Ingestor {
             totals: WriterTotals::default(),
         };
         let writer = spawn_task(&self.shutdown, writer.run(rx, self.config.flush_interval));
+        let finality = tokio::spawn(halt_with_tracker(
+            Arc::clone(&self.commitment_tracker),
+            self.shutdown.clone(),
+        ));
 
         let process_result = self.join("process", process).await;
         let writer_result = self.join("writer", writer).await;
+        finality.abort();
+        // Awaited so its tracker reference is gone once `run` returns.
+        let _ = finality.await;
+        // The poller's change log failure is what stopped the pipeline, so
+        // it comes first. A failed log names its original failure in every
+        // later error, whichever producer reports it.
+        if let Some(err) = self.commitment_tracker.take_error() {
+            return Err(err);
+        }
         process_result?;
         let totals = writer_result?;
         let cursor = self.cursor.state();
@@ -496,6 +510,17 @@ fn spawn_task<T: Send + 'static>(
         }
         result
     })
+}
+
+/// Shut the pipeline down if the commitment tracker's poller halts.
+async fn halt_with_tracker(tracker: Arc<CommitmentTracker>, shutdown: CancellationToken) {
+    tokio::select! {
+        () = tracker.halted() => {
+            warn!("finality poller halted; shutting down");
+            shutdown.cancel();
+        }
+        () = shutdown.cancelled() => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -692,8 +717,9 @@ impl WriterTask {
     ///
     /// A failed flush is logged and left for the next call, unless it is the
     /// `last` one or the `max_flush_failures`th in a row, which is returned.
-    /// A change log failure is returned at once: the cursor has not moved,
-    /// so the slots are written and announced again after a restart.
+    /// A change log failure (emit or flush) is returned at once: the cursor
+    /// has not moved, so the slots are written and announced again after a
+    /// restart.
     async fn flush(&mut self, last: bool) -> PrismResult<()> {
         let Some(high_water) = self.high_water else {
             return Ok(());
@@ -718,8 +744,11 @@ impl WriterTask {
         self.consecutive_failures = 0;
         for slot in &self.pending {
             let event = ChangeEvent::new_from_slot(slot, result.parquet_paths.clone());
-            self.changelog.emit(event).await?;
+            self.changelog.emit(event)?;
         }
+        // Durable before the cursor moves past them, and with them every
+        // `Skip` the gap handler emitted for the slots below the edge.
+        self.changelog.flush()?;
         self.pending.clear();
         self.cursor.record_flush(high_water)?;
         self.high_water = None;

@@ -18,8 +18,13 @@
 //! file was written. Files are immutable, so a row written as `false` stays
 //! `false` on disk; the `Final` event is how consumers learn that it has
 //! since become permanent.
+//!
+//! The poller stops if the change log fails. [`CommitmentTracker::halted`]
+//! resolves when it does, and [`CommitmentTracker::take_error`] hands over
+//! the error: the ingestor watches the first and returns the second, so a
+//! change log failure halts PRISM wherever it happens.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use arrow::array::BooleanArray;
@@ -30,7 +35,7 @@ use tracing::error;
 
 use crate::adapter::ChainAdapter;
 use crate::changelog::ChangeLog;
-use crate::types::error::PrismResult;
+use crate::types::error::{PrismError, PrismResult};
 
 pub mod finality_watermark;
 pub mod poller;
@@ -54,6 +59,10 @@ pub struct CommitmentTracker {
     watermark: Arc<FinalityWatermark>,
     poller_handle: Option<JoinHandle<()>>,
     shutdown: CancellationToken,
+    /// Cancelled when the poller stops on an error.
+    halted: CancellationToken,
+    /// That error, until [`Self::take_error`] takes it.
+    error: Arc<Mutex<Option<PrismError>>>,
 }
 
 impl CommitmentTracker {
@@ -85,10 +94,24 @@ impl CommitmentTracker {
             poll_interval,
             shutdown.clone(),
         )?;
+        let halted = CancellationToken::new();
+        let error = Arc::new(Mutex::new(None));
+        let poller_handle = tokio::spawn({
+            let halted = halted.clone();
+            let error = Arc::clone(&error);
+            async move {
+                if let Err(err) = poller.run().await {
+                    *error.lock().unwrap_or_else(PoisonError::into_inner) = Some(err);
+                    halted.cancel();
+                }
+            }
+        });
         Ok(Self {
             watermark,
-            poller_handle: Some(tokio::spawn(poller.run())),
+            poller_handle: Some(poller_handle),
             shutdown,
+            halted,
+            error,
         })
     }
 
@@ -99,6 +122,8 @@ impl CommitmentTracker {
             watermark,
             poller_handle: None,
             shutdown: CancellationToken::new(),
+            halted: CancellationToken::new(),
+            error: Arc::default(),
         }
     }
 
@@ -139,6 +164,18 @@ impl CommitmentTracker {
         self.poller_handle
             .as_ref()
             .is_some_and(|handle| !handle.is_finished())
+    }
+
+    /// Resolves once the poller has stopped on a change log error. Never
+    /// resolves for a poller that is running, was shut down, or for a
+    /// tracker without one.
+    pub async fn halted(&self) {
+        self.halted.cancelled().await;
+    }
+
+    /// The error the poller stopped on, the first time it is asked for.
+    pub fn take_error(&self) -> Option<PrismError> {
+        self.error.lock().unwrap_or_else(PoisonError::into_inner).take()
     }
 
     /// Stop the poller and wait for it to finish. The watermark keeps its

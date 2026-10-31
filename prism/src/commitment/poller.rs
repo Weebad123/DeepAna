@@ -9,14 +9,16 @@
 //! 4. offers the finalized tip to the watermark,
 //! 5. emits a [`ChangeEvent::Final`] if the finalized watermark has moved
 //!    past what was last announced,
-//! 6. logs the watermark and waits for the next tick.
+//! 6. flushes the change log, once,
+//! 7. logs the watermark and waits for the next tick.
 //!
 //! The poller favours accuracy over liveness. A tip that failed to fetch, or
 //! came back at a commitment other than the one asked for, is dropped rather
 //! than guessed at. A tip below the watermark is rejected by the watermark
-//! itself. A `Final` event that fails to emit is not lost: announcing is
-//! driven by the gap between the watermark and the last announced slot, so
-//! the next poll emits one event covering the whole gap.
+//! itself. A change log that fails to emit or flush is not retried: the
+//! poller stops and [`FinalityPoller::run`] returns the error, which halts
+//! PRISM like a storage failure does. Nothing is lost by that: a restarted
+//! poller announces the whole finalized range again from 0.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,7 +82,10 @@ impl FinalityPoller {
     /// Cancellation interrupts a fetch in progress (the adapter may be deep in
     /// its retry backoff) but not an emit, so a `Final` event is never cut off
     /// half written.
-    pub async fn run(mut self) {
+    ///
+    /// Returns the change log's error if it fails; fetch failures are only
+    /// logged.
+    pub async fn run(mut self) -> PrismResult<()> {
         info!(
             chain_id = self.adapter.chain_id(),
             poll_interval_ms = self.poll_interval.as_millis() as u64,
@@ -99,18 +104,27 @@ impl FinalityPoller {
                 () = self.shutdown.cancelled() => break,
                 tips = self.fetch_tips() => tips,
             };
-            self.apply(tips).await;
+            if let Err(err) = self.apply(tips) {
+                error!(
+                    chain_id = self.adapter.chain_id(),
+                    error = %err,
+                    "finality poller halted: the change log failed"
+                );
+                return Err(err);
+            }
         }
         info!(
             chain_id = self.adapter.chain_id(),
             "finality poller stopped"
         );
+        Ok(())
     }
 
-    /// One iteration of the loop, without the wait.
-    pub async fn poll_once(&mut self) {
+    /// One iteration of the loop, without the wait. Fails only when the
+    /// change log does.
+    pub async fn poll_once(&mut self) -> PrismResult<()> {
         let tips = self.fetch_tips().await;
-        self.apply(tips).await;
+        self.apply(tips)
     }
 
     /// Steps 1 and 2. Confirmed is read first, so the finalized read is
@@ -140,8 +154,8 @@ impl FinalityPoller {
         }
     }
 
-    /// Steps 3 to 6.
-    async fn apply(&mut self, (confirmed, finalized): (Option<ChainTip>, Option<ChainTip>)) {
+    /// Steps 3 to 7.
+    fn apply(&mut self, (confirmed, finalized): (Option<ChainTip>, Option<ChainTip>)) -> PrismResult<()> {
         if let Some(tip) = confirmed {
             let outcome = self
                 .watermark
@@ -154,7 +168,8 @@ impl FinalityPoller {
                 .advance_finalized(tip.slot_or_height, &tip.block_id);
             log_outcome(&tip, &outcome);
         }
-        self.announce().await;
+        self.announce()?;
+        self.changelog.flush()?;
         debug!(
             confirmed_slot = self.watermark.confirmed_slot(),
             finalized_slot = self.watermark.finalized_slot(),
@@ -162,24 +177,19 @@ impl FinalityPoller {
             announced_slot = self.announced,
             "finality watermark"
         );
+        Ok(())
     }
 
-    /// Emit a `Final` event for everything finalized since the last one.
-    async fn announce(&mut self) {
+    /// Emit a `Final` event for the newly finalized slot, if there is one.
+    fn announce(&mut self) -> PrismResult<()> {
         let (slot, blockhash) = self.watermark.finalized_tip();
         if slot <= self.announced {
-            return;
+            return Ok(());
         }
         let event = ChangeEvent::finalized(slot, blockhash, self.announced);
-        match self.changelog.emit(event).await {
-            Ok(()) => self.announced = slot,
-            Err(err) => warn!(
-                slot,
-                previous_slot = self.announced,
-                error = %err,
-                "failed to emit final event, retrying next poll"
-            ),
-        }
+        self.changelog.emit(event)?;
+        self.announced = slot;
+        Ok(())
     }
 }
 
