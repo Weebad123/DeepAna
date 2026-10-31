@@ -12,3 +12,4 @@ pub use registry::*;
 pub use api::*;
 pub use webhook::*;
 pub use changelog_reader::*;
+pub use config::{BoxError, ForgeConfig, ForgeError, ForgeResult};
