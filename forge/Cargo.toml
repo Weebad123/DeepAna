@@ -13,7 +13,16 @@ sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
+# LENS client: HTTP, error classification, and the visibility gate's sleeps.
+reqwest.workspace = true
+hyper.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 # Capture `ForgeConfig::display` output in the config tests.
 tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync"] }
+# The LENS client tests run a scripted fake LENS on a raw socket, and the
+# contract suite runs the real LENS over Parquet files PRISM's writer made.
+lens = { path = "../lens" }
+prism = { path = "../prism" }
