@@ -71,6 +71,11 @@ bytes = "1.12.1"
 sha2 = "0.10.9"
 flate2 = "1.1.10"
 
+# Registry (FORGE): one embedded SQLite file. `bundled` compiles SQLite in,
+# so the build needs no system libsqlite3.
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+uuid = { version = "1.29.0", features = ["v4"] }
+
 # Async
 tokio = { version = "1.53.3", features = ["time"] }
 tokio-util = "0.7.20"

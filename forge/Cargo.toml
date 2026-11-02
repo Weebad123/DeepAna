@@ -17,6 +17,10 @@ url.workspace = true
 reqwest.workspace = true
 hyper.workspace = true
 tokio.workspace = true
+# Registry: saved queries, alerts and the webhook outbox in one SQLite file,
+# so an alert's progress and its outbox row commit in one transaction.
+rusqlite.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 # Capture `ForgeConfig::display` output in the config tests.
