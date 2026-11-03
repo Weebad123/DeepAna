@@ -27,7 +27,7 @@ files PRISM has added since the last scan.
 | Module | What it does |
 |--------|--------------|
 | `config` | `LensConfig`, read once from `LENS_*` environment variables and validated at startup. It can't be changed after loading. |
-| `catalog` | `PrismCatalog` registers each PRISM table under the `solana` schema with a fixed Arrow schema that mirrors PRISM's UDM. A refresh re-registers every table so new files become visible, adds tables whose directory has appeared, and drops tables whose directory has gone. |
+| `catalog` | `PrismCatalog` registers each PRISM table under the `solana` schema with a fixed Arrow schema that mirrors PRISM's UDM. A refresh re-registers every table so new files become visible, adds tables whose directory has appeared, and drops tables whose directory has gone. `slots` is registered last, so once `MAX(slot)` shows new data (what FORGE's visibility gate watches), every other table has been refreshed too. |
 | `engine` | `QueryEngine` owns the DataFusion session and the catalog. Statements are planned read-only, so DDL, DML, `COPY` and `SET` are rejected. Each query is capped at `max_query_rows`, `query_timeout_secs`, and a memory pool that spills to disk. |
 | `result` | `QueryResult` holds the Arrow batches. `serialize` turns them into JSON or CSV. 64-bit integers stay exact and timestamps are RFC 3339. |
 | `api` | The axum router, `serve` and `shutdown_signal`. Shutdown lets in-flight requests finish, then stops the refresh task. |

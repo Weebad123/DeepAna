@@ -1,5 +1,6 @@
 //! The registry: one embedded SQLite file holding all of FORGE's state
-//! (saved queries, alerts, and the webhook outbox's deliveries).
+//! (saved queries, alerts, the webhook outbox's deliveries, and the alert
+//! engine's target slot).
 //!
 //! # One database, one connection
 //!
@@ -114,6 +115,15 @@ pub const MIGRATIONS: &[&str] = &[
     -- serves the cascade from alerts).
     CREATE INDEX deliveries_by_status_due ON deliveries (status, next_attempt_at);
     CREATE INDEX deliveries_by_alert ON deliveries (alert_id, created_at);
+    "#,
+    // 2: the alert engine's target, so a restart can resume alerts that
+    // were behind it without waiting for PRISM's next event.
+    r#"
+    CREATE TABLE engine_state (
+        id          INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+        target_slot INTEGER NOT NULL CHECK (target_slot >= 0),
+        updated_at  INTEGER NOT NULL
+    ) STRICT;
     "#,
 ];
 
@@ -579,6 +589,36 @@ impl Registry {
         }
     }
 
+    // -- engine state -------------------------------------------------------
+
+    /// The alert engine's target: the highest announced slot LENS has been
+    /// seen to cover. `None` before the engine's first gate.
+    pub fn engine_target(&self) -> ForgeResult<Option<u64>> {
+        self.db.with_conn("read engine target", |conn| {
+            let slot: Option<i64> = conn
+                .query_row("SELECT target_slot FROM engine_state WHERE id = 1", [], |row| row.get(0))
+                .optional()?;
+            slot.map(|slot| {
+                u64::try_from(slot).map_err(|_| RegistryError::storage(format!("negative engine target {slot}")))
+            })
+            .transpose()
+        })
+    }
+
+    /// Raise the stored engine target to `slot`. Never lowers it.
+    pub fn raise_engine_target(&self, slot: u64) -> ForgeResult<()> {
+        self.db.with_conn("raise engine target", |conn| {
+            let slot = slot_to_sql("target_slot", slot)?;
+            conn.execute(
+                "INSERT INTO engine_state (id, target_slot, updated_at) VALUES (1, ?1, ?2)
+                 ON CONFLICT (id) DO UPDATE SET target_slot = excluded.target_slot, updated_at = excluded.updated_at
+                 WHERE excluded.target_slot > engine_state.target_slot",
+                params![slot, unix_now()],
+            )?;
+            Ok(())
+        })
+    }
+
     // -- maintenance --------------------------------------------------------
 
     /// The schema version (`PRAGMA user_version`).
@@ -734,6 +774,23 @@ mod tests {
     fn slots_beyond_i64_are_rejected() {
         assert_eq!(slot_to_sql("s", i64::MAX as u64).unwrap(), i64::MAX);
         assert!(slot_to_sql("s", i64::MAX as u64 + 1).is_err());
+    }
+
+    #[test]
+    fn the_engine_target_only_rises() {
+        let dir = std::env::temp_dir().join(format!("forge-engine-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = Registry::open_path(dir.join("forge.db")).unwrap();
+        assert_eq!(registry.engine_target().unwrap(), None);
+        registry.raise_engine_target(100).unwrap();
+        registry.raise_engine_target(90).unwrap();
+        assert_eq!(registry.engine_target().unwrap(), Some(100));
+        registry.raise_engine_target(120).unwrap();
+        assert_eq!(registry.engine_target().unwrap(), Some(120));
+        assert!(registry.raise_engine_target(u64::MAX).is_err());
+        drop(registry);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

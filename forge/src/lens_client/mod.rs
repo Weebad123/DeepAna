@@ -11,6 +11,10 @@
 //! It does not retry, bind SQL parameters, or cache. Retrying is the caller's
 //! call, made with [`LensCallError::is_retryable`].
 //!
+//! The alert engine does not hold a [`LensClient`] but an
+//! `Arc<dyn `[`LensApi`]`>`: the two calls it makes, which [`LensClient`]
+//! implements and a test can fake.
+//!
 //! # Wire format
 //!
 //! `POST {lens_url}/query`, `Content-Type: application/json`:
@@ -59,6 +63,7 @@
 use std::error::Error as StdError;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::{Client, RequestBuilder, StatusCode, redirect};
 use serde::{Deserialize, Serialize};
@@ -456,6 +461,32 @@ impl LensClient {
             "LENS query succeeded"
         );
         Ok(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LensApi
+// ---------------------------------------------------------------------------
+
+/// What the alert engine asks of LENS, with [`LensClient`]'s semantics: no
+/// retries, every failure classified.
+#[async_trait]
+pub trait LensApi: Send + Sync {
+    /// See [`LensClient::query`].
+    async fn query(&self, sql: &str) -> Result<LensResponse, LensCallError>;
+
+    /// See [`LensClient::wait_until_visible`].
+    async fn wait_until_visible(&self, slot: u64, timeout: Duration) -> Visibility;
+}
+
+#[async_trait]
+impl LensApi for LensClient {
+    async fn query(&self, sql: &str) -> Result<LensResponse, LensCallError> {
+        LensClient::query(self, sql).await
+    }
+
+    async fn wait_until_visible(&self, slot: u64, timeout: Duration) -> Visibility {
+        LensClient::wait_until_visible(self, slot, timeout).await
     }
 }
 

@@ -26,6 +26,10 @@ tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 # so an alert's progress and its outbox row commit in one transaction.
 rusqlite.workspace = true
 uuid.workspace = true
+# Alert engine: `LensApi` is used as `Arc<dyn LensApi>`, which needs boxed
+# async methods; shutdown is a `CancellationToken`.
+async-trait.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 # Capture `ForgeConfig::display` output in the config tests.

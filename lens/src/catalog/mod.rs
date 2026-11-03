@@ -25,6 +25,14 @@
 //! registered on the next refresh; one whose directory disappears is
 //! deregistered.
 //!
+//! A pass registers the tables in [`REGISTRATION_ORDER`], `slots` last.
+//! FORGE decides that a slot is visible by watching `MAX(slot)` in
+//! `solana.slots` alone. Re-registering one table at a time means that,
+//! partway through a pass, some tables have dropped their cached listing
+//! and others have not. With `slots` last, once `solana.slots` shows new
+//! data, every other table has already been re-registered in the same
+//! pass, so none still lists only older files.
+//!
 //! The `solana` schema is a [`PrismSchemaProvider`] rather than DataFusion's
 //! `MemorySchemaProvider`, because the latter refuses to replace a table:
 //! re-registering would mean deregistering first, and a query planned in
@@ -55,6 +63,15 @@ pub use table::{
 
 use crate::config::LensConfig;
 use crate::error::{LensError, LensResult};
+
+/// The order a pass registers tables in: every table [`TableKind::ALL`]
+/// holds, with `slots` last. See the [module docs](self).
+pub const REGISTRATION_ORDER: [TableKind; 4] = [
+    TableKind::Transactions,
+    TableKind::Instructions,
+    TableKind::TokenTransfers,
+    TableKind::Slots,
+];
 
 // ---------------------------------------------------------------------------
 // Metrics, status, reports
@@ -93,7 +110,7 @@ pub struct TableStatus {
 }
 
 /// What one pass over the tables did, per table, in [`TableKind::ALL`]
-/// order.
+/// order (not the [`REGISTRATION_ORDER`] the pass ran in).
 #[derive(Debug, Default)]
 pub struct RefreshReport {
     /// Registered or re-registered.
@@ -176,7 +193,7 @@ impl PrismCatalog {
 
     /// Register every table whose directory exists with `ctx`. Meant for
     /// startup: the first table that cannot be registered fails the call,
-    /// leaving the tables before it registered.
+    /// leaving the tables before it in [`REGISTRATION_ORDER`] registered.
     pub fn register(&mut self, ctx: &SessionContext) -> LensResult<RefreshReport> {
         let report = self.run_pass(ctx, true)?;
         tracing::info!(
@@ -277,14 +294,15 @@ impl PrismCatalog {
         tracing::debug!("catalog refresh loop stopped");
     }
 
-    /// One pass over every table. With `fail_fast`, the first failure is
-    /// returned and the metrics are left as they were; without it, failures
-    /// go into the report and the pass always returns `Ok`.
+    /// One pass over every table, in [`REGISTRATION_ORDER`]. With
+    /// `fail_fast`, the first failure is returned and the metrics are left as
+    /// they were; without it, failures go into the report and the pass always
+    /// returns `Ok`.
     fn run_pass(&mut self, ctx: &SessionContext, fail_fast: bool) -> LensResult<RefreshReport> {
         let started = Instant::now();
         let mut report = RefreshReport::default();
-        for table in &self.tables {
-            let kind = table.kind();
+        for kind in REGISTRATION_ORDER {
+            let table = self.table(kind);
             let outcome = table.register_with(ctx).and_then(|outcome| {
                 // A table that is gone from disk should not stay queryable.
                 let removed = outcome == RegisterOutcome::SkippedMissingDir
@@ -313,6 +331,11 @@ impl PrismCatalog {
             }
         }
         report.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // `TableKind`'s `Ord` is declaration order, which is `ALL` order.
+        report.registered.sort();
+        report.skipped.sort();
+        report.deregistered.sort();
+        report.failed.sort_by_key(|(kind, _)| *kind);
 
         self.metrics = CatalogMetrics {
             total_refreshes: self.metrics.total_refreshes + 1,
@@ -550,5 +573,31 @@ mod tests {
         assert_eq!(report.skipped.len(), 3);
         let metrics = catalog.metrics();
         assert_eq!((metrics.total_refreshes, metrics.tables_failed, metrics.tables_skipped), (1, 1, 3));
+    }
+
+    #[test]
+    fn registration_order_holds_every_table_once_with_slots_last() {
+        let mut sorted = REGISTRATION_ORDER;
+        sorted.sort();
+        assert_eq!(sorted, TableKind::ALL);
+        assert_eq!(REGISTRATION_ORDER.last(), Some(&TableKind::Slots));
+    }
+
+    #[test]
+    fn a_pass_reports_in_all_order_whatever_order_it_ran_in() {
+        let ctx = SessionContext::new();
+        let dir = temp_dir();
+        for kind in TableKind::ALL {
+            fs::create_dir_all(dir.join(kind.dir_name())).unwrap();
+        }
+        let mut catalog = PrismCatalog::from_chain_root(&dir);
+        assert_eq!(catalog.register(&ctx).unwrap().registered, TableKind::ALL);
+
+        fs::remove_dir_all(dir.join("slots")).unwrap();
+        fs::remove_dir_all(dir.join("instructions")).unwrap();
+        let report = catalog.refresh(&ctx);
+        assert_eq!(report.registered, [TableKind::Transactions, TableKind::TokenTransfers]);
+        assert_eq!(report.skipped, [TableKind::Slots, TableKind::Instructions]);
+        assert_eq!(report.deregistered, [TableKind::Slots, TableKind::Instructions]);
     }
 }

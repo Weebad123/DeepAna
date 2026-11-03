@@ -86,7 +86,7 @@ fn reopen_keeps_data_and_version() {
         registry.create_alert(new_alert("a")).unwrap().id
     };
     let registry = open(&dir);
-    assert_eq!(registry.schema_version().unwrap(), 1);
+    assert_eq!(registry.schema_version().unwrap(), MIGRATIONS.len() as u32);
     assert_eq!(registry.get_query("q").unwrap().params.len(), 2);
     assert_eq!(registry.get_alert(&id).unwrap().name, "a");
 }
@@ -157,7 +157,8 @@ fn migration_one_creates_the_deliveries_table() {
             Ok(names)
         })
         .unwrap();
-    assert_eq!(tables, ["alerts", "deliveries", "saved_queries"]);
+    // Migration 2 adds `engine_state`.
+    assert_eq!(tables, ["alerts", "deliveries", "engine_state", "saved_queries"]);
 }
 
 // ---------------------------------------------------------------------------
