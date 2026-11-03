@@ -10,13 +10,18 @@ serde.workspace = true
 serde_json.workspace = true
 # Fingerprint of the change log's first line, to recognise a replaced file.
 sha2.workspace = true
+# Webhook signatures: HMAC-SHA256, hex-encoded.
+hmac.workspace = true
+hex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
 # LENS client: HTTP, error classification, and the visibility gate's sleeps.
 reqwest.workspace = true
 hyper.workspace = true
-tokio.workspace = true
+# The webhook dispatcher also needs a background task, its wake signal and
+# `select!`.
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 # Registry: saved queries, alerts and the webhook outbox in one SQLite file,
 # so an alert's progress and its outbox row commit in one transaction.
 rusqlite.workspace = true

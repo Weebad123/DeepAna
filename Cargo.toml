@@ -69,6 +69,8 @@ bs58 = "0.5.1"
 base64 = "0.22.1"
 bytes = "1.12.1"
 sha2 = "0.10.9"
+hmac = "0.12.1"
+hex = "0.4.3"
 flate2 = "1.1.10"
 
 # Registry (FORGE): one embedded SQLite file. `bundled` compiles SQLite in,

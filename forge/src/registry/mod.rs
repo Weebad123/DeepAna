@@ -88,19 +88,32 @@ pub const MIGRATIONS: &[&str] = &[
         updated_at          INTEGER NOT NULL
     ) STRICT;
 
+    -- One row per fired range; see webhook/outbox.rs. Times are unix
+    -- milliseconds (alerts and saved queries use seconds).
     CREATE TABLE deliveries (
-        delivery_id     TEXT    PRIMARY KEY NOT NULL,
-        alert_id        TEXT    NOT NULL REFERENCES alerts (id) ON DELETE CASCADE,
-        payload         TEXT    NOT NULL,
-        status          TEXT    NOT NULL,
-        attempts        INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-        next_attempt_at INTEGER NOT NULL,
-        created_at      INTEGER NOT NULL
+        delivery_id        TEXT    PRIMARY KEY NOT NULL,
+        alert_id           TEXT    NOT NULL REFERENCES alerts (id) ON DELETE CASCADE,
+        to_slot            INTEGER NOT NULL CHECK (to_slot >= 0),
+        payload            TEXT    NOT NULL,
+        status             TEXT    NOT NULL CHECK (status IN ('held', 'pending', 'delivered', 'failed')),
+        release_after_slot INTEGER          CHECK (release_after_slot >= 0),
+        attempts           INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        next_attempt_at    INTEGER NOT NULL,
+        last_attempt_at    INTEGER,
+        delivered_at       INTEGER,
+        last_status_code   INTEGER          CHECK (last_status_code BETWEEN 100 AND 999),
+        last_error         TEXT,
+        created_at         INTEGER NOT NULL,
+        -- A range fires at most once, however often it is re-evaluated.
+        UNIQUE (alert_id, to_slot),
+        CHECK (status <> 'held' OR release_after_slot IS NOT NULL),
+        CHECK ((status = 'delivered') = (delivered_at IS NOT NULL))
     ) STRICT;
 
-    -- The dispatcher's claim query, and the cascade from alerts.
+    -- The dispatcher's due query, and the per-alert history (which also
+    -- serves the cascade from alerts).
     CREATE INDEX deliveries_by_status_due ON deliveries (status, next_attempt_at);
-    CREATE INDEX deliveries_by_alert ON deliveries (alert_id);
+    CREATE INDEX deliveries_by_alert ON deliveries (alert_id, created_at);
     "#,
 ];
 
@@ -191,7 +204,7 @@ fn is_unique_violation(err: &rusqlite::Error) -> bool {
 
 /// Slots are `u64`; SQLite integers are `i64`. No real slot comes near the
 /// boundary, but one must never wrap silently.
-fn slot_to_sql(field: &str, slot: u64) -> Result<i64, RegistryError> {
+pub(crate) fn slot_to_sql(field: &str, slot: u64) -> Result<i64, RegistryError> {
     i64::try_from(slot).map_err(|_| RegistryError::invalid(field, format!("slot {slot} exceeds {}", i64::MAX)))
 }
 
@@ -219,6 +232,15 @@ impl Db {
         }
     }
 
+    /// A migrated in-memory database, for unit tests elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) fn open_in_memory() -> Self {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrate(&mut conn).unwrap();
+        Self::new(conn)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Connection> {
         // A panic mid-transaction drops its `Transaction`, which rolls back,
         // so the connection is still consistent.
@@ -243,9 +265,10 @@ impl Db {
     /// ```ignore
     /// db.transaction("fire alert", |tx| {
     ///     Registry::advance_progress(tx, &alert.id, to_slot)?;
-    ///     outbox::enqueue(tx, &alert.id, &payload)?;
+    ///     webhook.enqueue(tx, &delivery)?;
     ///     Ok(())
     /// })?;
+    /// webhook.wake();
     /// ```
     ///
     /// `IMMEDIATE` takes the write lock up front, so the transaction cannot
@@ -486,7 +509,8 @@ impl Registry {
         })
     }
 
-    /// Delete an alert and, by cascade, its pending deliveries.
+    /// Delete an alert and, by cascade, all its deliveries (held and pending
+    /// ones are never sent).
     pub fn delete_alert(&self, id: &str) -> ForgeResult<()> {
         self.db.with_conn("delete alert", |conn| {
             match conn.execute("DELETE FROM alerts WHERE id = ?1", [id])? {

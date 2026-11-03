@@ -8,8 +8,8 @@
 //! the closure panics, the process dies before commit, and many writers race
 //! while an independent reader watches.
 //!
-//! The outbox module owns the delivery insert. These tests write the row
-//! with plain SQL, in the same transaction, the way it will.
+//! The delivery half is the real `Outbox::enqueue`, in the same
+//! transaction, the way the evaluator runs it.
 
 mod common;
 
@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use common::TempDir;
-use forge::{ForgeError, NewAlert, Registry, RegistryError};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use forge::{Enqueued, ForgeError, NewAlert, NewDelivery, Outbox, Registry, RegistryError};
+use rusqlite::{Connection, OptionalExtension, Transaction};
 
 fn open(dir: &TempDir) -> Registry {
     Registry::open_path(dir.path().join("forge.db")).unwrap()
@@ -39,21 +39,26 @@ fn create_alert(registry: &Registry, name: &str) -> String {
         .id
 }
 
-/// What the outbox will do: one pending row per fired range.
-fn enqueue(tx: &Transaction<'_>, delivery_id: &str, alert_id: &str, slot: u64) -> Result<(), RegistryError> {
-    tx.execute(
-        "INSERT INTO deliveries (delivery_id, alert_id, payload, status, attempts, next_attempt_at, created_at)
-         VALUES (?1, ?2, ?3, 'pending', 0, 0, 0)",
-        params![delivery_id, alert_id, format!(r#"{{"to_slot":{slot}}}"#)],
-    )?;
-    Ok(())
+fn delivery(alert_id: &str, slot: u64) -> NewDelivery {
+    NewDelivery {
+        alert_id: alert_id.into(),
+        to_slot: slot,
+        payload: format!(r#"{{"to_slot":{slot}}}"#),
+        release_after_slot: None,
+    }
 }
 
-/// The unit under test, as the evaluator will run it.
-fn fire(registry: &Registry, alert_id: &str, delivery_id: &str, to_slot: u64) -> Result<(), ForgeError> {
+/// One pending row for the fired range.
+fn enqueue(tx: &Transaction<'_>, alert_id: &str, slot: u64) -> Result<Enqueued, RegistryError> {
+    Outbox::enqueue(tx, &delivery(alert_id, slot), 0)
+}
+
+/// The unit under test, as the evaluator runs it.
+fn fire(registry: &Registry, alert_id: &str, to_slot: u64) -> Result<(), ForgeError> {
     registry.db().transaction("fire alert", |tx| {
         Registry::advance_progress(tx, alert_id, to_slot)?;
-        enqueue(tx, delivery_id, alert_id, to_slot)
+        enqueue(tx, alert_id, to_slot)?;
+        Ok(())
     })
 }
 
@@ -92,7 +97,7 @@ fn success_commits_both_halves_durably() {
     let before = state(&registry, &id);
     assert_eq!(before, State { slot: None, deliveries: 0 });
 
-    fire(&registry, &id, "d1", 10).unwrap();
+    fire(&registry, &id, 10).unwrap();
     let after = State { slot: Some(10), deliveries: 1 };
     assert_eq!(state(&registry, &id), after);
 
@@ -106,17 +111,23 @@ fn a_failed_delivery_insert_rolls_back_the_advance() {
     let dir = TempDir::new();
     let registry = open(&dir);
     let id = create_alert(&registry, "a");
-    fire(&registry, &id, "d1", 10).unwrap();
+    fire(&registry, &id, 10).unwrap();
     let before = state(&registry, &id);
 
     // The advance to 20 succeeds inside the transaction, then the insert
-    // hits the delivery_id primary key.
-    let err = fire(&registry, &id, "d1", 20).unwrap_err();
-    assert_eq!(status(err), 500);
+    // rejects the payload.
+    let err = registry
+        .db()
+        .transaction("fire", |tx| {
+            Registry::advance_progress(tx, &id, 20)?;
+            Outbox::enqueue(tx, &NewDelivery { payload: "not json".into(), ..delivery(&id, 20) }, 0)
+        })
+        .unwrap_err();
+    assert_eq!(status(err), 400);
     assert_eq!(state(&registry, &id), before, "advance must not survive a failed insert");
 
     // And slot 20 can still be fired: nothing was skipped.
-    fire(&registry, &id, "d2", 20).unwrap();
+    fire(&registry, &id, 20).unwrap();
     assert_eq!(state(&registry, &id), State { slot: Some(20), deliveries: 2 });
 }
 
@@ -131,7 +142,7 @@ fn a_delivery_for_a_vanished_alert_rolls_back() {
         .db()
         .transaction("fire", |tx| {
             Registry::advance_progress(tx, &id, 5)?;
-            enqueue(tx, "d1", "no-such-alert", 5)
+            enqueue(tx, "no-such-alert", 5)
         })
         .unwrap_err();
     assert_eq!(status(err), 500);
@@ -142,17 +153,18 @@ fn a_delivery_for_a_vanished_alert_rolls_back() {
 fn a_stale_advance_rolls_back_an_already_inserted_delivery() {
     // Insert first, then advance. A stale slot fails the advance, and the
     // delivery written earlier in the same transaction must go with it.
+    // (Slot 10 already has its row, so that enqueue is a no-op duplicate.)
     let dir = TempDir::new();
     let registry = open(&dir);
     let id = create_alert(&registry, "a");
-    fire(&registry, &id, "d1", 10).unwrap();
+    fire(&registry, &id, 10).unwrap();
     let before = state(&registry, &id);
 
-    for (n, stale) in [10u64, 9, 0].into_iter().enumerate() {
+    for stale in [10u64, 9, 0] {
         let err = registry
             .db()
             .transaction("fire", |tx| {
-                enqueue(tx, &format!("stale-{n}"), &id, stale)?;
+                enqueue(tx, &id, stale)?;
                 Registry::advance_progress(tx, &id, stale)
             })
             .unwrap_err();
@@ -171,7 +183,7 @@ fn an_error_after_both_writes_rolls_back_both() {
         .db()
         .transaction("fire", |tx| {
             Registry::advance_progress(tx, &id, 7)?;
-            enqueue(tx, "d1", &id, 7)?;
+            enqueue(tx, &id, 7)?;
             // Both writes are visible inside the transaction...
             assert_eq!(state_of(tx, &id), State { slot: Some(7), deliveries: 1 });
             Err::<(), _>(RegistryError::storage("signer unavailable"))
@@ -192,7 +204,7 @@ fn a_panic_after_both_writes_rolls_back_both_and_the_db_stays_usable() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = registry.db().transaction("fire", |tx| {
             Registry::advance_progress(tx, &id, 7)?;
-            enqueue(tx, "d1", &id, 7)?;
+            enqueue(tx, &id, 7)?;
             panic!("evaluator bug");
             #[allow(unreachable_code)]
             Ok(())
@@ -203,7 +215,7 @@ fn a_panic_after_both_writes_rolls_back_both_and_the_db_stays_usable() {
 
     // The poisoned mutex is recovered and the connection is not stuck in
     // a transaction.
-    fire(&registry, &id, "d1", 7).unwrap();
+    fire(&registry, &id, 7).unwrap();
     assert_eq!(state(&registry, &id), State { slot: Some(7), deliveries: 1 });
 }
 
@@ -227,7 +239,7 @@ fn crash_child() {
     let id = registry.list_alerts().unwrap().remove(0).id;
     let _ = registry.db().transaction("fire", |tx| {
         Registry::advance_progress(tx, &id, 99)?;
-        enqueue(tx, "crash", &id, 99)?;
+        enqueue(tx, &id, 99)?;
         std::process::abort();
         #[allow(unreachable_code)]
         Ok(())
@@ -240,7 +252,7 @@ fn a_process_crash_before_commit_leaves_neither_half() {
     let id = {
         let registry = open(&dir);
         let id = create_alert(&registry, "a");
-        fire(&registry, &id, "d1", 10).unwrap();
+        fire(&registry, &id, 10).unwrap();
         id
     };
     let before = State { slot: Some(10), deliveries: 1 };
@@ -255,7 +267,7 @@ fn a_process_crash_before_commit_leaves_neither_half() {
     // The lock died with the child; reopening runs WAL recovery.
     let registry = open(&dir);
     assert_eq!(state(&registry, &id), before);
-    fire(&registry, &id, "crash", 99).unwrap();
+    fire(&registry, &id, 99).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -314,13 +326,13 @@ fn concurrent_fires_and_an_observer_never_see_half_a_unit() {
     };
 
     let writers: Vec<_> = (0..WRITERS)
-        .map(|w| {
+        .map(|_| {
             let (registry, id, committed, start) = (registry.clone(), id.clone(), committed.clone(), start.clone());
             thread::spawn(move || {
                 start.wait();
                 // Every writer tries every slot, so each slot is contested.
                 for slot in 1..=SLOTS {
-                    match fire(&registry, &id, &format!("w{w}-s{slot}"), slot) {
+                    match fire(&registry, &id, slot) {
                         Ok(()) => {
                             committed.fetch_add(1, Ordering::Relaxed);
                         }
@@ -362,9 +374,9 @@ fn deleting_an_alert_cascades_to_its_deliveries() {
     let registry = open(&dir);
     let keep = create_alert(&registry, "keep");
     let drop_id = create_alert(&registry, "drop");
-    fire(&registry, &keep, "k1", 1).unwrap();
-    fire(&registry, &drop_id, "d1", 1).unwrap();
-    fire(&registry, &drop_id, "d2", 2).unwrap();
+    fire(&registry, &keep, 1).unwrap();
+    fire(&registry, &drop_id, 1).unwrap();
+    fire(&registry, &drop_id, 2).unwrap();
 
     registry.delete_alert(&drop_id).unwrap();
     assert_eq!(state(&registry, &drop_id), State { slot: None, deliveries: 0 });

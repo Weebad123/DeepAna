@@ -54,7 +54,8 @@ pub struct Alert {
     pub webhook_url: String,
     #[serde(skip_serializing, default)]
     pub secret: String,
-    /// Evaluate a range only once all of it is finalized.
+    /// Hold each range's delivery in the outbox until the range's last slot
+    /// is finalized. The range is still evaluated as soon as it is seen.
     pub wait_for_final: bool,
     pub enabled: bool,
     pub last_evaluated_slot: Option<u64>,
