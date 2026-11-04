@@ -625,6 +625,30 @@ impl Registry {
     pub fn schema_version(&self) -> ForgeResult<u32> {
         self.db.with_conn("read schema version", |conn| Ok(user_version(conn)?))
     }
+
+    /// The schema version and how many alerts and saved queries are stored,
+    /// for `/health`. Counts only; nothing is read.
+    pub fn stats(&self) -> ForgeResult<RegistryStats> {
+        self.db.with_conn("read registry stats", |conn| {
+            let count = |table: &str| -> Result<u64, RegistryError> {
+                let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
+                Ok(u64::try_from(n).unwrap_or_default())
+            };
+            Ok(RegistryStats {
+                schema_version: user_version(conn)?,
+                alerts: count("alerts")?,
+                saved_queries: count("saved_queries")?,
+            })
+        })
+    }
+}
+
+/// What [`Registry::stats`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RegistryStats {
+    pub schema_version: u32,
+    pub alerts: u64,
+    pub saved_queries: u64,
 }
 
 /// `{db_path}.lock`.
@@ -788,6 +812,8 @@ mod tests {
         assert_eq!(registry.engine_target().unwrap(), Some(100));
         registry.raise_engine_target(120).unwrap();
         assert_eq!(registry.engine_target().unwrap(), Some(120));
+        let stats = registry.stats().unwrap();
+        assert_eq!(stats, RegistryStats { schema_version: MIGRATIONS.len() as u32, alerts: 0, saved_queries: 0 });
         assert!(registry.raise_engine_target(u64::MAX).is_err());
         drop(registry);
         let _ = std::fs::remove_dir_all(&dir);

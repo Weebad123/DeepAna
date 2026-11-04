@@ -22,6 +22,14 @@
 //! is dropped, so request paths can be appended directly. Its default is
 //! LENS's own default bind address.
 //!
+//! `bind_address` must not be LENS's own address: FORGE would either fail
+//! to bind, or, started first, take LENS's port and send its LENS queries to
+//! itself. They clash when the ports are equal and `lens_url`'s host is this
+//! machine as FORGE binds it: `localhost`, a loopback address, or the bind
+//! IP itself (any local address when FORGE binds `0.0.0.0` or `::`). Host
+//! names are not resolved, so a LENS behind another name for this machine
+//! is not caught here.
+//!
 //! `changelog_path` and `db_path` may name files that do not exist yet (PRISM
 //! may not have written its first event, and FORGE creates its database), but
 //! the parent directory must exist. Both are stored canonicalized.
@@ -71,7 +79,7 @@ use std::ffi::OsString;
 use std::fmt::Display;
 use std::fs;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf, is_separator};
 use std::str::FromStr;
 use std::time::Duration;
@@ -203,6 +211,7 @@ impl ForgeConfig {
         let bind_address = read_string(&lookup, ENV_BIND_ADDRESS, "bind_address")?
             .unwrap_or_else(|| DEFAULT_BIND_ADDRESS.to_owned());
         validate_bind_address(&bind_address)?;
+        check_not_lens_address(&bind_address, &lens_url)?;
 
         let poll_interval_ms = read_number(&lookup, ENV_POLL_INTERVAL_MS, "poll_interval_ms")?
             .unwrap_or(DEFAULT_POLL_INTERVAL_MS);
@@ -435,6 +444,37 @@ fn validate_bind_address(bind_address: &str) -> ForgeResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Reject a `bind_address` that is LENS's own address (see the module
+/// docs). Both values have been validated.
+fn check_not_lens_address(bind_address: &str, lens_url: &str) -> ForgeResult<()> {
+    let bind: SocketAddr = bind_address.parse().expect("bind_address was validated");
+    let lens = Url::parse(lens_url).expect("lens_url was validated");
+    if lens.port_or_known_default() != Some(bind.port()) {
+        return Ok(());
+    }
+    let same_host = match lens.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => is_local_to(IpAddr::V4(ip), bind.ip()),
+        Some(url::Host::Ipv6(ip)) => is_local_to(IpAddr::V6(ip), bind.ip()),
+        None => false,
+    };
+    if same_host {
+        return Err(ForgeError::config(
+            "bind_address",
+            format!(
+                "{bind_address:?} is the address of LENS ({lens_url}); FORGE needs a port of its own \
+                 (default {DEFAULT_BIND_ADDRESS})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a LENS at `lens_ip` is reached by a socket bound to `bind_ip`.
+fn is_local_to(lens_ip: IpAddr, bind_ip: IpAddr) -> bool {
+    lens_ip == bind_ip || lens_ip.is_loopback() || lens_ip.is_unspecified() || bind_ip.is_unspecified()
 }
 
 /// Check that `raw` is a usable LENS base URL and return it without a
@@ -768,6 +808,36 @@ mod tests {
         for bad in ["127.0.0.1:0", "[::]:0", "localhost:8081", "127.0.0.1", ":8081", "127.0.0.1:65536", "::1:8081"] {
             let err = validate_bind_address(bad).unwrap_err();
             assert_eq!(err.config_field(), Some("bind_address"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn bind_address_may_not_be_the_lens_address() {
+        for (bind, lens) in [
+            ("127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("127.0.0.1:8080", "http://localhost:8080"),
+            ("127.0.0.1:8080", "http://LOCALHOST:8080/api"),
+            ("127.0.0.1:80", "http://127.0.0.1"),
+            ("127.0.0.1:443", "https://localhost/"),
+            ("0.0.0.0:8080", "http://127.0.0.1:8080"),
+            ("0.0.0.0:8080", "http://10.1.2.3:8080"),
+            ("10.1.2.3:8080", "http://10.1.2.3:8080"),
+            ("10.1.2.3:8080", "http://127.0.0.1:8080"),
+            ("[::1]:8080", "http://[::1]:8080"),
+            ("[::]:8080", "http://127.0.0.1:8080"),
+            ("127.0.0.1:8080", "http://0.0.0.0:8080"),
+        ] {
+            let err = check_not_lens_address(bind, lens).unwrap_err();
+            assert_eq!(err.config_field(), Some("bind_address"), "{bind} vs {lens}");
+        }
+        for (bind, lens) in [
+            (DEFAULT_BIND_ADDRESS, DEFAULT_LENS_URL),
+            ("127.0.0.1:8081", "http://127.0.0.1:8080"),
+            ("127.0.0.1:8080", "http://lens.internal:8080"),
+            ("10.1.2.3:8080", "http://10.9.9.9:8080"),
+            ("127.0.0.1:80", "https://127.0.0.1"),
+        ] {
+            assert!(check_not_lens_address(bind, lens).is_ok(), "{bind} vs {lens}");
         }
     }
 

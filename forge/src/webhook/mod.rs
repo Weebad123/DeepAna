@@ -270,6 +270,11 @@ impl WebhookService {
         self.outbox.list(alert_id, limit)
     }
 
+    /// For the delivery history endpoint; see [`Outbox::list_with_status`].
+    pub fn history(&self, alert_id: &str, limit: usize, status: Option<DeliveryStatus>) -> ForgeResult<Vec<Delivery>> {
+        self.outbox.list_with_status(alert_id, limit, status)
+    }
+
     /// Stop claiming, let in-flight sends finish (or abandon them after the
     /// grace period), and return once the dispatcher has stopped. Calling it
     /// again returns at once.

@@ -11,8 +11,8 @@
 //! It does not retry, bind SQL parameters, or cache. Retrying is the caller's
 //! call, made with [`LensCallError::is_retryable`].
 //!
-//! The alert engine does not hold a [`LensClient`] but an
-//! `Arc<dyn `[`LensApi`]`>`: the two calls it makes, which [`LensClient`]
+//! The alert engine and the HTTP API do not hold a [`LensClient`] but an
+//! `Arc<dyn `[`LensApi`]`>`: the calls they make, which [`LensClient`]
 //! implements and a test can fake.
 //!
 //! # Wire format
@@ -468,8 +468,8 @@ impl LensClient {
 // LensApi
 // ---------------------------------------------------------------------------
 
-/// What the alert engine asks of LENS, with [`LensClient`]'s semantics: no
-/// retries, every failure classified.
+/// What the alert engine and the HTTP API ask of LENS, with
+/// [`LensClient`]'s semantics: no retries, every failure classified.
 #[async_trait]
 pub trait LensApi: Send + Sync {
     /// See [`LensClient::query`].
@@ -477,6 +477,9 @@ pub trait LensApi: Send + Sync {
 
     /// See [`LensClient::wait_until_visible`].
     async fn wait_until_visible(&self, slot: u64, timeout: Duration) -> Visibility;
+
+    /// See [`LensClient::health`].
+    async fn health(&self) -> Result<LensHealth, LensCallError>;
 }
 
 #[async_trait]
@@ -487,6 +490,10 @@ impl LensApi for LensClient {
 
     async fn wait_until_visible(&self, slot: u64, timeout: Duration) -> Visibility {
         LensClient::wait_until_visible(self, slot, timeout).await
+    }
+
+    async fn health(&self) -> Result<LensHealth, LensCallError> {
+        LensClient::health(self).await
     }
 }
 
@@ -529,7 +536,7 @@ fn cut_short(err: &LensCallError, budget: Duration, request_timeout: Duration, t
 }
 
 /// The `max_slot` of a [`VISIBILITY_SQL`] result; `None` for an empty table.
-fn max_slot_of(response: &LensResponse) -> Result<Option<u64>, LensCallError> {
+pub(crate) fn max_slot_of(response: &LensResponse) -> Result<Option<u64>, LensCallError> {
     let protocol = |message: String| LensCallError::Protocol { message };
     let [row] = response.rows.as_slice() else {
         return Err(protocol(format!("visibility query returned {} rows, expected 1", response.rows.len())));

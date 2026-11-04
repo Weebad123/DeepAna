@@ -89,11 +89,7 @@ impl Alert {
         debug_assert!(from_slot <= to_slot, "empty range {from_slot}..={to_slot}");
         // Stored SQL was validated on the way in, so it parses and names
         // only the two slots.
-        validate_template("sql", &self.sql)
-            .and_then(|template| {
-                template.render(|name| Ok(if name == FROM_SLOT { from_slot } else { to_slot }.to_string()))
-            })
-            .expect("stored alert SQL is a valid template")
+        bind_alert_sql(&self.sql, from_slot, to_slot).expect("stored alert SQL is a valid template")
     }
 
     /// The inclusive range to evaluate once the change log has reached
@@ -135,11 +131,18 @@ impl std::fmt::Debug for NewAlert {
 }
 
 impl NewAlert {
+    /// Every check [`super::Registry::create_alert`] makes, without touching
+    /// the database.
     pub fn validate(&self) -> Result<(), RegistryError> {
         validate_name("name", &self.name)?;
         validate_alert_sql(&self.sql)?;
         validate_webhook_url(&self.webhook_url)?;
         validate_secret(&self.secret)
+    }
+
+    /// [`Alert::bind_range`] before the alert is stored, e.g. for a dry run.
+    pub fn bind_range(&self, from_slot: u64, to_slot: u64) -> Result<String, RegistryError> {
+        bind_alert_sql(&self.sql, from_slot, to_slot)
     }
 }
 
@@ -212,6 +215,13 @@ pub fn validate_alert_sql(sql: &str) -> Result<(), RegistryError> {
         }
     }
     Ok(())
+}
+
+/// Validate `sql` as alert SQL and render it for `from_slot..=to_slot`.
+pub fn bind_alert_sql(sql: &str, from_slot: u64, to_slot: u64) -> Result<String, RegistryError> {
+    validate_alert_sql(sql)?;
+    validate_template("sql", sql)?
+        .render(|name| Ok(if name == FROM_SLOT { from_slot } else { to_slot }.to_string()))
 }
 
 /// `http(s)://host...`, with no credentials and no fragment. Error messages
@@ -305,6 +315,20 @@ mod tests {
         assert_eq!(alert(SQL, Some(6)).next_range(5, 9), Some((7, 9)));
         assert_eq!(alert(SQL, Some(9)).next_range(5, 9), None);
         assert_eq!(alert(SQL, Some(u64::MAX)).next_range(0, u64::MAX), None);
+    }
+
+    #[test]
+    fn bind_alert_sql_validates_before_rendering() {
+        assert_eq!(bind_alert_sql(SQL, 0, 0).unwrap(), "SELECT * FROM t WHERE slot BETWEEN 0 AND 0");
+        assert!(bind_alert_sql("SELECT * FROM t WHERE slot <= {{to_slot}}", 0, 0).is_err());
+        let new = NewAlert {
+            name: "a".into(),
+            sql: SQL.into(),
+            webhook_url: "https://hooks.example.com/x".into(),
+            secret: "0123456789abcdef".into(),
+            wait_for_final: false,
+        };
+        assert_eq!(new.bind_range(3, 4).unwrap(), alert(SQL, None).bind_range(3, 4));
     }
 
     #[test]

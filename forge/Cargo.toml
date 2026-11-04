@@ -20,8 +20,9 @@ url.workspace = true
 reqwest.workspace = true
 hyper.workspace = true
 # The webhook dispatcher also needs a background task, its wake signal and
-# `select!`.
-tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+# `select!`; the API and the binary a multi-threaded runtime, a listener and
+# the shutdown signals.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal"] }
 # Registry: saved queries, alerts and the webhook outbox in one SQLite file,
 # so an alert's progress and its outbox row commit in one transaction.
 rusqlite.workspace = true
@@ -30,11 +31,18 @@ uuid.workspace = true
 # async methods; shutdown is a `CancellationToken`.
 async-trait.workspace = true
 tokio-util.workspace = true
+# HTTP API: the router, a whole-request timeout, and request tracing; the
+# binary's log output.
+axum.workspace = true
+tower = { workspace = true, features = ["timeout"] }
+tower-http = { workspace = true, features = ["trace"] }
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
-# Capture `ForgeConfig::display` output in the config tests.
-tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync"] }
+# Drive the API router in-process in the API tests.
+tower = { workspace = true, features = ["util"] }
+http-body-util.workspace = true
 # The LENS client tests run a scripted fake LENS on a raw socket, and the
 # contract suite runs the real LENS over Parquet files PRISM's writer made.
 lens = { path = "../lens" }

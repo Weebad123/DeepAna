@@ -3,7 +3,7 @@
 //!
 //! | File            | Holds                                                         |
 //! |-----------------|---------------------------------------------------------------|
-//! | `mod.rs`        | [`AlertEngine`]: the loop, progress, failure isolation, status |
+//! | `mod.rs`        | [`AlertEngine`]: the loop, progress, failure isolation, status; [`EngineHandle`] |
 //! | [`evaluator`]   | one alert over one slot range, and its payload                |
 //!
 //! It is the one place the other modules meet: events come from the
@@ -98,6 +98,13 @@
 //! table PRISM finally writes can fix it; until then the alert stays where
 //! it is. Changing the alert's SQL clears its failure at once. A success
 //! clears it too. An alert deleted mid-pass is dropped silently.
+//!
+//! # Status
+//!
+//! [`AlertEngine::run`] borrows the engine for as long as it runs, so the
+//! engine is usually moved into the task that runs it. Take an
+//! [`EngineHandle`] first: it is cheap to clone, shares the engine's state,
+//! and is how the HTTP API reads [`EngineStatus`] for `/health`.
 //!
 //! # Shutdown
 //!
@@ -300,7 +307,27 @@ pub struct AlertEngine {
     lens: Arc<dyn LensApi>,
     webhook: Arc<WebhookService>,
     settings: EngineSettings,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+}
+
+/// A cloneable, read-only view of a running [`AlertEngine`]. See the
+/// [module docs](self#status).
+#[derive(Clone)]
+pub struct EngineHandle {
+    state: Arc<Mutex<State>>,
+}
+
+impl EngineHandle {
+    /// A snapshot of what the engine has done; see [`AlertEngine::status`].
+    pub fn status(&self) -> EngineStatus {
+        snapshot(&lock_state(&self.state))
+    }
+}
+
+impl std::fmt::Debug for EngineHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineHandle").finish_non_exhaustive()
+    }
 }
 
 /// The engine's memory between passes.
@@ -387,7 +414,7 @@ impl AlertEngine {
             lens,
             webhook,
             settings,
-            state: Mutex::new(state),
+            state: Arc::new(Mutex::new(state)),
         })
     }
 
@@ -397,20 +424,12 @@ impl AlertEngine {
 
     /// A snapshot of what the engine has done.
     pub fn status(&self) -> EngineStatus {
-        let state = self.state();
-        let mut status = state.status.clone();
-        status.failing_alerts = state
-            .failures
-            .iter()
-            .map(|(id, failure)| FailingAlert {
-                id: id.clone(),
-                kind: failure.kind,
-                consecutive: failure.consecutive,
-                since: failure.since,
-                last_error: failure.last_error.clone(),
-            })
-            .collect();
-        status
+        snapshot(&self.state())
+    }
+
+    /// A handle sharing this engine's state; see [`EngineHandle`].
+    pub fn handle(&self) -> EngineHandle {
+        EngineHandle { state: self.state.clone() }
     }
 
     /// Run passes until `cancel` fires. Releases deliveries held for slots
@@ -841,7 +860,7 @@ impl AlertEngine {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock_state(&self.state)
     }
 
     fn lock_reader(&self) -> MutexGuard<'_, ChangelogReader> {
@@ -868,6 +887,29 @@ fn fold<'a>(events: impl IntoIterator<Item = &'a EventRecord>) -> Option<u64> {
             _ => None,
         })
         .max()
+}
+
+/// [`EngineStatus`] with the failing alerts filled in from `state`.
+fn snapshot(state: &State) -> EngineStatus {
+    let mut status = state.status.clone();
+    status.failing_alerts = state
+        .failures
+        .iter()
+        .map(|(id, failure)| FailingAlert {
+            id: id.clone(),
+            kind: failure.kind,
+            consecutive: failure.consecutive,
+            since: failure.since,
+            last_error: failure.last_error.clone(),
+        })
+        .collect();
+    status
+}
+
+fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
+    // Each update is a few field writes under the lock; a panic between two
+    // leaves counters at worst one event apart.
+    state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The end of the first half of `from..=to`, for `from < to`.

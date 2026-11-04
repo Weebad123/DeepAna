@@ -325,7 +325,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::lens_client::{LensResponse, Visibility};
+    use crate::lens_client::{LensHealth, LensResponse, Visibility};
 
     const SQL: &str = "SELECT slot, n FROM solana.token_transfers WHERE slot BETWEEN {{from_slot}} AND {{to_slot}}";
 
@@ -372,6 +372,10 @@ mod tests {
 
         async fn wait_until_visible(&self, _slot: u64, _timeout: Duration) -> Visibility {
             unreachable!("the evaluator never gates")
+        }
+
+        async fn health(&self) -> Result<LensHealth, LensCallError> {
+            unreachable!("the evaluator never checks health")
         }
     }
 

@@ -456,15 +456,26 @@ impl Outbox {
     /// newest first (insertion order within one millisecond). An unknown
     /// alert has none.
     pub fn list(&self, alert_id: &str, limit: usize) -> ForgeResult<Vec<Delivery>> {
+        self.list_with_status(alert_id, limit, None)
+    }
+
+    /// [`Self::list`], only rows in `status` when it is given. The filter is
+    /// applied before the limit, so a full page means there may be more.
+    pub fn list_with_status(
+        &self,
+        alert_id: &str,
+        limit: usize,
+        status: Option<DeliveryStatus>,
+    ) -> ForgeResult<Vec<Delivery>> {
         self.db.with_conn("list deliveries", |conn| {
             if !(1..=MAX_LIST_LIMIT).contains(&limit) {
                 return Err(RegistryError::invalid("limit", format!("must be 1 to {MAX_LIST_LIMIT}, got {limit}")));
             }
             let mut stmt = conn.prepare(&format!(
-                "SELECT {DELIVERY_COLUMNS} FROM deliveries WHERE alert_id = ?1
+                "SELECT {DELIVERY_COLUMNS} FROM deliveries WHERE alert_id = ?1 AND (?3 IS NULL OR status = ?3)
                  ORDER BY created_at DESC, rowid DESC LIMIT ?2"
             ))?;
-            let rows = stmt.query_map(params![alert_id, limit as i64], read_delivery)?;
+            let rows = stmt.query_map(params![alert_id, limit as i64, status.map(DeliveryStatus::as_str)], read_delivery)?;
             rows.map(|row| row?).collect()
         })
     }
@@ -899,6 +910,16 @@ mod tests {
             }
         );
         assert_eq!(Outbox::new(Db::open_in_memory(), 1, LEASE).unwrap().depth(0).unwrap(), OutboxDepth::default());
+
+        // The filter comes before the limit.
+        let slots = |status| {
+            outbox.list_with_status("a1", 1, Some(status)).unwrap().iter().map(|d| d.to_slot).collect::<Vec<_>>()
+        };
+        assert_eq!(slots(DeliveryStatus::Delivered), [a.to_slot]);
+        assert_eq!(slots(DeliveryStatus::Failed), [b.to_slot]);
+        assert_eq!(slots(DeliveryStatus::Pending), [3]);
+        assert!(slots(DeliveryStatus::Held).is_empty());
+        assert_eq!(outbox.list_with_status("a2", 10, Some(DeliveryStatus::Held)).unwrap().len(), 1);
     }
 
     #[test]

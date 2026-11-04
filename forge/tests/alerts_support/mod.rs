@@ -21,8 +21,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use forge::{
-    AlertEngine, ChangelogReader, CheckpointStore, EngineSettings, LensApi, LensCallError, LensResponse, NewAlert,
-    Registry, RetryPolicy, SystemClock, Visibility, WebhookService, WebhookSettings,
+    AlertEngine, ChangelogReader, CheckpointStore, EngineSettings, LensApi, LensCallError, LensHealth,
+    LensHealthStatus, LensResponse, NewAlert, Registry, RetryPolicy, SystemClock, Visibility, WebhookService,
+    WebhookSettings,
 };
 use serde_json::{Map, Value, json};
 
@@ -330,6 +331,10 @@ impl LensApi for FakeLens {
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+    }
+
+    async fn health(&self) -> Result<LensHealth, LensCallError> {
+        Ok(LensHealth { status: LensHealthStatus::Healthy, round_trip_ms: 0 })
     }
 }
 
