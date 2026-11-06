@@ -10,6 +10,13 @@ thiserror.workspace = true
 tracing.workspace = true
 # `lens_url` validation and normalization.
 url.workspace = true
+# Store: anomalies, detector progress and digests in one SQLite file, so a
+# scan's anomalies and its progress commit in one transaction.
+rusqlite.workspace = true
+# Store row types are serialised by the API; anomaly details and digest
+# bodies are stored as JSON.
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # Capture `OracleConfig::display` output in the config tests.

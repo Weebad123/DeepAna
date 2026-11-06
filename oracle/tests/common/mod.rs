@@ -1,4 +1,4 @@
-//! Helpers shared by the config tests.
+//! Helpers shared by the integration tests.
 
 #![allow(dead_code)]
 
@@ -21,7 +21,7 @@ impl TempDir {
     pub fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "oracle-config-test-{}-{}",
+            "oracle-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
