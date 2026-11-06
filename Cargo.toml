@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["forge","lens",
+members = ["forge","lens", "oracle",
     "prism",
 ]
 
