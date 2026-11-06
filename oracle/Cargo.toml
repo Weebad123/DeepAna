@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+thiserror.workspace = true
+# `OracleConfig::display` logs the effective config; the host installs the
+# subscriber.
+tracing.workspace = true
+# `lens_url` validation and normalization.
+url.workspace = true
+
+[dev-dependencies]
+# Capture `OracleConfig::display` output in the config tests.
+tracing-subscriber.workspace = true
