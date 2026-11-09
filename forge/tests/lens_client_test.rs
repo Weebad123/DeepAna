@@ -86,6 +86,54 @@ fn zero_durations_are_rejected_naming_the_setting() {
     }
 }
 
+#[test]
+fn from_parts_needs_no_forge_config() {
+    let client = LensClient::from_parts("https://lens.internal/api/v1/", Duration::from_secs(60)).unwrap();
+    assert_eq!(client.query_url(), "https://lens.internal/api/v1/query", "trailing slash dropped");
+    assert_eq!(client.health_url(), "https://lens.internal/api/v1/health");
+    assert_eq!(
+        *client.settings(),
+        LensClientSettings { request_timeout: Duration::from_secs(60), ..Default::default() },
+        "the timeout bounds requests; everything else is the default"
+    );
+}
+
+#[test]
+fn from_parts_never_lets_connecting_outlast_the_request() {
+    let timeout = Duration::from_secs(2);
+    assert!(timeout < LensClientSettings::default().connect_timeout);
+    let client = LensClient::from_parts("http://127.0.0.1:8080", timeout).unwrap();
+    assert_eq!(client.settings().request_timeout, timeout);
+    assert_eq!(client.settings().connect_timeout, timeout);
+}
+
+#[test]
+fn from_parts_rejects_a_zero_timeout() {
+    match LensClient::from_parts("http://127.0.0.1:8080/", Duration::ZERO) {
+        Err(ForgeError::LensClientError { url, source }) => {
+            assert_eq!(url, "http://127.0.0.1:8080");
+            assert!(source.to_string().contains("request_timeout"), "{source}");
+        }
+        other => panic!("expected LensClientError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_from_parts_client_queries_and_times_out_like_any_other() {
+    let lens = FakeLens::always(Reply::rows(json!([{ "slot": 7 }]), SQL)).await;
+    let client = LensClient::from_parts(&lens.url(), Duration::from_secs(5)).unwrap();
+    let response = client.query(SQL).await.unwrap();
+    assert_eq!(response.rows[0]["slot"], json!(7));
+    assert_eq!(lens.only_request().target, "/query");
+
+    let hanging = FakeLens::always(Reply::Hang).await;
+    let client = LensClient::from_parts(&hanging.url(), Duration::from_millis(300)).unwrap();
+    let started = Instant::now();
+    let err = expect_err(client.query("S").await, "timeout", "within the timeout");
+    assert!(err.is_retryable());
+    assert!(started.elapsed() < Duration::from_secs(2), "gave up promptly: {:?}", started.elapsed());
+}
+
 // ===========================================================================
 // Request: exactly what LENS expects
 // ===========================================================================

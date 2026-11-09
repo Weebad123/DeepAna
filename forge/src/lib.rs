@@ -1,5 +1,5 @@
 pub mod config;
-mod lens_client;
+pub mod lens_client;
 mod alerts;
 mod registry;
 mod changelog_reader;

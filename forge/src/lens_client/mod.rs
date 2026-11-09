@@ -304,7 +304,29 @@ impl LensClient {
     /// never sends one. Fails with a [`ForgeError::LensClientError`] when a
     /// duration is zero or the HTTP client cannot be built.
     pub fn with_settings(config: &ForgeConfig, settings: LensClientSettings) -> ForgeResult<Self> {
-        let base = config.lens_url();
+        Self::build(config.lens_url(), settings)
+    }
+
+    /// A client for `lens_url` whose requests give up after `timeout`, for a
+    /// caller that has no [`ForgeConfig`] (ORACLE keeps its own `lens_url`
+    /// and `lens_timeout_secs`).
+    ///
+    /// A trailing `/` on `lens_url` is dropped; the URL is otherwise used as
+    /// given, so validate it first. Connecting may take at most
+    /// [`DEFAULT_CONNECT_TIMEOUT`], or `timeout` if that is shorter; the
+    /// visibility gate polls every [`DEFAULT_VISIBILITY_POLL_INTERVAL`].
+    /// Fails like [`Self::with_settings`], so a zero `timeout` is an error.
+    pub fn from_parts(lens_url: &str, timeout: Duration) -> ForgeResult<Self> {
+        let settings = LensClientSettings {
+            request_timeout: timeout,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT.min(timeout),
+            visibility_poll_interval: DEFAULT_VISIBILITY_POLL_INTERVAL,
+        };
+        Self::build(lens_url.trim_end_matches('/'), settings)
+    }
+
+    /// The constructors' shared body; `base` has no trailing `/`.
+    fn build(base: &str, settings: LensClientSettings) -> ForgeResult<Self> {
         for (name, value) in [
             ("request_timeout", settings.request_timeout),
             ("connect_timeout", settings.connect_timeout),
@@ -468,7 +490,7 @@ impl LensClient {
 // LensApi
 // ---------------------------------------------------------------------------
 
-/// What the alert engine and the HTTP API ask of LENS, with
+/// What the alert engine, the HTTP API and ORACLE's detectors ask of LENS, with
 /// [`LensClient`]'s semantics: no retries, every failure classified.
 #[async_trait]
 pub trait LensApi: Send + Sync {

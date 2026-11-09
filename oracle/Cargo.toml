@@ -17,7 +17,21 @@ rusqlite.workspace = true
 # bodies are stored as JSON.
 serde.workspace = true
 serde_json.workspace = true
+# LENS is ORACLE's only data source; ORACLE talks to it through FORGE's
+# `lens_client` module, so both share one wire format and error classification.
+forge = { path = "../forge" }
+# Detectors: `Detector` and `LensApi` are used as trait objects, which needs
+# boxed async methods. The runner: its task, sleeps, `select!`, the blocking
+# pool for store commits, and its `CancellationToken`.
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util.workspace = true
 
 [dev-dependencies]
 # Capture `OracleConfig::display` output in the config tests.
 tracing-subscriber.workspace = true
+# The detect tests drive the runner on a real runtime, against a scripted
+# LENS and against the real LENS over Parquet files PRISM's writer made.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }
+lens = { path = "../lens" }
+prism = { path = "../prism" }
