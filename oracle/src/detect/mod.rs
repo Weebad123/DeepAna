@@ -8,11 +8,17 @@
 //!
 //! # One tick, every `detect_interval_secs`
 //!
-//! 1. Gather the facts with three queries: `MAX(slot)` of `solana.slots`,
-//!    `MAX(slot)` of `solana.transactions`, `MIN(slot)` of `solana.slots`.
-//! 2. The watermark `M` is the smaller of the two maxima: PRISM writes a
+//! 1. Gather the facts with four queries, in this order (see [`LensFacts`]):
+//!    `MAX(slot)` of `solana.slots`, the newest slot of `solana.slots` with
+//!    `transaction_count > 0`, `MAX(slot)` of `solana.transactions`, and
+//!    `MIN(slot)` of `solana.slots`.
+//! 2. The watermark `M` is the newest slot both tables cover. PRISM writes a
 //!    slot's rows together, but LENS may have picked up one table's newest
-//!    file before the other's. A bucket is complete when its last slot is at
+//!    file before the other's. `solana.slots` says which slots carry
+//!    transactions, so once `solana.transactions` holds the newest of them,
+//!    it is caught up and `M` is `MAX(slot)` of `solana.slots`, empty
+//!    trailing slots included. Until then `M` is `MAX(slot)` of
+//!    `solana.transactions`. A bucket is complete when its last slot is at
 //!    most `M`. `complete_max = (M + 1) / bucket_slots - 1` is the newest
 //!    complete bucket. `first_complete_bucket = ceil(MIN(slot) /
 //!    bucket_slots)` is the first one ingestion covered from its first slot,
@@ -68,7 +74,6 @@
 pub mod baseline;
 pub mod detectors;
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use forge::lens_client::{LensApi, LensResponse};
@@ -89,6 +94,10 @@ pub const DEFAULT_CHUNK_BUCKETS: u64 = 32;
 pub const MAX_CHUNKS_PER_TURN: u32 = 16;
 
 pub const MAX_SLOTS_SQL: &str = "SELECT MAX(slot) AS max_slot FROM solana.slots";
+/// The newest slot that should have rows in `solana.transactions`. PRISM sets
+/// `transaction_count` from the same normalized block it writes the
+/// transaction rows from, so the two always agree.
+pub const LAST_TX_SLOT_SQL: &str = "SELECT MAX(slot) AS max_slot FROM solana.slots WHERE transaction_count > 0";
 pub const MAX_TX_SLOT_SQL: &str = "SELECT MAX(slot) AS max_slot FROM solana.transactions";
 pub const MIN_SLOTS_SQL: &str = "SELECT MIN(slot) AS min_slot FROM solana.slots";
 
@@ -96,10 +105,45 @@ pub const MIN_SLOTS_SQL: &str = "SELECT MIN(slot) AS min_slot FROM solana.slots"
 // Watermark
 // ---------------------------------------------------------------------------
 
+/// What the watermark queries returned; `None` is an empty result.
+///
+/// The runner reads them in field order. `last_tx_slot` must be read no
+/// earlier than `max_slot`, so that it judges every slot up to `max_slot`,
+/// and `max_tx_slot` no earlier than `last_tx_slot`. LENS only ever adds
+/// files between two reads, so a later read can only see more.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LensFacts {
+    /// [`MAX_SLOTS_SQL`].
+    pub max_slot: Option<u64>,
+    /// [`LAST_TX_SLOT_SQL`]: `None` when no slot has transactions yet.
+    pub last_tx_slot: Option<u64>,
+    /// [`MAX_TX_SLOT_SQL`].
+    pub max_tx_slot: Option<u64>,
+    /// [`MIN_SLOTS_SQL`].
+    pub min_slot: Option<u64>,
+}
+
+impl LensFacts {
+    /// The newest slot both `solana.slots` and `solana.transactions` cover.
+    ///
+    /// Once `solana.transactions` holds `last_tx_slot`, no slot after it
+    /// should have transaction rows, so the transactions table covers all of
+    /// `solana.slots`. Until then it covers only up to its own `MAX(slot)`.
+    pub fn covered_slot(&self) -> Option<u64> {
+        let max_slot = self.max_slot?;
+        let caught_up = match (self.last_tx_slot, self.max_tx_slot) {
+            (None, _) => true,
+            (Some(expected), Some(seen)) => seen >= expected,
+            (Some(_), None) => false,
+        };
+        if caught_up { Some(max_slot) } else { Some(max_slot.min(self.max_tx_slot?)) }
+    }
+}
+
 /// What one tick learned about LENS's data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Watermark {
-    /// The smaller of `MAX(slot)` over slots and over transactions.
+    /// The newest slot both tables cover ([`LensFacts::covered_slot`]).
     pub max_slot: u64,
     pub min_slot: u64,
     /// Newest complete bucket.
@@ -111,14 +155,9 @@ pub struct Watermark {
 impl Watermark {
     /// The watermark for these facts, or `None` when no bucket is complete
     /// (or a table is empty).
-    pub fn compute(
-        max_slots: Option<u64>,
-        max_tx_slot: Option<u64>,
-        min_slot: Option<u64>,
-        bucket_slots: u64,
-    ) -> Option<Self> {
-        let max_slot = max_slots?.min(max_tx_slot?);
-        let min_slot = min_slot?;
+    pub fn compute(facts: &LensFacts, bucket_slots: u64) -> Option<Self> {
+        let max_slot = facts.covered_slot()?;
+        let min_slot = facts.min_slot?;
         if bucket_slots == 0 || min_slot > max_slot {
             return None;
         }
@@ -354,11 +393,18 @@ impl Runner {
         }
     }
 
-    /// The three watermark queries. `None` when cancelled.
+    /// The four watermark queries, in [`LensFacts`]'s order. `None` when
+    /// cancelled.
     async fn facts(&self) -> Option<Result<Option<Watermark>, ScanError>> {
-        let mut values = [None; 3];
-        for (i, (sql, column)) in
-            [(MAX_SLOTS_SQL, "max_slot"), (MAX_TX_SLOT_SQL, "max_slot"), (MIN_SLOTS_SQL, "min_slot")].into_iter().enumerate()
+        let mut values = [None; 4];
+        for (i, (sql, column)) in [
+            (MAX_SLOTS_SQL, "max_slot"),
+            (LAST_TX_SLOT_SQL, "max_slot"),
+            (MAX_TX_SLOT_SQL, "max_slot"),
+            (MIN_SLOTS_SQL, "min_slot"),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let response = tokio::select! {
                 () = self.shutdown.cancelled() => return None,
@@ -369,7 +415,9 @@ impl Runner {
                 Err(err) => return Some(Err(err)),
             }
         }
-        Some(Ok(Watermark::compute(values[0], values[1], values[2], self.shared.bucket_slots)))
+        let [max_slot, last_tx_slot, max_tx_slot, min_slot] = values;
+        let facts = LensFacts { max_slot, last_tx_slot, max_tx_slot, min_slot };
+        Some(Ok(Watermark::compute(&facts, self.shared.bucket_slots)))
     }
 
     /// One detector's turn. The caller holds `slot.turn`.
@@ -608,32 +656,64 @@ impl RunnerHandle {
 mod tests {
     use super::*;
 
+    const BS: u64 = 150;
+
+    /// Facts for data in `min ..= max`, every slot carrying transactions.
+    fn busy(min: u64, max: u64) -> LensFacts {
+        facts(Some(max), Some(max), Some(max), Some(min))
+    }
+
+    fn facts(max_slot: Option<u64>, last_tx_slot: Option<u64>, max_tx_slot: Option<u64>, min: Option<u64>) -> LensFacts {
+        LensFacts { max_slot, last_tx_slot, max_tx_slot, min_slot: min }
+    }
+
+    fn complete_max(facts: LensFacts) -> Option<u64> {
+        Watermark::compute(&facts, BS).map(|wm| wm.complete_max)
+    }
+
     #[test]
     fn watermark_counts_only_whole_buckets() {
-        let bs = 150;
         // Slots 0..=299 ingested: buckets 0 and 1 complete.
-        assert_eq!(Watermark::compute(Some(299), Some(299), Some(0), bs).unwrap().complete_max, 1);
+        assert_eq!(complete_max(busy(0, 299)), Some(1));
         // One slot short of bucket 1's end: only bucket 0.
-        assert_eq!(Watermark::compute(Some(298), Some(299), Some(0), bs).unwrap().complete_max, 0);
-        // The lagging table decides.
-        assert_eq!(Watermark::compute(Some(1_000), Some(298), Some(0), bs).unwrap().complete_max, 0);
+        assert_eq!(complete_max(busy(0, 298)), Some(0));
         // Nothing complete.
-        assert_eq!(Watermark::compute(Some(148), Some(148), Some(0), bs), None);
-        assert_eq!(Watermark::compute(None, Some(1), Some(0), bs), None);
-        assert_eq!(Watermark::compute(Some(1), None, Some(0), bs), None);
+        assert_eq!(complete_max(busy(0, 148)), None);
+        assert_eq!(complete_max(facts(None, Some(1), Some(1), Some(0))), None);
+        assert_eq!(complete_max(facts(Some(299), Some(299), Some(299), None)), None);
+    }
+
+    #[test]
+    fn a_lagging_transactions_table_decides() {
+        // Slots says slot 1_000 has transactions; LENS has them only to 298.
+        assert_eq!(complete_max(facts(Some(1_000), Some(1_000), Some(298), Some(0))), Some(0));
+        // Slots says there are transactions, but none are visible yet.
+        assert_eq!(complete_max(facts(Some(1_000), Some(10), None, Some(0))), None);
+    }
+
+    #[test]
+    fn slots_without_transactions_do_not_hold_the_watermark_back() {
+        // The last 150 slots are empty, and transactions holds the newest
+        // slot that is not: both tables cover all 450 slots.
+        assert_eq!(complete_max(facts(Some(449), Some(299), Some(299), Some(0))), Some(2));
+        // A transactions table that is past it (a later read saw more) too.
+        assert_eq!(complete_max(facts(Some(449), Some(299), Some(320), Some(0))), Some(2));
+        // No slot has transactions at all: nothing to wait for.
+        assert_eq!(complete_max(facts(Some(449), None, None, Some(0))), Some(2));
+        // But one empty bucket after a lagging table changes nothing.
+        assert_eq!(complete_max(facts(Some(449), Some(299), Some(298), Some(0))), Some(0));
     }
 
     #[test]
     fn the_bucket_ingestion_started_in_is_partial() {
-        let bs = 150;
-        let at = |min| Watermark::compute(Some(10_000), Some(10_000), Some(min), bs).unwrap().first_complete_bucket;
+        let at = |min| Watermark::compute(&busy(min, 10_000), BS).unwrap().first_complete_bucket;
         assert_eq!(at(0), 0);
         assert_eq!(at(150), 1, "an aligned start is complete");
         assert_eq!(at(151), 2);
         assert_eq!(at(299), 2);
         // Started inside the newest bucket: nothing complete.
-        assert_eq!(Watermark::compute(Some(299), Some(299), Some(151), bs), None);
-        assert_eq!(Watermark::compute(Some(449), Some(449), Some(151), bs).unwrap().complete_max, 2);
+        assert_eq!(complete_max(busy(151, 299)), None);
+        assert_eq!(complete_max(busy(151, 449)), Some(2));
     }
 
     #[test]

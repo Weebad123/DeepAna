@@ -240,6 +240,21 @@ impl RealLens {
         Arc::new(LensClient::from_parts(&self.url, Duration::from_secs(120)).unwrap())
     }
 
+    /// Stop LENS and wait until it is gone: `serve_on` stops accepting,
+    /// drops its listener, and closes every connection (idle keep-alive
+    /// ones in a client's pool included) before it returns. Aborting the
+    /// task instead would leave all three to happen in the background, so a
+    /// request sent right after could still be answered.
+    async fn stop(mut self) {
+        self.engine.shutdown();
+        let server = self.server.take().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("LENS did not stop within 10 s")
+            .unwrap()
+            .unwrap();
+    }
+
     /// Pick up files PRISM wrote since the last refresh.
     fn refresh(&self) {
         let report = self.engine.refresh_catalog();
@@ -485,11 +500,14 @@ async fn a_lens_that_cannot_answer_leaves_every_detector_where_it_was() {
     let lens = RealLens::start(data.path(), &[]).await;
     let oracle = backfill(lens.client()).await;
     let before = oracle.anomalies();
-    drop(lens); // LENS goes away.
+    assert_eq!(oracle.keys(), planted());
+    lens.stop().await; // LENS goes away.
 
     // Rewind nothing; just ask again with LENS down.
     oracle.runner.run_once().await;
-    assert!(oracle.runner.handle().status().tick_error.is_some());
+    let tick_error = oracle.runner.handle().status().tick_error.expect("a tick with LENS down must say why");
+    assert!(tick_error.starts_with("transient LENS failure"), "an unreachable LENS is transient: {tick_error}");
+    oracle.assert_all(&DetectorState::UpToDate);
     assert_eq!(oracle.anomalies(), before);
     for detector in default_detectors() {
         assert_eq!(oracle.store.progress(detector.id()).unwrap(), Some(LAST));

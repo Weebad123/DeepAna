@@ -26,12 +26,14 @@ use tokio_util::sync::CancellationToken;
 const BS: u64 = 150;
 
 // ---------------------------------------------------------------------------
-// Scripted LENS: answers only the three watermark queries.
+// Scripted LENS: answers only the four watermark queries.
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct FakeLens {
     max_slot: Mutex<Option<u64>>,
+    /// The newest slot `solana.slots` says carries transactions.
+    last_tx_slot: Mutex<Option<u64>>,
     max_tx_slot: Mutex<Option<u64>>,
     min_slot: Mutex<Option<u64>>,
     fail_with: Mutex<Option<LensCallError>>,
@@ -39,7 +41,8 @@ struct FakeLens {
 }
 
 impl FakeLens {
-    /// Data covers slots `min ..= max` in both tables.
+    /// Data covers slots `min ..= max` in both tables, and every slot
+    /// carries transactions.
     fn covering(min: u64, max: u64) -> Arc<Self> {
         let lens = Arc::new(Self::default());
         lens.set(min, max);
@@ -49,6 +52,7 @@ impl FakeLens {
     fn set(&self, min: u64, max: u64) {
         *self.min_slot.lock().unwrap() = Some(min);
         *self.max_slot.lock().unwrap() = Some(max);
+        *self.last_tx_slot.lock().unwrap() = Some(max);
         *self.max_tx_slot.lock().unwrap() = Some(max);
     }
 
@@ -74,6 +78,7 @@ impl LensApi for FakeLens {
         }
         Ok(match sql {
             oracle::detect::MAX_SLOTS_SQL => one_row(sql, "max_slot", *self.max_slot.lock().unwrap()),
+            oracle::detect::LAST_TX_SLOT_SQL => one_row(sql, "max_slot", *self.last_tx_slot.lock().unwrap()),
             oracle::detect::MAX_TX_SLOT_SQL => one_row(sql, "max_slot", *self.max_tx_slot.lock().unwrap()),
             oracle::detect::MIN_SLOTS_SQL => one_row(sql, "min_slot", *self.min_slot.lock().unwrap()),
             other => panic!("the scripted LENS only answers watermark queries, got {other}"),
@@ -288,10 +293,30 @@ async fn the_lagging_table_bounds_completeness() {
     runner.run_once().await; // baseline at 9
 
     *lens.max_slot.lock().unwrap() = Some(20 * BS);
+    *lens.last_tx_slot.lock().unwrap() = Some(20 * BS);
     // transactions only reach the end of bucket 12.
     *lens.max_tx_slot.lock().unwrap() = Some(13 * BS - 1);
     runner.run_once().await;
     assert_eq!(det.seen(), vec![(10, 12, 0)]);
+}
+
+#[tokio::test]
+async fn trailing_slots_without_transactions_still_complete_their_buckets() {
+    let lens = FakeLens::covering(0, 10 * BS - 1);
+    let h = Harness::new(lens.clone());
+    let det = Scripted::new("a");
+    let runner = h.runner(dets(&[&det]));
+    runner.run_once().await; // baseline at 9
+
+    // The chain went quiet after the first slot of bucket 11: buckets 11 and
+    // 12 are complete, with nothing in them. The transactions table holds
+    // the newest slot with transactions, so it is caught up.
+    *lens.max_slot.lock().unwrap() = Some(13 * BS - 1);
+    *lens.last_tx_slot.lock().unwrap() = Some(11 * BS);
+    *lens.max_tx_slot.lock().unwrap() = Some(11 * BS);
+    runner.run_once().await;
+    assert_eq!(det.seen(), vec![(10, 12, 0)], "a quiet bucket is scored, not waited on");
+    assert_eq!(h.store.progress("a").unwrap(), Some(12));
 }
 
 #[tokio::test]
@@ -555,9 +580,9 @@ async fn spawn_ticks_on_schedule_and_stops_on_shutdown() {
     let task = h.runner_with(dets(&[&det]), cancel.clone()).spawn();
     tokio::time::sleep(Duration::from_secs(1)).await;
     let after_first = lens.queries.load(Ordering::SeqCst);
-    assert_eq!(after_first, 3, "one tick at start: three watermark queries");
+    assert_eq!(after_first, 4, "one tick at start: four watermark queries");
     tokio::time::sleep(Duration::from_secs(10)).await;
-    assert_eq!(lens.queries.load(Ordering::SeqCst), 6, "a second tick after detect_interval_secs");
+    assert_eq!(lens.queries.load(Ordering::SeqCst), 8, "a second tick after detect_interval_secs");
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
 }
