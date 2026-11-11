@@ -4389,6 +4389,7 @@ name = "oracle"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bs58",
  "forge",
  "lens",
  "prism",

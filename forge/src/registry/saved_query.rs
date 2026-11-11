@@ -191,6 +191,15 @@ fn validate_params(params: &[ParamSpec], placeholders: &HashSet<&str>) -> Result
     Ok(())
 }
 
+/// `raw` as a single-quoted SQL string literal, every `'` doubled.
+///
+/// The one escaping routine for string literals: saved-query parameters use
+/// it, and so does ORACLE's `profile` module. Callers still validate their
+/// input first; this is the second line of defence, not the only one.
+pub fn quote_sql_string(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "''"))
+}
+
 /// Parse `raw` as `kind` and render it as a SQL literal.
 fn render_literal(field: &str, kind: ParamKind, raw: &str) -> Result<String, RegistryError> {
     match kind {
@@ -201,7 +210,7 @@ fn render_literal(field: &str, kind: ParamKind, raw: &str) -> Result<String, Reg
             if raw.contains('\0') {
                 return Err(RegistryError::invalid(field, "contains a NUL byte"));
             }
-            Ok(format!("'{}'", raw.replace('\'', "''")))
+            Ok(quote_sql_string(raw))
         }
         // Only plain digits: Rust's parsers also take a leading '+'.
         ParamKind::U64 => {
