@@ -440,6 +440,10 @@ pub struct AnomalyFilter {
     pub subject: Option<String>,
     /// Only buckets at or after this one.
     pub since_bucket: Option<u64>,
+    /// Only buckets at or before this one. With `since_bucket`, selects one
+    /// closed range, so an old range's rows are not crowded out by newer
+    /// ones under the limit.
+    pub until_bucket: Option<u64>,
     /// At least 1; capped at [`MAX_LIST_LIMIT`].
     pub limit: usize,
 }
@@ -450,6 +454,7 @@ impl Default for AnomalyFilter {
             metric: None,
             subject: None,
             since_bucket: None,
+            until_bucket: None,
             limit: DEFAULT_LIST_LIMIT,
         }
     }
@@ -967,6 +972,10 @@ impl Store {
             if let Some(since) = filter.since_bucket {
                 args.push(SqlValue::Integer(to_sql("since_bucket", since)?));
                 clauses.push(format!("bucket >= ?{}", args.len()));
+            }
+            if let Some(until) = filter.until_bucket {
+                args.push(SqlValue::Integer(to_sql("until_bucket", until)?));
+                clauses.push(format!("bucket <= ?{}", args.len()));
             }
             let mut sql = format!("SELECT {ANOMALY_COLUMNS} FROM anomalies");
             if !clauses.is_empty() {

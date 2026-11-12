@@ -628,6 +628,31 @@ fn since_bucket_is_inclusive() {
 }
 
 #[test]
+fn until_bucket_is_inclusive_and_bounds_a_range_under_the_limit() {
+    let (_dir, store) = seeded();
+    let count = |until| store.list_anomalies(&AnomalyFilter { until_bucket: Some(until), ..Default::default() }).unwrap().len();
+    assert_eq!(count(0), 0);
+    assert_eq!(count(1), 2);
+    assert_eq!(count(2), 5);
+    assert_eq!(count(3), 7);
+    let range = |since, until, limit| {
+        keys(
+            &store
+                .list_anomalies(&AnomalyFilter { since_bucket: Some(since), until_bucket: Some(until), limit, ..Default::default() })
+                .unwrap(),
+        )
+    };
+    assert_eq!(range(2, 2, 100), [key("b", "x", 2), key("a", "x", 2), key("a", "", 2)]);
+    // An old range is not crowded out by newer rows under a small limit.
+    assert_eq!(range(1, 1, 2), [key("a", "x", 1), key("a", "", 1)]);
+    assert!(range(3, 2, 100).is_empty());
+    assert_eq!(
+        invalid_field(store.list_anomalies(&AnomalyFilter { until_bucket: Some(i64::MAX as u64 + 1), ..Default::default() })),
+        "until_bucket"
+    );
+}
+
+#[test]
 fn list_limit_boundaries() {
     let dir = TempDir::new();
     let store = open(&dir);
