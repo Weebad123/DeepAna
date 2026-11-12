@@ -4388,14 +4388,21 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "oracle"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema 60.0.0",
  "async-trait",
  "bs58",
  "forge",
  "lens",
+ "parquet 60.0.0",
  "prism",
  "rusqlite",
  "serde",
  "serde_json",
+ "solana-sdk-ids",
+ "spl-associated-token-account-interface",
+ "spl-memo-interface",
+ "spl-token-2022-interface 3.1.2",
+ "spl-token-interface 2.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",

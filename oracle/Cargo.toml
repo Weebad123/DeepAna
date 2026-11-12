@@ -37,3 +37,14 @@ tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }
 lens = { path = "../lens" }
 prism = { path = "../prism" }
+# `catalog_prism_test` reads the footers of the Parquet files PRISM's writer
+# makes and compares their Arrow schemas with the catalog's.
+parquet.workspace = true
+arrow-schema.workspace = true
+# `catalog_test` checks the built-in entities' addresses against the SDK's
+# own constants. All already in the build through PRISM.
+solana-sdk-ids = "3.1.0"
+spl-token-interface.workspace = true
+spl-token-2022-interface.workspace = true
+spl-associated-token-account-interface = "2.0.0"
+spl-memo-interface = "2.1.0"
