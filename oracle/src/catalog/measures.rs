@@ -9,6 +9,7 @@
 //! | `fee_total_lamports`          | transactions    | `SumDecimal(fee)`                      | lamports         |
 //! | `fee_avg_lamports`            | transactions    | `Avg(fee)`                             | lamports         |
 //! | `compute_units_avg`           | transactions    | `Avg(compute_units_consumed)`          | compute units    |
+//! | `ix_count`                    | instructions    | `Count`                                | count            |
 //! | `ix_cpi_count`                | instructions    | `Count(inner_instruction_index set)`   | count            |
 //! | `ix_undecoded_count`          | instructions    | `Count(instruction_type IS NULL)`      | count            |
 //! | `program_count`               | instructions    | `CountDistinct(program_id)`            | count            |
@@ -370,6 +371,16 @@ pub const MEASURES: &[Measure] = &[
         unit: Unit::ComputeUnits,
         requires_dimension: None,
         warnings: &["Transactions the RPC reported no compute units for are left out of the average."],
+    },
+    Measure {
+        id: "ix_count",
+        label: "Instructions",
+        description: "Instructions, top-level and inner.",
+        table: Instructions,
+        kind: Count { filter: None },
+        unit: Unit::Count,
+        requires_dimension: None,
+        warnings: &[],
     },
     Measure {
         id: "ix_cpi_count",

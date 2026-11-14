@@ -364,6 +364,7 @@ fn expected_totals() -> BTreeMap<&'static str, Value> {
         ("fee_total_lamports", json!("19000000000000017000")),
         ("fee_avg_lamports", json!(19_000_000_000_000_017_000f64 / 5.0)),
         ("compute_units_avg", json!(400.0)),
+        ("ix_count", json!(5)),
         ("ix_cpi_count", json!(2)),
         ("ix_undecoded_count", json!(3)),
         ("program_count", json!(3)),

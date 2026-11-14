@@ -90,6 +90,7 @@ fn the_measure_set_is_exactly_the_specified_one_sorted_by_id() {
             "compute_units_avg",
             "fee_avg_lamports",
             "fee_total_lamports",
+            "ix_count",
             "ix_cpi_count",
             "ix_undecoded_count",
             "mint_count",
