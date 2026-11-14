@@ -29,8 +29,12 @@
 //! * **Token amounts are raw only and never summed across mints**: a
 //!   [`Unit::RawTokenAmount`] sum must require the `mint` dimension and
 //!   exclude rows with no mint. [`Catalog::new`] refuses anything else.
+//!   Converting them to UI units is **deferred**: `spec/` returns the exact
+//!   raw sum, and the measure's warnings say decimals are not applied.
 //! * **Windows are measured in slots.** There are no hour or day dimensions:
-//!   `block_time` is nullable and not monotonic enough to bucket by.
+//!   `block_time` is nullable and not monotonic enough to bucket by. `spec/`
+//!   takes slot windows only and does not translate "last hour" into slots;
+//!   that, like UI units, is deferred, so nothing it returns is estimated.
 //! * **Entities are a curated set plus host-supplied extras**, validated
 //!   together. An extra that collides with a built-in is an error, never an
 //!   override.

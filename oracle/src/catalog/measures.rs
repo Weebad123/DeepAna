@@ -130,19 +130,50 @@ impl Measure {
     /// The aggregate expression, e.g. `COUNT(*)`. Pair it with
     /// [`filter`](Self::filter) in the `WHERE` clause.
     pub fn select_expr(&self) -> String {
+        self.aggregate_sql(&[])
+    }
+
+    /// The aggregate over only the rows where every predicate in `when`
+    /// holds, e.g. `COUNT(CASE WHEN status = 'failed' THEN 1 END)`. With
+    /// `when` empty it is [`select_expr`](Self::select_expr).
+    ///
+    /// For a query whose `WHERE` clause cannot carry the measure's own
+    /// [`filter`](Self::filter), because another measure in it reads the rows
+    /// that filter drops: pass the filter here instead. `when` is catalog
+    /// structure, never SQL text, so the result is still rendered from
+    /// definitions only.
+    pub fn aggregate_sql(&self, when: &[Pred]) -> String {
+        self.render(when, false)
+    }
+
+    /// What to `ORDER BY` for this measure: [`aggregate_sql`] except that a
+    /// decimal sum stays a `DECIMAL`. Its select expression is text, and
+    /// text sorts `"9"` above `"10"`.
+    ///
+    /// [`aggregate_sql`]: Self::aggregate_sql
+    pub fn sort_sql(&self, when: &[Pred]) -> String {
+        self.render(when, true)
+    }
+
+    fn render(&self, when: &[Pred], numeric: bool) -> String {
+        // `CASE WHEN {cond} THEN {then} END`, or `otherwise` with no condition.
+        let gate = |extra: Option<&Pred>, then: &str, otherwise: &str| -> String {
+            let conds: Vec<String> = when.iter().chain(extra).map(Pred::sql).collect();
+            if conds.is_empty() { otherwise.to_owned() } else { format!("CASE WHEN {} THEN {then} END", conds.join(" AND ")) }
+        };
         match self.kind {
-            MeasureKind::Count { .. } => "COUNT(*)".to_owned(),
-            MeasureKind::CountDistinct { column } => format!("COUNT(DISTINCT {column})"),
+            MeasureKind::Count { .. } => format!("COUNT({})", gate(None, "1", "*")),
+            MeasureKind::CountDistinct { column } => format!("COUNT(DISTINCT {})", gate(None, column, column)),
             MeasureKind::SumDecimal { column, .. } => {
-                format!("CAST(SUM(CAST({column} AS DECIMAL(38, 0))) AS VARCHAR)")
+                let cast = format!("CAST({column} AS DECIMAL(38, 0))");
+                let sum = format!("SUM({})", gate(None, &cast, &cast));
+                if numeric { sum } else { format!("CAST({sum} AS VARCHAR)") }
             }
-            MeasureKind::Avg { column } => format!("AVG({column})"),
+            MeasureKind::Avg { column } => format!("AVG({})", gate(None, column, column)),
             MeasureKind::Ratio { numerator, denominator } => {
-                let den = match denominator {
-                    None => "COUNT(*)".to_owned(),
-                    Some(p) => format!("COUNT(CASE WHEN {} THEN 1 END)", p.sql()),
-                };
-                format!("CAST(COUNT(CASE WHEN {} THEN 1 END) AS DOUBLE) / NULLIF({den}, 0)", numerator.sql())
+                let num = format!("COUNT({})", gate(Some(&numerator), "1", "*"));
+                let den = format!("COUNT({})", gate(denominator.as_ref(), "1", "*"));
+                format!("CAST({num} AS DOUBLE) / NULLIF({den}, 0)")
             }
         }
     }
@@ -450,6 +481,44 @@ mod tests {
         );
         assert_eq!(m("tx_failure_ratio").filter(), None);
         assert_eq!(m("transfer_volume_raw").filter(), Some(&Pred::IsNotNull("mint_token_address")));
+    }
+
+    #[test]
+    fn conditions_fold_into_the_aggregate() {
+        let nn = Pred::IsNotNull("mint_token_address");
+        let failed = Pred::EqStr("status", "failed");
+        assert_eq!(m("tx_count").aggregate_sql(&[failed]), "COUNT(CASE WHEN status = 'failed' THEN 1 END)");
+        assert_eq!(
+            m("transfer_volume_raw").aggregate_sql(&[nn]),
+            "CAST(SUM(CASE WHEN mint_token_address IS NOT NULL THEN CAST(amount_raw AS DECIMAL(38, 0)) END) AS VARCHAR)"
+        );
+        assert_eq!(
+            m("mint_count").aggregate_sql(&[nn]),
+            "COUNT(DISTINCT CASE WHEN mint_token_address IS NOT NULL THEN mint_token_address END)"
+        );
+        assert_eq!(m("fee_avg_lamports").aggregate_sql(&[failed]), "AVG(CASE WHEN status = 'failed' THEN fee END)");
+        assert_eq!(
+            m("tx_failure_ratio").aggregate_sql(&[Pred::IsNotNull("err")]),
+            "CAST(COUNT(CASE WHEN err IS NOT NULL AND status = 'failed' THEN 1 END) AS DOUBLE) \
+             / NULLIF(COUNT(CASE WHEN err IS NOT NULL THEN 1 END), 0)"
+        );
+        // No condition: exactly the select expression.
+        for measure in MEASURES {
+            assert_eq!(measure.aggregate_sql(&[]), measure.select_expr(), "{}", measure.id);
+        }
+    }
+
+    #[test]
+    fn decimal_sums_sort_as_numbers() {
+        assert_eq!(m("fee_total_lamports").sort_sql(&[]), "SUM(CAST(fee AS DECIMAL(38, 0)))");
+        assert_eq!(
+            m("transfer_volume_raw").sort_sql(&[Pred::IsNotNull("mint_token_address")]),
+            "SUM(CASE WHEN mint_token_address IS NOT NULL THEN CAST(amount_raw AS DECIMAL(38, 0)) END)"
+        );
+        // Everything else already sorts as what it selects.
+        for measure in MEASURES.iter().filter(|m| !matches!(m.kind, SumDecimal { .. })) {
+            assert_eq!(measure.sort_sql(&[]), measure.select_expr(), "{}", measure.id);
+        }
     }
 
     #[test]

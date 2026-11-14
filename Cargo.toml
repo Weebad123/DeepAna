@@ -44,6 +44,9 @@ arrow-schema = "60.0.0"
 # the copies DataFusion re-exports (`datafusion::arrow`, `datafusion::parquet`)
 # so its Arrow types always match the engine's.
 datafusion = "55.2.0"
+# ORACLE's `spec/` parses every statement it compiles. The version and
+# features DataFusion 55.2 itself uses, so this adds no crate to the build.
+sqlparser = { version = "0.62.0", default-features = false, features = ["std", "visitor"] }
 url = "2.5.8"
 
 # HTTP API (LENS)

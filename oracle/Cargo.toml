@@ -28,6 +28,9 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-util.workspace = true
 # `profile/`: an id must decode to exactly 32 bytes.
 bs58.workspace = true
+# `spec/`: every compiled statement is parsed before it is sent, to prove it
+# is exactly one SELECT over one table.
+sqlparser.workspace = true
 
 [dev-dependencies]
 # Capture `OracleConfig::display` output in the config tests.

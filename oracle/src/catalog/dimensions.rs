@@ -18,10 +18,15 @@
 //!
 //! * `slot_bucket` is the only parameterised dimension: its width, in slots,
 //!   is `1..=`[`MAX_BUCKET_WIDTH_SLOTS`]. It groups but does not filter: a
-//!   query's window already bounds its slots.
-//! * A filter on a `COALESCE`d dimension tests the **raw column**
-//!   (`mint_token_address = '…'`), never the rendered expression, so it can
-//!   use the column's statistics and cannot match the placeholder.
+//!   query's window already bounds its slots. A query grouped by it snaps
+//!   its window inward to whole buckets, so no bucket is partly outside.
+//! * **Filters compile against the raw column** (`mint_token_address =
+//!   '…'`), never the rendered expression, so DataFusion can prune files
+//!   with their Parquet statistics. A consequence, not the reason: a
+//!   `COALESCE` placeholder such as `unattributed` is not a base58 key, so
+//!   it can never be filtered for.
+//! * A filter with several values ([`Dimension::filter_any_sql`]) is the
+//!   `OR` of the single-value conditions, each still on the raw column.
 //! * No dimension renders text from outside. A filter value is checked by
 //!   its [`ValueRule`] first; an enum member is rendered from the
 //!   definition's own constant, a key only once it is proven base58
@@ -241,6 +246,27 @@ impl Dimension {
         }
     }
 
+    /// The `WHERE` condition for "this dimension equals any of `values`":
+    /// [`filter_sql`](Self::filter_sql) of each value, `OR`ed and
+    /// parenthesised, so it can be `AND`ed with other conditions as is. One
+    /// value renders exactly as `filter_sql` does. Every value must pass.
+    pub fn filter_any_sql<S: AsRef<str>>(&self, values: &[S]) -> Result<String, ValueError> {
+        match values {
+            [] => Err(ValueError::BadValue {
+                dimension: self.id.to_owned(),
+                expected: format!("at least one value: {}", self.values.expected()),
+            }),
+            [one] => self.filter_sql(one.as_ref()),
+            many => {
+                let terms = many
+                    .iter()
+                    .map(|v| self.filter_sql(v.as_ref()).map(|sql| format!("({sql})")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(format!("({})", terms.join(" OR ")))
+            }
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), CatalogError> {
         let item = format!("dimension {}", self.id);
         let item = item.as_str();
@@ -361,7 +387,9 @@ pub const DIMENSIONS: &[Dimension] = &[
         values: ValueRule::BucketWidth,
         filterable: false,
         parameterised: true,
-        warnings: &["A bucket at either end of the window may be partly outside it."],
+        warnings: &[
+            "The window is snapped inward to whole buckets, so it may cover fewer slots than requested.",
+        ],
     },
     Dimension {
         id: "leader",
@@ -515,6 +543,27 @@ mod tests {
         assert_eq!(d("slot").filter_sql("42").unwrap(), "slot = 42");
         assert_eq!(d("slot").filter_sql("10..=20").unwrap(), "slot >= 10 AND slot <= 20");
         assert!(matches!(d("slot_bucket").filter_sql("1"), Err(ValueError::NotFilterable { .. })));
+    }
+
+    #[test]
+    fn several_values_are_ored_on_the_raw_column() {
+        let other = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+        assert_eq!(d("mint").filter_any_sql(&[KEY]).unwrap(), d("mint").filter_sql(KEY).unwrap());
+        assert_eq!(
+            d("mint").filter_any_sql(&[KEY, other]).unwrap(),
+            format!("((mint_token_address = '{KEY}') OR (mint_token_address = '{other}'))")
+        );
+        assert_eq!(
+            d("slot").filter_any_sql(&["5", "10..=20"]).unwrap(),
+            "((slot = 5) OR (slot >= 10 AND slot <= 20))"
+        );
+        assert_eq!(
+            d("ix_level").filter_any_sql(&["inner", "top_level"]).unwrap(),
+            "((inner_instruction_index IS NOT NULL) OR (inner_instruction_index IS NULL))"
+        );
+        assert!(d("mint").filter_any_sql::<&str>(&[]).is_err());
+        assert!(d("mint").filter_any_sql(&[KEY, "unattributed"]).is_err());
+        assert!(d("slot_bucket").filter_any_sql(&["1", "2"]).is_err());
     }
 
     #[test]

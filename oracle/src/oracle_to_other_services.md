@@ -25,7 +25,7 @@ ORACLE depends only on LENS. It reads no changelog, calls neither PRISM nor FORG
 
 ## What it does
 
-- **Structured queries.** A client sends a spec (a measure, grouped by a dimension, over a window), and ORACLE compiles it to safe SQL. Token decimals, slot bounds and row limits are enforced for you.
+- **Structured queries.** A client sends a spec (measures, grouped and filtered by dimensions, over a window of slots), and ORACLE compiles it to one safe `SELECT`. Slot bounds and row limits are enforced for you. Answers are exact: slots, not times, and raw token amounts, with decimals not applied (UI units are deferred).
 - **Question matching.** Short questions such as "top 10 mints by transfers in the last hour" are matched to templates. Unrecognised questions get the nearest supported ones, never a guess.
 - **Anomaly detection.** It compares recent activity against its own rolling baseline (median/MAD) and flags first-seen mints and programs, and failure-rate shifts.
 - **Profiles and digests.** It reports on a mint, program or address, and on what changed recently.
