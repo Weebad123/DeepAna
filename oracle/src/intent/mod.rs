@@ -207,6 +207,28 @@ pub enum Assumption {
     AutoBucketWidth { width: u64, buckets: u64 },
 }
 
+impl Assumption {
+    /// The fixed sentence `/ask` shows for this assumption. Only numbers and
+    /// catalog ids are filled in; nothing from the question's text.
+    pub fn text(&self) -> String {
+        match self {
+            Self::DefaultWindow { slots } => {
+                format!("No window was given, so the last {slots} slots are used.")
+            }
+            Self::TimeConverted { amount, unit, slots, slot_millis } => format!(
+                "{amount} {} was converted to {slots} slots at {slot_millis} ms per slot; slot times vary, \
+                 so the window is approximate.",
+                unit.name(*amount != 1)
+            ),
+            Self::DefaultLimit { n } => format!("No row count was given, so at most {n} rows are returned."),
+            Self::DefaultMeasure { measure } => format!("No measure was given, so groups are ranked by {measure}."),
+            Self::AutoBucketWidth { width, buckets } => {
+                format!("No bucket width was given, so buckets of {width} slots are used ({buckets} buckets).")
+            }
+        }
+    }
+}
+
 /// The entity a question names, and the filter it became.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedEntity {

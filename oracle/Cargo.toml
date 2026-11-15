@@ -31,13 +31,21 @@ bs58.workspace = true
 # `spec/`: every compiled statement is parsed before it is sent, to prove it
 # is exactly one SELECT over one table.
 sqlparser.workspace = true
+# `api/`: the HTTP surface. `catch-panic` turns a handler panic into a 500;
+# request ids are UUID v4.
+axum.workspace = true
+tower-http = { workspace = true, features = ["catch-panic"] }
+uuid.workspace = true
 
 [dev-dependencies]
+# `api_test` drives the router in-process with `oneshot` and reads bodies.
+tower = { workspace = true, features = ["util"] }
+http-body-util.workspace = true
 # Capture `OracleConfig::display` output in the config tests.
 tracing-subscriber.workspace = true
 # The detect tests drive the runner on a real runtime, against a scripted
 # LENS and against the real LENS over Parquet files PRISM's writer made.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "test-util"] }
 lens = { path = "../lens" }
 prism = { path = "../prism" }
 # `catalog_prism_test` reads the footers of the Parquet files PRISM's writer

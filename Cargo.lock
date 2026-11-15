@@ -4390,8 +4390,10 @@ version = "0.1.0"
 dependencies = [
  "arrow-schema 60.0.0",
  "async-trait",
+ "axum",
  "bs58",
  "forge",
+ "http-body-util",
  "lens",
  "parquet 60.0.0",
  "prism",
@@ -4407,9 +4409,12 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

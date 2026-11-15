@@ -1184,6 +1184,13 @@ impl Auditor {
         Ok(report)
     }
 
+    /// The newest report [`Self::report`] cached, however old, without
+    /// running anything. `/health` reads it so a health check never costs an
+    /// audit.
+    pub fn last(&self) -> Option<Arc<QualityReport>> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
     /// Stop: running and future audits return [`QualityError::Cancelled`].
     pub fn shutdown(&self) {
         self.shutdown.cancel();
