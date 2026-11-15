@@ -458,6 +458,8 @@ fn display_emits_one_info_event_with_every_field() {
             (ENV_BUCKET_SECS, "90"),
             (ENV_BASELINE_BUCKETS, "12"),
             (ENV_ANOMALY_THRESHOLD, "2.75"),
+            (ENV_DETECT_ENABLED, "false"),
+            (ENV_LOG_LEVEL, "debug"),
         ])
         .unwrap();
 
@@ -475,6 +477,8 @@ fn display_emits_one_info_event_with_every_field() {
         "bucket_secs=90".to_owned(),
         "baseline_buckets=12".to_owned(),
         "anomaly_threshold=2.75".to_owned(),
+        "detect_enabled=false".to_owned(),
+        "log_level=\"debug\"".to_owned(),
     ] {
         assert!(output.contains(&expected), "missing {expected:?} in {output}");
     }
@@ -516,6 +520,11 @@ fn error_display_includes_context_and_cause() {
             "detector for failure_rate failed: boom",
         ),
         (OracleError::io("/data/oracle.db", cause()), "io_error", "I/O failure on /data/oracle.db: boom"),
+        (
+            OracleError::task_failed("detect", "did not stop"),
+            "task_failed",
+            "task detect failed: did not stop",
+        ),
     ];
     for (err, kind, display) in cases {
         assert_eq!(err.kind(), kind);
@@ -583,4 +592,36 @@ fn error_kinds_are_distinct() {
 fn oracle_error_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync + 'static>() {}
     assert_send_sync::<OracleError>();
+}
+
+// ---------------------------------------------------------------------------
+// detect_enabled, log_level
+// ---------------------------------------------------------------------------
+
+#[test]
+fn detect_enabled_takes_exactly_true_or_false() {
+    let fixture = Fixture::new();
+    assert!(fixture.load(&[]).unwrap().detect_enabled(), "default");
+    for (value, expected) in [("true", true), ("false", false), ("TRUE", true), ("False", false), (" false ", false)] {
+        assert_eq!(fixture.load(&[(ENV_DETECT_ENABLED, value)]).unwrap().detect_enabled(), expected, "{value:?}");
+    }
+    for bad in ["1", "0", "yes", "no", "on", "off", "t", "truee"] {
+        let reason = rejection_reason(fixture.load(&[(ENV_DETECT_ENABLED, bad)]), "detect_enabled");
+        assert!(reason.contains("true or false"), "{bad:?}: {reason}");
+    }
+}
+
+#[test]
+fn log_level_is_one_of_five_names() {
+    let fixture = Fixture::new();
+    assert_eq!(fixture.load(&[]).unwrap().log_level(), DEFAULT_LOG_LEVEL);
+    for level in LOG_LEVELS {
+        assert_eq!(fixture.load(&[(ENV_LOG_LEVEL, level)]).unwrap().log_level(), level);
+        let upper = level.to_ascii_uppercase();
+        assert_eq!(fixture.load(&[(ENV_LOG_LEVEL, upper.as_str())]).unwrap().log_level(), level, "stored lowercase");
+    }
+    for bad in ["verbose", "warning", "oracle=debug", "3", "info,debug"] {
+        let reason = rejection_reason(fixture.load(&[(ENV_LOG_LEVEL, bad)]), "log_level");
+        assert!(reason.contains("must be one of"), "{bad:?}: {reason}");
+    }
 }

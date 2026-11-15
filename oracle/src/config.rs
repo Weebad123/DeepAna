@@ -16,6 +16,8 @@
 //! | `ORACLE_BUCKET_SECS`             | `bucket_secs`            | `300`       | `60..=86400`                                      |
 //! | `ORACLE_BASELINE_BUCKETS`        | `baseline_buckets`       | `288`       | `5..=2016`                                        |
 //! | `ORACLE_ANOMALY_THRESHOLD`       | `anomaly_threshold`      | `3.5`       | finite decimal, `1.0..=20.0`                      |
+//! | `ORACLE_DETECT_ENABLED`          | `detect_enabled`         | `true`      | `true` or `false`                                 |
+//! | `ORACLE_LOG_LEVEL`               | `log_level`              | `info`      | `error`, `warn`, `info`, `debug` or `trace`       |
 //!
 //! `lens_url` must use `http` or `https`, name a host, and carry no
 //! credentials, query string or fragment; port 0 is rejected. A trailing `/`
@@ -39,6 +41,12 @@
 //! flagged. The interval may not exceed the bucket size, or whole buckets
 //! would close between two runs without ever being scored. At least five
 //! baseline buckets are required for the median and MAD to mean anything.
+//!
+//! `detect_enabled = false` starts every detector disabled. The detector
+//! loop still runs (so `/detectors` and `/health` report on it), and each
+//! detector can be enabled over the API. `log_level` is advisory: ORACLE is
+//! a library and never installs a tracing subscriber, so the host reads
+//! [`OracleConfig::log_level`] when it builds its own.
 //!
 //! `db_path` may name a file that does not exist yet (ORACLE creates its
 //! database), but the parent directory must exist. It is stored
@@ -68,6 +76,7 @@
 //! | `spec/`, `intent/`    | [`SpecError`]     |
 //! | `detect/`             | [`DetectError`]   |
 //! | filesystem access     | [`IoError`]       |
+//! | a background task     | [`TaskFailed`]    |
 //!
 //! Every config failure is a [`ConfigError`], including a `db_path` whose
 //! directory cannot be inspected (e.g. permission denied): the operator's
@@ -91,6 +100,7 @@
 //! [`SpecError`]: OracleError::SpecError
 //! [`DetectError`]: OracleError::DetectError
 //! [`IoError`]: OracleError::IoError
+//! [`TaskFailed`]: OracleError::TaskFailed
 
 use std::ffi::OsString;
 use std::fmt::Display;
@@ -112,9 +122,11 @@ pub const ENV_DETECT_INTERVAL_SECS: &str = "ORACLE_DETECT_INTERVAL_SECS";
 pub const ENV_BUCKET_SECS: &str = "ORACLE_BUCKET_SECS";
 pub const ENV_BASELINE_BUCKETS: &str = "ORACLE_BASELINE_BUCKETS";
 pub const ENV_ANOMALY_THRESHOLD: &str = "ORACLE_ANOMALY_THRESHOLD";
+pub const ENV_DETECT_ENABLED: &str = "ORACLE_DETECT_ENABLED";
+pub const ENV_LOG_LEVEL: &str = "ORACLE_LOG_LEVEL";
 
 /// Every variable [`OracleConfig::load`] reads.
-pub const ENV_VARS: [&str; 9] = [
+pub const ENV_VARS: [&str; 11] = [
     ENV_LENS_URL,
     ENV_DB_PATH,
     ENV_LENS_TIMEOUT_SECS,
@@ -124,7 +136,14 @@ pub const ENV_VARS: [&str; 9] = [
     ENV_BUCKET_SECS,
     ENV_BASELINE_BUCKETS,
     ENV_ANOMALY_THRESHOLD,
+    ENV_DETECT_ENABLED,
+    ENV_LOG_LEVEL,
 ];
+
+pub const DEFAULT_DETECT_ENABLED: bool = true;
+pub const DEFAULT_LOG_LEVEL: &str = "info";
+/// The values `ORACLE_LOG_LEVEL` accepts, most severe first.
+pub const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 
 /// URL schemes `lens_url` may use.
 pub const LENS_URL_SCHEMES: [&str; 2] = ["http", "https"];
@@ -202,6 +221,10 @@ pub struct OracleConfig {
     baseline_buckets: u32,
     /// Modified z-score above which a bucket is anomalous.
     anomaly_threshold: f64,
+    /// Whether the detectors start enabled.
+    detect_enabled: bool,
+    /// The level the host is asked to log at; one of [`LOG_LEVELS`].
+    log_level: &'static str,
 }
 
 impl OracleConfig {
@@ -274,6 +297,19 @@ impl OracleConfig {
             .unwrap_or(DEFAULT_ANOMALY_THRESHOLD);
         check_range("anomaly_threshold", anomaly_threshold, MIN_ANOMALY_THRESHOLD, MAX_ANOMALY_THRESHOLD)?;
 
+        let detect_enabled =
+            read_bool(&lookup, ENV_DETECT_ENABLED, "detect_enabled")?.unwrap_or(DEFAULT_DETECT_ENABLED);
+
+        let log_level = match read_string(&lookup, ENV_LOG_LEVEL, "log_level")? {
+            None => DEFAULT_LOG_LEVEL,
+            Some(value) => LOG_LEVELS.into_iter().find(|l| l.eq_ignore_ascii_case(&value)).ok_or_else(|| {
+                OracleError::config(
+                    "log_level",
+                    format!("{ENV_LOG_LEVEL}={value:?} must be one of {}", LOG_LEVELS.join(", ")),
+                )
+            })?,
+        };
+
         let db_path = validate_file_path("db_path", &raw_db_path)?;
 
         Ok(Self {
@@ -286,6 +322,8 @@ impl OracleConfig {
             bucket_secs,
             baseline_buckets,
             anomaly_threshold,
+            detect_enabled,
+            log_level,
         })
     }
 
@@ -346,6 +384,18 @@ impl OracleConfig {
         self.anomaly_threshold
     }
 
+    /// Whether the detectors start enabled. With `false` the detector loop
+    /// still runs, with every detector disabled.
+    pub const fn detect_enabled(&self) -> bool {
+        self.detect_enabled
+    }
+
+    /// The level the host should log at, lowercase, one of [`LOG_LEVELS`].
+    /// Advisory: ORACLE never installs a subscriber.
+    pub const fn log_level(&self) -> &'static str {
+        self.log_level
+    }
+
     /// Log the effective configuration as one structured `info` event. Meant
     /// to be called once, when the host starts ORACLE.
     ///
@@ -362,6 +412,8 @@ impl OracleConfig {
             bucket_secs = self.bucket_secs,
             baseline_buckets = self.baseline_buckets,
             anomaly_threshold = self.anomaly_threshold,
+            detect_enabled = self.detect_enabled,
+            log_level = self.log_level,
             "ORACLE configuration loaded"
         );
     }
@@ -417,6 +469,24 @@ where
     value.parse().map(Some).map_err(|err| {
         OracleError::config(field, format!("{var}={value:?} is not a valid unsigned integer: {err}"))
     })
+}
+
+/// Exactly `true` or `false` (ASCII case-insensitive), or `None` when `var`
+/// is unset. `1`, `yes` and `on` are rejected: one spelling per value.
+fn read_bool<F>(lookup: &F, var: &str, field: &str) -> OracleResult<Option<bool>>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    let Some(value) = read_string(lookup, var, field)? else {
+        return Ok(None);
+    };
+    if value.eq_ignore_ascii_case("true") {
+        Ok(Some(true))
+    } else if value.eq_ignore_ascii_case("false") {
+        Ok(Some(false))
+    } else {
+        Err(OracleError::config(field, format!("{var}={value:?} must be true or false")))
+    }
 }
 
 /// A finite `f64`, or `None` when `var` is unset.
@@ -610,6 +680,16 @@ pub enum OracleError {
         source: BoxError,
     },
 
+    /// A background task ([`crate::Oracle`]'s detector loop or digester)
+    /// stopped while ORACLE was running, or did not stop when asked.
+    #[error("task {task} failed: {reason}")]
+    TaskFailed {
+        /// `"detect"`, `"digest"` or `"supervisor"`.
+        task: String,
+        /// `"exited unexpectedly"`, `"panicked: ..."`, `"did not stop"`, ...
+        reason: String,
+    },
+
     /// A filesystem operation failed.
     #[error("I/O failure on {path}: {source}")]
     IoError {
@@ -661,6 +741,14 @@ impl OracleError {
         }
     }
 
+    /// Build an [`OracleError::TaskFailed`].
+    pub fn task_failed(task: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::TaskFailed {
+            task: task.into(),
+            reason: reason.into(),
+        }
+    }
+
     /// Build an [`OracleError::IoError`].
     pub fn io(path: impl Into<String>, source: io::Error) -> Self {
         Self::IoError {
@@ -677,6 +765,7 @@ impl OracleError {
             Self::StoreError { .. } => "store_error",
             Self::SpecError { .. } => "spec_error",
             Self::DetectError { .. } => "detect_error",
+            Self::TaskFailed { .. } => "task_failed",
             Self::IoError { .. } => "io_error",
         }
     }

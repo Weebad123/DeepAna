@@ -337,9 +337,17 @@ impl Runner {
         RunnerHandle { shared: Arc::clone(&self.shared) }
     }
 
-    /// Run a tick now, then one every `detect_interval_secs`, until shutdown.
+    /// [`Self::run`] on its own task.
     pub fn spawn(self) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        tokio::spawn(self.run())
+    }
+
+    /// Run a tick now, then one every `detect_interval_secs`, until shutdown.
+    /// Returns only once the shutdown token is cancelled (or a detector
+    /// panics, which ends it with the panic). A host that supervises its
+    /// tasks spawns this future itself.
+    pub async fn run(self) {
+        {
             info!(
                 detectors = self.shared.slots.len(),
                 bucket_slots = self.shared.bucket_slots,
@@ -354,7 +362,7 @@ impl Runner {
                 }
             }
             info!("anomaly detection stopped");
-        })
+        }
     }
 
     /// One tick (see the module docs). [`Runner::spawn`] calls this on its
@@ -406,7 +414,9 @@ impl Runner {
         .into_iter()
         .enumerate()
         {
+            // Biased: once cancelled, no new query is even sent.
             let response = tokio::select! {
+                biased;
                 () = self.shutdown.cancelled() => return None,
                 response = self.shared.lens.query(sql) => response,
             };

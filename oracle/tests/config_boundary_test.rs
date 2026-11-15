@@ -507,6 +507,8 @@ fn every_variable_rejects_empty_and_whitespace_only_values() {
         (ENV_BUCKET_SECS, "bucket_secs"),
         (ENV_BASELINE_BUCKETS, "baseline_buckets"),
         (ENV_ANOMALY_THRESHOLD, "anomaly_threshold"),
+        (ENV_DETECT_ENABLED, "detect_enabled"),
+        (ENV_LOG_LEVEL, "log_level"),
     ];
     assert_eq!(fields.len(), ENV_VARS.len());
     for (var, _) in fields {

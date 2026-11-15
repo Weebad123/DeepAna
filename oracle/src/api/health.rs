@@ -258,7 +258,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Result<ApiJson<Health
     Ok(ApiJson(HealthResponse {
         status,
         reasons: unhealthy,
-        uptime_secs: state.started_at.elapsed().as_secs(),
+        uptime_secs: state.start_time.elapsed().as_secs(),
         lens,
         detectors,
         digest,

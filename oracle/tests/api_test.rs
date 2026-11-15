@@ -266,7 +266,7 @@ fn rig_full(budgets: Option<Budgets>, interpreter: Option<Interpreter>) -> Rig {
         lens: api_lens,
         config,
         shutdown,
-        started_at: Instant::now(),
+        start_time: Instant::now(),
     });
     let app = match budgets {
         Some(b) => router_with(Arc::clone(&state), b),

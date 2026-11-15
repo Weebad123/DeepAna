@@ -1207,12 +1207,21 @@ impl Digester {
         DigestHandle { shared: Arc::clone(&self.shared) }
     }
 
-    /// Tick now, then every [`DIGEST_TICK_SECS`], until `shutdown`.
+    /// [`Self::run`] on its own task.
     pub fn spawn(self, shutdown: CancellationToken) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        tokio::spawn(self.run(shutdown))
+    }
+
+    /// Tick now, then every [`DIGEST_TICK_SECS`], until `shutdown`. Returns
+    /// only once `shutdown` is cancelled; a host that supervises its tasks
+    /// spawns this future itself.
+    pub async fn run(self, shutdown: CancellationToken) {
+        {
             info!(bucket_slots = self.shared.bucket_slots, "digests started");
             loop {
+                // Biased: once cancelled, no new tick starts.
                 tokio::select! {
+                    biased;
                     () = shutdown.cancelled() => break,
                     () = self.run_once() => {}
                 }
@@ -1223,7 +1232,7 @@ impl Digester {
             }
             self.shared.cancel.cancel();
             info!("digests stopped");
-        })
+        }
     }
 
     /// One tick (see the module docs). Tests call it directly.
