@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["forge","lens", "oracle",
+members = ["commons","forge","lens", "oracle",
     "prism",
 ]
 
@@ -62,6 +62,11 @@ reqwest = { version = "0.12.28", default-features = false, features = ["rustls-t
 # Only to tell a malformed response apart from a dropped connection in
 # reqwest's error chain; no features needed.
 hyper = "1.12.0"
+
+# CLI (COMMONS)
+clap = { version = "4.6.7", features = ["derive"] }
+# Tests only (COMMONS): scratch repo roots.
+tempfile = "3.27.0"
 
 # Utilities
 chrono = "0.4.45"
