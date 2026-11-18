@@ -12,3 +12,6 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Tests only: PRISM's writer schemas are the authority for fixture row columns.
+prism = { path = "../prism" }
+arrow-schema = { workspace = true }

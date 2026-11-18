@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "model": "daily-active-programs",
+  "case": "two-mints",
+  "provenance": { "kind": "hand_computed", "reference": "counted from chains/two-mints-one-failed.json",
+                  "note": "instructions per program in slots 100 to 102, failed transaction included" },
+  "chain": { "explicit": "two-mints-one-failed" },
+  "window": { "from_slot": 100, "to_slot": 102 },
+  "expect": { "columns": ["program_id", "n"], "ordered": false,
+              "rows": [["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", 3], ["5PjDJaGfSPJj4tFzMRCiuuAasKg5n8dJKXKenhuwZexx", 1]] }
+}

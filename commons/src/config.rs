@@ -37,7 +37,8 @@ pub const ECHO_MAX_CHARS: usize = 200;
 
 /// Success.
 pub const EXIT_OK: i32 = 0;
-/// The contributor's artifact is bad: manifest, verification or publish integrity.
+/// The contributor's artifact is bad (manifest, verification or publish
+/// integrity), or the repository's pinned fixtures are.
 pub const EXIT_ARTIFACT: i32 = 1;
 /// The invocation is wrong: a flag or path argument.
 pub const EXIT_USAGE: i32 = 2;
@@ -72,6 +73,15 @@ pub enum CommonsError {
     #[error("artifact {artifact}: publish: {reason}")]
     PublishError { artifact: String, reason: String },
 
+    /// The pinned fixtures in this repository are bad, or were changed
+    /// without updating `fixtures.lock`. `path` is relative to the repo root.
+    #[error("fixture {path}: field {field}: {reason}")]
+    FixtureError {
+        path: String,
+        field: String,
+        reason: String,
+    },
+
     #[error("i/o error at {}: {source}", echo(&.path.to_string_lossy()))]
     IoError {
         path: PathBuf,
@@ -89,7 +99,8 @@ impl CommonsError {
             CommonsError::ConfigError { .. } => EXIT_USAGE,
             CommonsError::ManifestError { .. }
             | CommonsError::VerifyError { .. }
-            | CommonsError::PublishError { .. } => EXIT_ARTIFACT,
+            | CommonsError::PublishError { .. }
+            | CommonsError::FixtureError { .. } => EXIT_ARTIFACT,
             CommonsError::IoError { .. } | CommonsError::Internal(_) => EXIT_INTERNAL,
         }
     }
@@ -932,6 +943,10 @@ mod tests {
             1
         );
         assert_eq!(CommonsError::PublishError { artifact: s(), reason: s() }.exit_code(), 1);
+        assert_eq!(
+            CommonsError::FixtureError { path: s(), field: s(), reason: s() }.exit_code(),
+            1
+        );
         assert_eq!(
             io_err(Path::new("/x"), io::Error::other("boom")).exit_code(),
             3

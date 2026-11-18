@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "model": "daily-active-programs",
+  "case": "generated-smoke",
+  "provenance": { "kind": "hand_computed", "reference": "none: invariants only",
+                  "note": "a generated chain never carries expected rows" },
+  "chain": { "generated": { "seed": 7, "start_slot": 1000, "slots": 500, "skip_percent": 5,
+                            "max_tx_per_slot": 8, "fail_percent": 10, "transfer_percent": 30,
+                            "mint_null_percent": 20 } },
+  "window": { "from_slot": 1000, "to_slot": 1499 }
+}

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "case": "transfer-basic",
+  "provenance": { "kind": "program_source", "reference": "spl-token program/src/instruction.rs, Transfer = 3",
+                  "note": "tag 3, then the amount as a little-endian u64" },
+  "instruction_data_hex": "03e803000000000000",
+  "accounts": ["29d2S7vB453rNYFdR5Ycwt7y9haRT5fwVwL9zTmBhfV2", "2DYKaRPBeNM5WdW8rNsYEktjPrnd89Mm4Lzp3qonSzoj", "3EKkiwNLWqoUbzFkPrmKbtUB4EweE6f4STzevYUmezeL"],
+  "expect": { "result": "decoded", "instruction_type": "transfer", "data": { "amount": 1000 } }
+}

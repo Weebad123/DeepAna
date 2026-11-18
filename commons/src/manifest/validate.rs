@@ -680,15 +680,23 @@ pub(crate) fn real_dir(path: &Path, artifact: &str) -> Result<(), CommonsError> 
 /// All entries of `dir`, sorted by name so that errors do not depend on the
 /// order the filesystem returns them in. At most [`MAX_ENTRIES_PER_DIR`].
 pub(crate) fn list_dir(dir: &Path, artifact: &str) -> Result<Vec<Entry>, CommonsError> {
+    list_dir_with(dir, |reason| manifest_err(artifact, FIELD_DIRECTORY, reason))
+}
+
+/// [`list_dir`] with the caller's error for a rule violation (I/O failures
+/// are always [`CommonsError::IoError`]). Shared with `fixtures/`, so both
+/// modules read directories the same way.
+pub(crate) fn list_dir_with(
+    dir: &Path,
+    rule_err: impl Fn(String) -> CommonsError,
+) -> Result<Vec<Entry>, CommonsError> {
     let mut out = Vec::new();
     for e in fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
         let e = e.map_err(|e| io_err(dir, e))?;
         if out.len() == MAX_ENTRIES_PER_DIR {
-            return Err(manifest_err(
-                artifact,
-                FIELD_DIRECTORY,
-                format!("has more than {MAX_ENTRIES_PER_DIR} entries"),
-            ));
+            return Err(rule_err(format!(
+                "has more than {MAX_ENTRIES_PER_DIR} entries"
+            )));
         }
         let file_type = e.file_type().map_err(|err| io_err(&e.path(), err))?;
         out.push(Entry {
@@ -785,24 +793,28 @@ pub(crate) fn read_regular_file(
     artifact: &str,
     field: &str,
 ) -> Result<Vec<u8>, CommonsError> {
-    let too_large = |n: u64| {
-        manifest_err(
-            artifact,
-            field,
-            format!("is {n} bytes, more than the limit of {max_bytes}"),
-        )
-    };
+    read_regular_file_with(path, lmeta, max_bytes, |reason| {
+        manifest_err(artifact, field, reason)
+    })
+}
+
+/// [`read_regular_file`] with the caller's error for a rule violation (I/O
+/// failures are always [`CommonsError::IoError`]). Shared with `fixtures/`,
+/// so both modules read files the same way.
+pub(crate) fn read_regular_file_with(
+    path: &Path,
+    lmeta: &Metadata,
+    max_bytes: u64,
+    rule_err: impl Fn(String) -> CommonsError,
+) -> Result<Vec<u8>, CommonsError> {
+    let too_large = |n: u64| rule_err(format!("is {n} bytes, more than the limit of {max_bytes}"));
     if lmeta.len() > max_bytes {
         return Err(too_large(lmeta.len()));
     }
     let file = File::open(path).map_err(|e| io_err(path, e))?;
     let fmeta = file.metadata().map_err(|e| io_err(path, e))?;
     if !fmeta.is_file() || !same_file(lmeta, &fmeta) {
-        return Err(manifest_err(
-            artifact,
-            field,
-            "file was replaced while being read",
-        ));
+        return Err(rule_err("file was replaced while being read".into()));
     }
     let mut buf = Vec::with_capacity(lmeta.len() as usize);
     file.take(max_bytes + 1)

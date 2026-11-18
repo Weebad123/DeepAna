@@ -1,7 +1,7 @@
 
 pub mod config;
 pub mod manifest;
-mod fixtures;
+pub mod fixtures;
 mod publish;
 mod verify;
 

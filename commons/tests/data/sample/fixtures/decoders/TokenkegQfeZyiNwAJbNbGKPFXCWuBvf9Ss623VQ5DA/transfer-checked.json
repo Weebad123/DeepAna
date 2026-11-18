@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "case": "transfer-checked",
+  "provenance": { "kind": "hand_computed", "reference": "worked from the TransferChecked layout",
+                  "note": "tag 12, amount 500, decimals 9" },
+  "instruction_data_hex": "0cf40100000000000009",
+  "accounts": ["2HTciirCEfeJeikeHgCTXdfVe1zpoD3ackfU7DrPCL8S", "4NwnA4HWZurKyXWNowJwYmb9CwX4gBKzwQKov1ExMf8M", "2MNus2KCpxwXnp19iyXNpWSFtBD2UGjQBAL8AbtywfT9", "3JF3sEqM796hk5WFqA6EtmEwJQ9quALszsfJyvXNQKy3"],
+  "expect": { "result": "decoded", "instruction_type": "transferChecked",
+              "data": { "amount": 500, "decimals": 9 } }
+}

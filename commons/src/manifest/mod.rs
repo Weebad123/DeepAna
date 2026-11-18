@@ -36,6 +36,12 @@ pub use validate::{
 
 use validate::{manifest_err, real_dir};
 
+// Shared with `fixtures/`, which reads files and names the way this module does.
+pub(crate) use validate::{
+    Entry, check_description, check_name, io_err, list_dir_with, parse_sha256_hex,
+    read_regular_file_with,
+};
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------

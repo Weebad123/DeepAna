@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "case": "truncated-transfer",
+  "provenance": { "kind": "hand_computed", "reference": "transfer-basic with the amount cut to 2 bytes",
+                  "note": "the decoder claims tag 3 and must fail on the short amount" },
+  "instruction_data_hex": "03e803",
+  "accounts": ["29d2S7vB453rNYFdR5Ycwt7y9haRT5fwVwL9zTmBhfV2", "2DYKaRPBeNM5WdW8rNsYEktjPrnd89Mm4Lzp3qonSzoj", "3EKkiwNLWqoUbzFkPrmKbtUB4EweE6f4STzevYUmezeL"],
+  "expect": { "result": "decode_error" }
+}

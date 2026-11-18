@@ -1748,8 +1748,10 @@ dependencies = [
 name = "commons"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema 60.0.0",
  "bs58",
  "clap",
+ "prism",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
