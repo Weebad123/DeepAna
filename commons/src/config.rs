@@ -126,7 +126,7 @@ fn io_err(path: &Path, source: io::Error) -> CommonsError {
 
 /// Unicode "format" characters that can reorder or hide text in a terminal
 /// or a CI log: bidi controls, zero-width characters, BOM, soft hyphen.
-fn is_invisible_format(c: char) -> bool {
+pub(crate) fn is_invisible_format(c: char) -> bool {
     matches!(c,
         '\u{00AD}'
         | '\u{061C}'

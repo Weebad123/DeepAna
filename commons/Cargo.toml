@@ -9,9 +9,24 @@ clap = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
+# verify/backend.rs: the only place COMMONS names a PRISM type. PRISM's
+# writer schemas are also the authority for fixture row columns.
+prism = { path = "../prism" }
+# verify/engine.rs: the in-process SQL engine, the same version LENS runs.
+datafusion = { workspace = true }
+# verify/sql_guard.rs: the parser DataFusion itself uses, same version.
+sqlparser = { workspace = true }
+# DataFusion is async; the engine drives it on a current-thread runtime.
+tokio = { workspace = true, features = ["rt"] }
+# The optional live LENS stage (`--lens-url`). Already in the build through
+# PRISM and FORGE, with the same TLS stack.
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# Tests only: PRISM's writer schemas are the authority for fixture row columns.
-prism = { path = "../prism" }
 arrow-schema = { workspace = true }
+# Tests only: engine fidelity runs the same SQL through LENS's own
+# QueryEngine over Parquet files PRISM's writer produced.
+lens = { path = "../lens" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }

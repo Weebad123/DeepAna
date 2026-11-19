@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "model": "fee-by-status",
+  "case": "generated-busy",
+  "provenance": {
+    "kind": "hand_computed",
+    "reference": "none: invariants only",
+    "note": "a window inside a generated chain, rows on both sides"
+  },
+  "chain": {
+    "generated": {
+      "seed": 7,
+      "start_slot": 1000,
+      "slots": 120,
+      "skip_percent": 5,
+      "max_tx_per_slot": 4,
+      "fail_percent": 10,
+      "transfer_percent": 30,
+      "mint_null_percent": 20
+    }
+  },
+  "window": {
+    "from_slot": 1010,
+    "to_slot": 1100
+  }
+}

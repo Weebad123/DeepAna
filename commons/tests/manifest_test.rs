@@ -1468,3 +1468,60 @@ fn end_to_end_discover_load_unique() {
         assert_eq!(a.artifact_id, a.manifest.artifact_id());
     }
 }
+
+// ---------------------------------------------------------------------------
+// check_unique_paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unique_paths_pass_on_a_clean_tree_and_an_empty_one() {
+    let r = repo();
+    check_unique_paths(&r.art).unwrap();
+    sample_tree(&r);
+    fs::write(r.art.join(ARTIFACTS_README), b"# Artifacts\n").unwrap();
+    artifact(&r, "experimental", "model", "spl-token", "1.0.0");
+    check_unique_paths(&r.art).unwrap();
+}
+
+#[test]
+fn unique_paths_catch_a_duplicate_outside_the_verified_paths() {
+    let r = repo();
+    sample_tree(&r);
+    let new = artifact(&r, "official", "decoder", "spl-token", "1.1.0");
+    // Verifying only the new directory passes check_unique...
+    let only_new = vec![load(&new, &r.config).unwrap()];
+    check_unique(&only_new).unwrap();
+    // ...but the tree as a whole holds the triple twice.
+    let (artifact, field, reason) = merr(check_unique_paths(&r.art));
+    assert_eq!(field, FIELD_PATH);
+    assert_eq!(artifact, "official/decoder/spl-token/1.1.0");
+    assert!(reason.contains("'experimental/decoder/spl-token/1.1.0'"), "{reason}");
+    assert!(reason.contains("move the directory, not copy it"), "{reason}");
+}
+
+#[test]
+fn unique_paths_read_no_manifest() {
+    let r = repo();
+    // A broken manifest elsewhere is not this check's business...
+    write_files(
+        &version_dir(&r, "experimental", "model", "broken", "1.0.0"),
+        &[(MANIFEST_FILE, b"not json"), ("model.sql", SQL)],
+    );
+    check_unique_paths(&r.art).unwrap();
+    // ...but a version directory that names no identity is.
+    fs::create_dir_all(r.art.join("experimental/model/broken/v1")).unwrap();
+    assert_merr(check_unique_paths(&r.art), FIELD_PATH, "not a version");
+}
+
+#[cfg(unix)]
+#[test]
+fn unique_paths_follow_the_discover_rules() {
+    let r = repo();
+    sample_tree(&r);
+    std::os::unix::fs::symlink(
+        r.art.join("official"),
+        r.art.join("experimental").join("model").join("link"),
+    )
+    .unwrap();
+    assert_merr(check_unique_paths(&r.art), FIELD_DIRECTORY, "symlinks are not allowed");
+}

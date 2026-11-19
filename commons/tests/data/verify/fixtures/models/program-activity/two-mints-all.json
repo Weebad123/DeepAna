@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "model": "program-activity",
+  "case": "two-mints-all",
+  "provenance": {
+    "kind": "hand_computed",
+    "reference": "counted from chains/two-mints-one-failed.json",
+    "note": "every instruction of the chain"
+  },
+  "chain": {
+    "explicit": "two-mints-one-failed"
+  },
+  "window": {
+    "from_slot": 100,
+    "to_slot": 102
+  },
+  "expect": {
+    "columns": [
+      "program_id",
+      "n"
+    ],
+    "ordered": true,
+    "rows": [
+      [
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        3
+      ],
+      [
+        "5PjDJaGfSPJj4tFzMRCiuuAasKg5n8dJKXKenhuwZexx",
+        1
+      ]
+    ]
+  }
+}

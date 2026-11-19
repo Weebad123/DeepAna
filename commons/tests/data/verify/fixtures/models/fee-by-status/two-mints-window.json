@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "model": "fee-by-status",
+  "case": "two-mints-window",
+  "provenance": {
+    "kind": "hand_computed",
+    "reference": "counted from chains/two-mints-one-failed.json",
+    "note": "slot 100: one success and one failed, 5000 lamports each"
+  },
+  "chain": {
+    "explicit": "two-mints-one-failed"
+  },
+  "window": {
+    "from_slot": 100,
+    "to_slot": 101
+  },
+  "expect": {
+    "columns": [
+      "status",
+      "txs",
+      "fees"
+    ],
+    "ordered": false,
+    "rows": [
+      [
+        "success",
+        1,
+        5000
+      ],
+      [
+        "failed",
+        1,
+        5000
+      ]
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "model": "program-activity",
+  "case": "two-mints-window",
+  "provenance": {
+    "kind": "hand_computed",
+    "reference": "counted from chains/two-mints-one-failed.json",
+    "note": "slot 100 only: two token instructions, one router; slot 102 is outside"
+  },
+  "chain": {
+    "explicit": "two-mints-one-failed"
+  },
+  "window": {
+    "from_slot": 100,
+    "to_slot": 101
+  },
+  "expect": {
+    "columns": [
+      "program_id",
+      "n"
+    ],
+    "ordered": true,
+    "rows": [
+      [
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        2
+      ],
+      [
+        "5PjDJaGfSPJj4tFzMRCiuuAasKg5n8dJKXKenhuwZexx",
+        1
+      ]
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "kind": "decoder",
+  "name": "escrow",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "Decodes the escrow example program.",
+  "content_sha256": "095ef6bdc16d5fbc31bf83796d4c82f662c956a79cab7fe6d9f5895de5d704d1",
+  "program_id": "CiUQWNDZ5Rhn2iULcgoHDagk2GFXrLwCDSknUMv5ioCv"
+}

@@ -1,0 +1,234 @@
+{
+  "address": "CiUQWNDZ5Rhn2iULcgoHDagk2GFXrLwCDSknUMv5ioCv",
+  "metadata": {
+    "name": "escrow",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Anchor 0.30 escrow, after solana-developers/program-examples tokens/escrow, plus configure for type coverage"
+  },
+  "instructions": [
+    {
+      "name": "make_offer",
+      "discriminator": [
+        214,
+        98,
+        97,
+        35,
+        59,
+        12,
+        44,
+        178
+      ],
+      "accounts": [
+        {
+          "name": "maker",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "token_mint_a"
+        },
+        {
+          "name": "token_mint_b"
+        },
+        {
+          "name": "offer",
+          "writable": true
+        },
+        {
+          "name": "vault",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "id",
+          "type": "u64"
+        },
+        {
+          "name": "token_a_offered_amount",
+          "type": "u64"
+        },
+        {
+          "name": "token_b_wanted_amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "take_offer",
+      "discriminator": [
+        128,
+        156,
+        242,
+        207,
+        237,
+        192,
+        103,
+        240
+      ],
+      "accounts": [
+        {
+          "name": "taker",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "offer",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "refund_offer",
+      "discriminator": [
+        171,
+        18,
+        70,
+        32,
+        244,
+        121,
+        60,
+        75
+      ],
+      "accounts": [
+        {
+          "name": "maker",
+          "writable": true,
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "configure",
+      "discriminator": [
+        245,
+        7,
+        108,
+        117,
+        95,
+        196,
+        54,
+        217
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "config",
+          "type": {
+            "defined": {
+              "name": "Config"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "types": [
+    {
+      "name": "Config",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "admins",
+            "type": {
+              "vec": "pubkey"
+            }
+          },
+          {
+            "name": "mode",
+            "type": {
+              "defined": {
+                "name": "Mode"
+              }
+            }
+          },
+          {
+            "name": "memo",
+            "type": {
+              "option": "string"
+            }
+          },
+          {
+            "name": "big",
+            "type": "u128"
+          },
+          {
+            "name": "delta",
+            "type": "i64"
+          },
+          {
+            "name": "payload",
+            "type": "bytes"
+          },
+          {
+            "name": "limits",
+            "type": {
+              "array": [
+                "u8",
+                3
+              ]
+            }
+          },
+          {
+            "name": "pair",
+            "type": {
+              "defined": {
+                "name": "Pair"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Mode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Off"
+          },
+          {
+            "name": "Fixed",
+            "fields": [
+              {
+                "name": "rate",
+                "type": "u64"
+              }
+            ]
+          },
+          {
+            "name": "Range",
+            "fields": [
+              "u32",
+              "u32"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "Pair",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          "u8",
+          "i16"
+        ]
+      }
+    }
+  ]
+}

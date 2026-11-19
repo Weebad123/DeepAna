@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "kind": "model",
+  "name": "fee-by-status",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "Transactions and fees by status.",
+  "content_sha256": "af1e525fe1c0427c10f4a64cb3a265130fc0bdbf40f1f24156bb43383eb0e0a2"
+}

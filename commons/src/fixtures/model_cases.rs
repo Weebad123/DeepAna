@@ -438,6 +438,46 @@ impl Chain {
     pub fn digest(&self) -> [u8; 32] {
         sha256(&self.canonical_bytes())
     }
+
+    /// The chain with every row whose `slot` is outside `from..=to` removed,
+    /// from every table; the rows kept keep their order. Every table is
+    /// keyed by slot, so a consistent chain stays consistent.
+    pub fn within(&self, from: u64, to: u64) -> Chain {
+        let inside = |slot: u64| (from..=to).contains(&slot);
+        Chain {
+            slots: self.slots.iter().filter(|r| inside(r.slot)).cloned().collect(),
+            transactions: self
+                .transactions
+                .iter()
+                .filter(|r| inside(r.slot))
+                .cloned()
+                .collect(),
+            instructions: self
+                .instructions
+                .iter()
+                .filter(|r| inside(r.slot))
+                .cloned()
+                .collect(),
+            token_transfers: self
+                .token_transfers
+                .iter()
+                .filter(|r| inside(r.slot))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Rows per table whose `slot` is outside `from..=to`, in
+    /// [`Table::ALL`] order.
+    pub fn rows_outside(&self, from: u64, to: u64) -> [usize; 4] {
+        let out = |slot: u64| !(from..=to).contains(&slot);
+        [
+            self.slots.iter().filter(|r| out(r.slot)).count(),
+            self.transactions.iter().filter(|r| out(r.slot)).count(),
+            self.instructions.iter().filter(|r| out(r.slot)).count(),
+            self.token_transfers.iter().filter(|r| out(r.slot)).count(),
+        ]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1689,5 +1729,22 @@ mod tests {
         let mut more = o.rows.clone();
         more.push(vec![Cell::Null, Cell::Null]);
         assert_eq!(o.check(&c, &more).unwrap_err(), "4 rows, expected 3");
+    }
+
+    #[test]
+    fn within_keeps_exactly_the_window_in_every_table() {
+        let c = chain();
+        assert_eq!(c.rows_outside(100, 101), [0, 0, 0, 0]);
+        assert_eq!(c.within(100, 101), c, "a window over everything changes nothing");
+        assert_eq!(c.rows_outside(101, 101), [1, 1, 2, 1]);
+        let w = c.within(101, 101);
+        assert_eq!(w.row_counts(), [1, 1, 0, 0]);
+        assert_eq!(w.slots[0].slot, 101);
+        assert_eq!(check_consistency(&w), Ok(()), "still consistent");
+        assert_eq!(c.within(102, 200), Chain::default());
+        assert_eq!(c.rows_outside(102, 200), c.row_counts());
+        // Order is kept.
+        let both = c.within(0, u64::MAX);
+        assert_eq!(both.transactions, c.transactions);
     }
 }

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "program_id": "CiUQWNDZ5Rhn2iULcgoHDagk2GFXrLwCDSknUMv5ioCv",
+  "case": "truncated-make-offer",
+  "provenance": {
+    "kind": "hand_computed",
+    "reference": "make-offer cut after 4 bytes of id",
+    "note": "claimed by the discriminator, then too short"
+  },
+  "instruction_data_hex": "d66261233b0c2cb201000000",
+  "accounts": [
+    "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
+  ],
+  "expect": {
+    "result": "decode_error"
+  }
+}

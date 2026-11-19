@@ -29,6 +29,13 @@
 //! Comparison is exact: [`StrictValue`]'s `==` never coerces (`1` is not
 //! `"1"`, `0` is not `false`) and [`first_difference`] names the first path
 //! where two values differ.
+//!
+//! Two additions serve `verify/`. [`canonical_cmp`] (and [`sort_canonical`])
+//! is the one written-down order of a multiset of values, bytewise on
+//! canonical bytes, which is what digests of unordered rows use. And
+//! [`json_quote`] / [`json_ascii`] write JSON that is valid and pure ASCII
+//! for **any** string, including ones a fixture could never hold; they are
+//! for report output and request bodies, never for fixtures or digests.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -518,6 +525,107 @@ pub fn canonical_string(v: &StrictValue) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical order
+// ---------------------------------------------------------------------------
+
+/// The order of values in a multiset whenever its order is written down (a
+/// digest, a report): bytewise by [`canonical_bytes`].
+///
+/// Unlike the structural `Ord` of [`StrictValue`], this order is defined by
+/// the bytes alone, so anyone holding the canonical forms can reproduce it
+/// (`LC_ALL=C sort` over one canonical value per line gives the same order
+/// for values whose strings hold no newline). Equal values compare equal.
+///
+/// [`canonical_bytes`] is injective for every value, including strings
+/// with control characters (only `"` and `\` are escaped, and each has one
+/// escape), so two different values never tie.
+pub fn canonical_cmp(a: &StrictValue, b: &StrictValue) -> std::cmp::Ordering {
+    canonical_bytes(a).cmp(&canonical_bytes(b))
+}
+
+/// Sort `values` into [`canonical_cmp`] order. Each value is serialised
+/// once.
+pub fn sort_canonical(values: &mut [StrictValue]) {
+    values.sort_by_cached_key(canonical_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// ASCII JSON
+// ---------------------------------------------------------------------------
+
+/// `s` as a JSON string literal, for text that may hold anything: report
+/// output and request bodies, not fixtures.
+///
+/// The result is printable ASCII and valid JSON for every input: `"` and
+/// `\` are escaped as `\"` and `\\`, and every character outside
+/// U+0020..=U+007E as `\uXXXX` (a surrogate pair above U+FFFF). A JSON
+/// reader gives back exactly `s`; a terminal shows nothing but ASCII.
+pub fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    push_json_quoted(&mut out, s);
+    out
+}
+
+fn push_json_quoted(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            ' '..='~' => out.push(c),
+            _ => {
+                let mut units = [0u16; 2];
+                for u in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{u:04x}"));
+                }
+            }
+        }
+    }
+    out.push('"');
+}
+
+/// `v` as compact JSON in the canonical layout (sorted keys, no
+/// whitespace), with every string written by [`json_quote`]. Equal to
+/// [`canonical_string`] for values whose strings are printable ASCII;
+/// unlike it, valid JSON and pure ASCII for every value.
+pub fn json_ascii(v: &StrictValue) -> String {
+    let mut out = String::new();
+    write_json_ascii(&mut out, v);
+    out
+}
+
+fn write_json_ascii(out: &mut String, v: &StrictValue) {
+    match v {
+        StrictValue::Null => out.push_str("null"),
+        StrictValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        StrictValue::Int(n) => out.push_str(&n.to_string()),
+        StrictValue::Str(s) => push_json_quoted(out, s),
+        StrictValue::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_ascii(out, item);
+            }
+            out.push(']');
+        }
+        StrictValue::Object(map) => {
+            out.push('{');
+            for (i, (k, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_quoted(out, k);
+                out.push(':');
+                write_json_ascii(out, item);
+            }
+            out.push('}');
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Exact comparison
 // ---------------------------------------------------------------------------
 
@@ -904,5 +1012,64 @@ mod tests {
         assert_eq!((d.path.as_str(), d.expected.as_str()), ("d", "no such key"));
         let d = first_difference(&ok("1"), &ok("\"1\"")).unwrap();
         assert_eq!(d.to_string(), "top level: expected 1 but got \"1\"");
+    }
+
+    #[test]
+    fn canonical_order_is_bytewise_on_canonical_bytes() {
+        let mut v: Vec<StrictValue> = ["[2]", "\"b\"", "10", "9", "null", "[10]", "\"B\"", "{}", "true"]
+            .iter()
+            .map(|s| ok(s))
+            .collect();
+        sort_canonical(&mut v);
+        let shown: Vec<String> = v.iter().map(canonical_string).collect();
+        // '"' 0x22 < '1' < '9' < '[' 0x5b < 'n' < 't' < '{'.
+        assert_eq!(shown, ["\"B\"", "\"b\"", "10", "9", "[10]", "[2]", "null", "true", "{}"]);
+        // The structural Ord would put null first: the two orders differ on
+        // purpose, and only this one is written down.
+        assert_eq!(canonical_cmp(&ok("10"), &ok("9")), std::cmp::Ordering::Less);
+        assert!(StrictValue::Int(10) > StrictValue::Int(9));
+        // Different values never tie, even with characters a fixture cannot
+        // hold; equal values do.
+        let raw = |s: &str| StrictValue::Str(s.to_string());
+        assert_ne!(canonical_cmp(&raw("a\nb"), &raw("a\\nb")), std::cmp::Ordering::Equal);
+        assert_ne!(canonical_cmp(&raw("\""), &raw("\\\"")), std::cmp::Ordering::Equal);
+        assert_eq!(canonical_cmp(&ok("{\"a\":[1]}"), &ok("{ \"a\" : [1] }")), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn json_quote_is_ascii_valid_json_and_reads_back_exactly() {
+        for s in [
+            "",
+            "plain",
+            "q\"uote and back\\slash",
+            "line\nfeed\r\ttab\u{0}nul",
+            "\u{7f}\u{85}\u{a0}",
+            "é ü 漢字",
+            "bidi \u{202E}rev\u{200B}",
+            "astral 🙂 \u{10FFFF}",
+            "\u{1b}[31mred",
+        ] {
+            let q = json_quote(s);
+            assert!(q.bytes().all(|b| (0x20..=0x7e).contains(&b)), "{q}");
+            let back: String = serde_json::from_str(&q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(back, s);
+        }
+        assert_eq!(json_quote("a\"b\\c\n"), r#""a\"b\\c\u000a""#);
+        assert_eq!(json_quote("🙂"), r#""\ud83d\ude42""#, "a surrogate pair");
+    }
+
+    #[test]
+    fn json_ascii_is_canonical_for_ascii_and_valid_for_anything() {
+        let v = ok(r#"{"b":[1,-2,true,null],"a":"q\"\\","B":{}}"#);
+        assert_eq!(json_ascii(&v), canonical_string(&v));
+        let odd = StrictValue::Object(
+            [("k\n".to_string(), StrictValue::str_array(&["é", "\u{1}"]))]
+                .into_iter()
+                .collect(),
+        );
+        let text = json_ascii(&odd);
+        assert!(text.is_ascii());
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, serde_json::json!({"k\n": ["é", "\u{1}"]}));
     }
 }

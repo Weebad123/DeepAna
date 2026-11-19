@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "kind": "model",
+  "name": "program-activity",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "Instructions per program, busiest first.",
+  "content_sha256": "046045386dd6da7fd58dc0740bd56e08c92d9a5ccba64fdc73e9073d84502dc0"
+}

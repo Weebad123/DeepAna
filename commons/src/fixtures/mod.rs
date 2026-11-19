@@ -67,8 +67,9 @@ use crate::manifest::{
 };
 
 pub use canon::{
-    CanonIssue, Difference, ParseLimits, StrictValue, canonical_bytes, canonical_string,
-    first_difference, join_index, join_key, parse_strict,
+    CanonIssue, Difference, ParseLimits, StrictValue, canonical_bytes, canonical_cmp,
+    canonical_string, first_difference, join_index, join_key, json_ascii, json_quote,
+    parse_strict, sort_canonical,
 };
 pub use chain_gen::{
     GENERATOR_VERSION, GenSpec, MAX_GEN_SLOTS, MAX_GEN_START_SLOT, MAX_GEN_TRANSACTIONS,

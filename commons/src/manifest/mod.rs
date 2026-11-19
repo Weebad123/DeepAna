@@ -535,3 +535,44 @@ pub fn check_unique(artifacts: &[Artifact]) -> Result<(), CommonsError> {
     }
     Ok(())
 }
+
+/// [`check_unique`] for the **whole** tree under `artifacts_dir`, not only
+/// the artifacts being verified: a pull request that adds
+/// `experimental/decoder/x/1.0.0` while `official/decoder/x/1.0.0` exists
+/// must fail even when CI verifies only the new directory.
+///
+/// Only paths are read, with the same walk and the same rules as
+/// [`discover`] (no symlinks, no hidden entries, known status and kind
+/// directories), and every version directory's path must name a valid
+/// identity. No manifest is opened. The reported pair is the first
+/// duplicate in path order, so it never depends on the filesystem.
+pub fn check_unique_paths(artifacts_dir: &Path) -> Result<(), CommonsError> {
+    let root = artifacts_dir;
+    real_dir(root, crate::config::ARTIFACTS_DIR)?;
+    let mut dirs = Vec::new();
+    walk(root, 0, root, &mut dirs)?;
+    dirs.sort();
+    let mut seen: std::collections::BTreeMap<(Kind, String, Version), PathBuf> =
+        std::collections::BTreeMap::new();
+    for dir in dirs {
+        let label = label_for(&dir, root);
+        let id = path_identity(&dir, root).map_err(|r| manifest_err(&label, FIELD_PATH, r))?;
+        let key = (id.kind, id.name, id.version);
+        if let Some(first) = seen.get(&key) {
+            return Err(manifest_err(
+                &label,
+                FIELD_PATH,
+                format!(
+                    "{}/{}/{} also exists at '{}'; (kind, name, version) must be unique across \
+                     every status, and promotion must move the directory, not copy it",
+                    key.0,
+                    key.1,
+                    key.2,
+                    label_for(first, root)
+                ),
+            ));
+        }
+        seen.insert(key, dir);
+    }
+    Ok(())
+}

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "program_id": "CiUQWNDZ5Rhn2iULcgoHDagk2GFXrLwCDSknUMv5ioCv",
+  "case": "make-offer",
+  "provenance": {
+    "kind": "hand_computed",
+    "reference": "sha256(global:make_offer)[..8], then borsh u64 id, u64 offered, u64 wanted",
+    "note": "offer 1: 1000000 of mint a for 2500000 of mint b"
+  },
+  "instruction_data_hex": "d66261233b0c2cb2010000000000000040420f0000000000a025260000000000",
+  "accounts": [
+    "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+    "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
+    "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
+    "GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq",
+    "LbUiWL3xVV8hTFYBVdbTNrpDo41NKS6o3LHHuDzjfcY"
+  ],
+  "expect": {
+    "result": "decoded",
+    "instruction_type": "make_offer",
+    "data": {
+      "id": 1,
+      "token_a_offered_amount": 1000000,
+      "token_b_wanted_amount": 2500000
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "program_id": "CiUQWNDZ5Rhn2iULcgoHDagk2GFXrLwCDSknUMv5ioCv",
+  "case": "unknown-instruction",
+  "provenance": {
+    "kind": "hand_computed",
+    "reference": "16 bytes starting 0102030405060708, no instruction's discriminator",
+    "note": "an Anchor program the IDL does not describe"
+  },
+  "instruction_data_hex": "0102030405060708090a0b0c0d0e0f10",
+  "accounts": [
+    "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
+  ],
+  "expect": {
+    "result": "not_claimed"
+  }
+}

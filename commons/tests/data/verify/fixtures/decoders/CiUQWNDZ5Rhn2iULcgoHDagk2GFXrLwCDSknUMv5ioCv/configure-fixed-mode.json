@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "program_id": "CiUQWNDZ5Rhn2iULcgoHDagk2GFXrLwCDSknUMv5ioCv",
+  "case": "configure-fixed-mode",
+  "provenance": {
+    "kind": "hand_computed",
+    "reference": "borsh of Config field by field: u16, vec<pubkey>, enum tag 1, option tag 1, u128, i64, bytes, [u8;3], (u8,i16)",
+    "note": "u128 is a decimal string and bytes are base64, as PRISM documents"
+  },
+  "instruction_data_hex": "f5076c755fc436d9fa0001000000090909090909090909090909090909090909090909090909090909090909090901070000000000000001020000006869fffffffffffffffffffffffffffffffffbffffffffffffff03000000010203010203c8d4fe",
+  "accounts": [
+    "cGfHiC6Kgg3FpFZvgwGcswsCRtp4aBP2fzuXRQPizuN"
+  ],
+  "expect": {
+    "result": "decoded",
+    "instruction_type": "configure",
+    "data": {
+      "config": {
+        "fee_bps": 250,
+        "admins": [
+          "cGfHiC6Kgg3FpFZvgwGcswsCRtp4aBP2fzuXRQPizuN"
+        ],
+        "mode": {
+          "Fixed": {
+            "rate": 7
+          }
+        },
+        "memo": "hi",
+        "big": "340282366920938463463374607431768211455",
+        "delta": -5,
+        "payload": "AQID",
+        "limits": [
+          1,
+          2,
+          3
+        ],
+        "pair": [
+          200,
+          -300
+        ]
+      }
+    }
+  }
+}

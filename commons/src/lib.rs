@@ -3,7 +3,7 @@ pub mod config;
 pub mod manifest;
 pub mod fixtures;
 mod publish;
-mod verify;
+pub mod verify;
 
 
 pub fn add(left: u64, right: u64) -> u64 {

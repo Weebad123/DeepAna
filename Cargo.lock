@@ -1751,10 +1751,16 @@ dependencies = [
  "arrow-schema 60.0.0",
  "bs58",
  "clap",
+ "datafusion",
+ "lens",
  "prism",
+ "reqwest",
+ "serde_json",
  "sha2 0.10.9",
+ "sqlparser",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "url",
 ]
 

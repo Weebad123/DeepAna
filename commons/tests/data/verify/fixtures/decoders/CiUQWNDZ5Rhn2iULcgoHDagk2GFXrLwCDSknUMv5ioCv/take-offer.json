@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "program_id": "CiUQWNDZ5Rhn2iULcgoHDagk2GFXrLwCDSknUMv5ioCv",
+  "case": "take-offer",
+  "provenance": {
+    "kind": "hand_computed",
+    "reference": "sha256(global:take_offer)[..8], no arguments",
+    "note": "the discriminator alone"
+  },
+  "instruction_data_hex": "809cf2cfedc067f0",
+  "accounts": [
+    "QWmroo4YnnMqYW3cnxWkFdaTxGD3P7vMSzwMHGbUzwF",
+    "GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq"
+  ],
+  "expect": {
+    "result": "decoded",
+    "instruction_type": "take_offer",
+    "data": {}
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "program_id": "CiUQWNDZ5Rhn2iULcgoHDagk2GFXrLwCDSknUMv5ioCv",
+  "case": "too-short",
+  "provenance": {
+    "kind": "hand_computed",
+    "reference": "3 bytes: shorter than any discriminator",
+    "note": "nothing to look up"
+  },
+  "instruction_data_hex": "0a0b0c",
+  "accounts": [],
+  "expect": {
+    "result": "not_claimed"
+  }
+}

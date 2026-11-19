@@ -168,6 +168,17 @@ impl SplitMix64 {
     fn index(&mut self, n: usize) -> usize {
         self.below(n as u64) as usize
     }
+
+    /// Fisher–Yates, from the last element down: for `i` in
+    /// `(1..len).rev()`, swap `items[i]` with `items[below(i + 1)]`. Exactly
+    /// `len - 1` draws (none for 0 or 1 items), so the permutation is a pure
+    /// function of the state and the length.
+    pub fn shuffle<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            let j = self.index(i + 1);
+            items.swap(i, j);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -659,6 +670,34 @@ mod tests {
         let mut r = SplitMix64::new(3);
         let hits = (0..10_000).filter(|_| r.chance(30)).count();
         assert!((2_700..3_300).contains(&hits), "{hits}");
+    }
+
+    #[test]
+    fn shuffle_is_a_seeded_permutation_with_a_fixed_number_of_draws() {
+        let shuffled = |seed: u64, n: u32| {
+            let mut v: Vec<u32> = (0..n).collect();
+            SplitMix64::new(seed).shuffle(&mut v);
+            v
+        };
+        // Pinned: changing the algorithm changes every row-order invariant.
+        assert_eq!(shuffled(7, 8), [7, 4, 6, 1, 2, 5, 0, 3], "computed outside Rust");
+        assert_eq!(shuffled(7, 8), shuffled(7, 8), "pure");
+        assert_ne!(shuffled(7, 8), shuffled(8, 8), "seeded");
+        let mut sorted = shuffled(1, 1000);
+        sorted.sort();
+        assert_eq!(sorted, (0..1000).collect::<Vec<_>>(), "a permutation");
+        // len - 1 draws.
+        let mut a = SplitMix64::new(5);
+        let mut b = SplitMix64::new(5);
+        a.shuffle(&mut [0u8; 10]);
+        for _ in 0..9 {
+            b.next_u64();
+        }
+        assert_eq!(a, b);
+        let mut c = SplitMix64::new(5);
+        c.shuffle::<u8>(&mut []);
+        c.shuffle(&mut [1u8]);
+        assert_eq!(c, SplitMix64::new(5), "no draws for 0 or 1 items");
     }
 
     #[test]
