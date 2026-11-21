@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepAna</title>
+<style>
+  :root {
+    --bg: #0f1218; --panel: #171b23; --line: #262c38; --text: #d8dde6; --dim: #8a93a3;
+    --green: #3fb950; --amber: #d29922; --red: #f85149; --blue: #58a6ff; --violet: #a371f7;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; }
+  header { display: flex; align-items: baseline; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: .5px; }
+  header .dir { color: var(--dim); font-family: var(--mono); font-size: 12px; }
+  header .conn { margin-left: auto; font-size: 12px; color: var(--dim); }
+  main { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; padding: 14px 20px 30px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0; }
+  .panel h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); display: flex; gap: 8px; align-items: center; }
+  .panel h2 .sub { text-transform: none; letter-spacing: 0; margin-left: auto; font-weight: normal; }
+  .w12 { grid-column: span 12; } .w8 { grid-column: span 8; } .w7 { grid-column: span 7; }
+  .w6 { grid-column: span 6; } .w5 { grid-column: span 5; } .w4 { grid-column: span 4; }
+  @media (max-width: 1100px) { .w8, .w7, .w6, .w5, .w4 { grid-column: span 12; } }
+
+  .strip { display: flex; align-items: stretch; gap: 0; }
+  .stage { flex: 1; display: flex; flex-direction: column; gap: 4px; padding: 6px 12px; border-right: 1px solid var(--line); }
+  .stage:last-child { border-right: 0; }
+  .stage .name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .stage .detail { color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
+  .slot { flex: 1.3; }
+  .slot .big { font: 600 28px/1.1 var(--mono); color: var(--blue); }
+  .light { width: 11px; height: 11px; border-radius: 50%; background: #444; box-shadow: 0 0 0 2px #0003; flex: none; }
+  .light.ok { background: var(--green); } .light.warn { background: var(--amber); } .light.bad { background: var(--red); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-weight: 500; border-bottom: 1px solid var(--line); padding: 4px 6px; white-space: nowrap; }
+  td { border-bottom: 1px solid #1f2430; padding: 4px 6px; vertical-align: top; }
+  td.num, th.num { text-align: right; font-family: var(--mono); }
+  td.mono { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  .scroll { max-height: 340px; overflow: auto; }
+  .empty { color: var(--dim); font-style: italic; padding: 6px 0; }
+
+  .tag { display: inline-block; padding: 0 6px; border-radius: 4px; font: 600 11px/18px var(--mono); text-transform: uppercase; }
+  .tag.new { background: #1f6feb33; color: var(--blue); }
+  .tag.skip { background: #d2992233; color: var(--amber); }
+  .tag.final { background: #3fb95033; color: var(--green); }
+  .tag.pass, .tag.delivered, .tag.healthy, .tag.matched { background: #3fb95033; color: var(--green); }
+  .tag.warn, .tag.pending, .tag.held, .tag.degraded, .tag.incomplete, .tag.ambiguous { background: #d2992233; color: var(--amber); }
+  .tag.fail, .tag.failed, .tag.error, .tag.unhealthy, .tag.rejected, .tag.no_match { background: #f8514933; color: var(--red); }
+  .filters { display: flex; gap: 10px; font-size: 12px; color: var(--dim); }
+  .filters label { cursor: pointer; }
+
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; }
+  .kv dt { color: var(--dim); } .kv dd { margin: 0; font-family: var(--mono); }
+  .counts { display: flex; gap: 18px; margin: 4px 0 10px; }
+  .counts div { display: flex; flex-direction: column; }
+  .counts b { font: 600 20px var(--mono); } .counts span { color: var(--dim); font-size: 12px; }
+  ul.headline { margin: 0; padding-left: 18px; } ul.headline li { margin: 3px 0; }
+
+  form.ask { display: flex; gap: 8px; }
+  input[type=text], textarea { flex: 1; background: #0d1016; border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 8px 10px; font: inherit; }
+  textarea { font-family: var(--mono); font-size: 12px; min-height: 60px; width: 100%; }
+  button { background: #238636; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; font: inherit; cursor: pointer; }
+  button.secondary { background: #30363d; }
+  button:disabled { opacity: .5; cursor: default; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .chip { background: #21262d; border: 1px solid var(--line); color: var(--text); border-radius: 14px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+  .chip:hover { border-color: var(--blue); }
+  .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .tabs button { background: transparent; color: var(--dim); padding: 4px 10px; border: 1px solid transparent; }
+  .tabs button.active { color: var(--text); border-color: var(--line); background: #21262d; }
+  .answer { margin-top: 10px; }
+  .answer .meta { color: var(--dim); font-size: 12px; margin: 6px 0; }
+  .answer .understood { font-weight: 600; }
+  .error { color: var(--red); }
+  details summary { cursor: pointer; color: var(--dim); font-size: 12px; }
+  pre { white-space: pre-wrap; font: 12px var(--mono); color: var(--dim); margin: 6px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>DeepAna</h1>
+  <span class="dir" id="data-dir"></span>
+  <span class="conn" id="conn">connecting…</span>
+</header>
+<main>
+  <!-- Pipeline strip -->
+  <section class="panel w12">
+    <div class="strip">
+      <div class="stage"><div class="name"><span class="light" id="l-prism"></span>PRISM</div><div class="detail" id="d-prism">waiting for the change log</div></div>
+      <div class="stage"><div class="name"><span class="light" id="l-lens"></span>LENS</div><div class="detail" id="d-lens">–</div></div>
+      <div class="stage"><div class="name"><span class="light" id="l-forge"></span>FORGE</div><div class="detail" id="d-forge">–</div></div>
+      <div class="stage"><div class="name"><span class="light" id="l-oracle"></span>ORACLE</div><div class="detail" id="d-oracle">–</div></div>
+      <div class="stage slot"><div class="detail">newest slot in LENS</div><div class="big" id="newest-slot">–</div><div class="detail" id="slot-sub"></div></div>
+    </div>
+  </section>
+
+  <!-- Ask ORACLE -->
+  <section class="panel w7">
+    <h2>Ask ORACLE <span class="sub" id="ask-status"></span></h2>
+    <div class="tabs">
+      <button class="active" data-tab="ask">Question</button>
+      <button data-tab="sql">SQL (LENS)</button>
+    </div>
+    <div id="tab-ask">
+      <form class="ask" id="ask-form">
+        <input type="text" id="ask-input" placeholder="e.g. top 10 mints by transfers in the last hour" autocomplete="off">
+        <button type="submit" id="ask-btn">Ask</button>
+      </form>
+      <div class="chips" id="ask-chips"></div>
+    </div>
+    <div id="tab-sql" hidden>
+      <textarea id="sql-input" spellcheck="false"></textarea>
+      <div class="chips" id="sql-chips"></div>
+      <button id="sql-btn">Run on LENS</button>
+    </div>
+    <div class="answer" id="answer"></div>
+  </section>
+
+  <!-- Changelog feed -->
+  <section class="panel w5">
+    <h2>Live change log
+      <span class="sub filters">
+        <label><input type="checkbox" data-kind="new" checked> New</label>
+        <label><input type="checkbox" data-kind="skip" checked> Skip</label>
+        <label><input type="checkbox" data-kind="final" checked> Final</label>
+      </span>
+    </h2>
+    <div class="counts" id="prism-counts"></div>
+    <div class="scroll"><table><thead><tr><th>#</th><th>event</th><th class="num">slot</th><th>detail</th><th>time</th></tr></thead><tbody id="feed"></tbody></table></div>
+  </section>
+
+  <!-- LENS -->
+  <section class="panel w4">
+    <h2>LENS tables <span class="sub" id="lens-sub"></span></h2>
+    <table><thead><tr><th>table</th><th class="num">files</th><th>registered</th></tr></thead><tbody id="lens-tables"></tbody></table>
+    <dl class="kv" id="lens-kv" style="margin-top:10px"></dl>
+  </section>
+
+  <!-- FORGE -->
+  <section class="panel w8">
+    <h2>FORGE alerts and deliveries <span class="sub" id="forge-sub"></span></h2>
+    <div class="counts" id="outbox"></div>
+    <table><thead><tr><th>alert</th><th>enabled</th><th class="num">last evaluated slot</th><th>webhook</th></tr></thead><tbody id="alerts"></tbody></table>
+    <h2 style="margin-top:12px">Recent deliveries</h2>
+    <div class="scroll" style="max-height:200px"><table><thead><tr><th>status</th><th>alert</th><th class="num">to slot</th><th class="num">attempts</th><th>last error</th><th>created</th></tr></thead><tbody id="deliveries"></tbody></table></div>
+  </section>
+
+  <!-- ORACLE anomalies -->
+  <section class="panel w7">
+    <h2>ORACLE anomalies <span class="sub" id="anom-sub"></span></h2>
+    <div class="scroll"><table><thead><tr><th>metric</th><th>subject</th><th>kind</th><th class="num">score</th><th class="num">value</th><th class="num">baseline</th><th class="num">slots</th><th>detected</th></tr></thead><tbody id="anomalies"></tbody></table></div>
+  </section>
+
+  <!-- Digest + quality -->
+  <section class="panel w5">
+    <h2>Digest <span class="sub" id="digest-sub"></span></h2>
+    <div id="digest"><div class="empty">no digest yet: ORACLE builds one once a full window of data is in</div></div>
+    <h2 style="margin-top:14px">Data quality <span class="sub" id="quality-sub"></span></h2>
+    <div id="quality"><div class="empty">–</div></div>
+  </section>
+
+  <!-- COMMONS -->
+  <section class="panel w12">
+    <h2>COMMONS verify report <span class="sub"><button class="secondary" id="verify-btn">Run verify</button></span></h2>
+    <div id="commons"><div class="empty">verify has not run yet</div></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const num = (v) => (v === null || v === undefined || v === "") ? "–" : (typeof v === "number" ? v.toLocaleString() : esc(v));
+const fixed = (v, d = 2) => (typeof v === "number") ? v.toFixed(d) : "–";
+const short = (s, n = 10) => { s = String(s ?? ""); return s.length > 2 * n + 1 ? s.slice(0, n) + "…" + s.slice(-n) : s; };
+const ago = (secs) => {
+  if (!secs) return "–";
+  const d = Math.max(0, Math.round(Date.now() / 1000 - secs));
+  return d < 60 ? d + "s ago" : d < 3600 ? Math.round(d / 60) + "m ago" : Math.round(d / 3600) + "h ago";
+};
+const tag = (t) => `<span class="tag ${esc(String(t).toLowerCase())}">${esc(t)}</span>`;
+const light = (id, cls) => { $(id).className = "light " + (cls || ""); };
+const statusClass = (s) => s === "healthy" ? "ok" : s === "degraded" ? "warn" : s ? "bad" : "";
+
+const state = { feed: [], prism: null, status: null, anomalies: [], digest: null, commons: null, seen: new Set() };
+const filters = { new: true, skip: true, final: true };
+
+// ---- SSE ------------------------------------------------------------------
+function connect() {
+  const es = new EventSource("/api/stream");
+  es.onopen = () => { $("conn").textContent = "live"; $("conn").style.color = "var(--green)"; };
+  es.onerror = () => { $("conn").textContent = "reconnecting…"; $("conn").style.color = "var(--amber)"; };
+  es.addEventListener("snapshot", (e) => {
+    const s = JSON.parse(e.data);
+    $("data-dir").textContent = s.data_dir;
+    state.feed = []; state.seen = new Set();
+    addEvents(s.changelog || []);
+    state.prism = s.prism; state.status = s.status; state.anomalies = s.anomalies || [];
+    state.digest = s.digest; state.commons = s.commons;
+    renderAll();
+  });
+  es.addEventListener("changelog", (e) => { const d = JSON.parse(e.data); addEvents(d.events); state.prism = d.prism; renderFeed(); renderPrism(); });
+  es.addEventListener("status", (e) => { state.status = JSON.parse(e.data); renderStatus(); renderPrism(); });
+  es.addEventListener("anomalies", (e) => {
+    const fresh = JSON.parse(e.data).anomalies || [];
+    state.anomalies = fresh.concat(state.anomalies).slice(0, 50); renderAnomalies();
+  });
+  es.addEventListener("digest", (e) => { state.digest = JSON.parse(e.data); renderDigest(); });
+  es.addEventListener("commons", (e) => { state.commons = JSON.parse(e.data); renderCommons(); });
+}
+function addEvents(events) {
+  for (const ev of events) {
+    const key = ev.id ?? JSON.stringify(ev);
+    if (state.seen.has(key)) continue;
+    state.seen.add(key); state.feed.push(ev);
+  }
+  while (state.feed.length > 200) state.seen.delete(state.feed.shift().id);
+}
+
+// ---- Rendering ------------------------------------------------------------
+function renderAll() { renderPrism(); renderFeed(); renderStatus(); renderAnomalies(); renderDigest(); renderCommons(); }
+
+function renderPrism() {
+  const p = state.prism;
+  if (!p || !p.last_event_at) { light("l-prism", ""); $("d-prism").textContent = "no change log events yet"; }
+  else {
+    const age = Date.now() / 1000 - p.last_event_at;
+    light("l-prism", age < 30 ? "ok" : age < 120 ? "warn" : "bad");
+    $("d-prism").textContent = `last event ${ago(p.last_event_at)} · slot ${num(p.last_new_slot)}`;
+  }
+  $("prism-counts").innerHTML = p ? [
+    ["New", p.new_events], ["Skip", p.skip_events], ["Final", p.final_events], ["finalized ≤", p.last_final_slot],
+  ].map(([k, v]) => `<div><b>${num(v)}</b><span>${k}</span></div>`).join("") : "";
+}
+
+function renderFeed() {
+  const rows = state.feed.filter((e) => filters[e.event]).slice(-200).reverse();
+  $("feed").innerHTML = rows.length ? rows.map((e) => {
+    let detail = "";
+    if (e.event === "new") detail = `${num(e.transaction_count)} txs · ${num(e.files)} files`;
+    else if (e.event === "skip") detail = esc(e.reason);
+    else if (e.event === "final") detail = `from ${num(e.previous_slot)}`;
+    return `<tr><td class="num">${num(e.id)}</td><td>${tag(e.event)}</td><td class="num">${num(e.slot)}</td><td>${detail}</td><td>${ago(e.emitted_at)}</td></tr>`;
+  }).join("") : `<tr><td colspan="5" class="empty">no events yet: PRISM writes its first ones on its first flush (about 10 s after it starts)</td></tr>`;
+}
+
+function renderStatus() {
+  const s = state.status;
+  if (!s) return;
+  // LENS
+  const lh = s.lens.health || {};
+  light("l-lens", lh.error ? "bad" : statusClass(lh.status));
+  $("d-lens").textContent = lh.error ? lh.error : `${lh.status} · ${num(lh.engine?.total_queries)} queries`;
+  $("newest-slot").textContent = s.lens.newest_slot != null ? s.lens.newest_slot.toLocaleString() : "–";
+  $("slot-sub").textContent = s.lens.newest_slot_error ? s.lens.newest_slot_error : (s.lens.newest_slot == null ? "no rows yet" : "MAX(slot) in solana.slots");
+  const tables = lh.tables || {};
+  $("lens-tables").innerHTML = Object.keys(tables).length ? Object.entries(tables).map(([name, t]) =>
+    `<tr><td class="mono">${esc(name)}</td><td class="num">${num(t.file_count)}</td><td>${t.registered ? tag("pass") : (t.dir_exists ? tag("fail") : "–")}</td></tr>`).join("")
+    : `<tr><td colspan="3" class="empty">${esc(lh.error || "–")}</td></tr>`;
+  $("lens-sub").textContent = lh.status || "";
+  $("lens-kv").innerHTML = lh.catalog ? [
+    ["catalog refreshes", lh.catalog.total_refreshes], ["last refresh", (lh.catalog.last_refresh_duration_ms ?? "–") + " ms"],
+    ["queries ok / failed", `${num(lh.engine?.successful_queries)} / ${num(lh.engine?.failed_queries)}`],
+    ["p50 / p99", `${num(lh.engine?.p50_duration_ms)} / ${num(lh.engine?.p99_duration_ms)} ms`], ["uptime", (lh.uptime_secs ?? "–") + " s"],
+  ].map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("") : "";
+
+  // FORGE
+  const fh = s.forge.health || {};
+  light("l-forge", fh.error ? "bad" : statusClass(fh.status));
+  $("d-forge").textContent = fh.error ? fh.error : `${fh.status} · ${num(fh.engine?.events_processed)} events · ${num(fh.changelog?.bytes_behind)} B behind`;
+  $("forge-sub").textContent = (fh.reasons || []).join("; ");
+  const ob = fh.outbox;
+  $("outbox").innerHTML = ob ? [["held", ob.held], ["pending", ob.pending], ["delivered", ob.delivered], ["failed", ob.failed]]
+    .map(([k, v]) => `<div><b>${num(v)}</b><span>${k}</span></div>`).join("") : "";
+  const alerts = s.forge.alerts?.alerts || [];
+  const names = Object.fromEntries(alerts.map((a) => [a.id, a.name]));
+  $("alerts").innerHTML = alerts.length ? alerts.map((a) =>
+    `<tr><td>${esc(a.name)}</td><td>${a.enabled ? tag("pass") : tag("held")}</td><td class="num">${num(a.last_evaluated_slot)}</td><td class="mono">${esc(a.webhook_url)}</td></tr>`).join("")
+    : `<tr><td colspan="4" class="empty">${esc(s.forge.alerts?.error || "no alerts: create one with POST /api/forge/alerts")}</td></tr>`;
+  const ds = s.forge.deliveries || [];
+  $("deliveries").innerHTML = ds.length ? ds.map((d) =>
+    `<tr><td>${tag(d.status)}</td><td>${esc(names[d.alert_id] || short(d.alert_id, 6))}</td><td class="num">${num(d.to_slot)}</td><td class="num">${num(d.attempts)}</td><td>${esc(d.last_error || "")}</td><td>${ago(d.created_at / 1000)}</td></tr>`).join("")
+    : `<tr><td colspan="6" class="empty">no deliveries yet</td></tr>`;
+
+  // ORACLE
+  const oh = s.oracle.health || {};
+  light("l-oracle", oh.error ? "bad" : statusClass(oh.status));
+  $("d-oracle").textContent = oh.error ? oh.error : `${oh.status} · ${num(oh.store?.anomalies)} anomalies · ${num(oh.store?.digests)} digests`;
+  renderQuality();
+}
+
+function renderAnomalies() {
+  const rows = state.anomalies;
+  $("anom-sub").textContent = rows.length ? `${rows.length} newest` : "";
+  $("anomalies").innerHTML = rows.length ? rows.map((a) =>
+    `<tr><td class="mono">${esc(a.metric)}</td><td class="mono" title="${esc(a.subject)}">${esc(short(a.subject) || "(global)")}</td><td>${tag(a.kind)}</td>
+     <td class="num">${fixed(a.score)}</td><td class="num">${fixed(a.value, 0)}</td><td class="num">${fixed(a.baseline, 1)}</td>
+     <td class="num">${num(a.start_slot)}–${num(a.end_slot)}</td><td>${ago(a.detected_at / 1000)}</td></tr>`).join("")
+    : `<tr><td colspan="8" class="empty">no anomalies: detectors need a baseline of several buckets before they score anything</td></tr>`;
+}
+
+function renderDigest() {
+  const d = state.digest;
+  if (!d || !d.body) return;
+  const b = d.body;
+  $("digest-sub").textContent = `slots ${num(d.start_slot)}–${num(d.end_slot)}${b.provisional ? " · provisional" : ""}`;
+  $("digest").innerHTML = `<ul class="headline">${(b.headline || []).map((h) => `<li>${esc(h)}</li>`).join("")}</ul>`;
+  renderQuality();
+}
+
+function renderQuality() {
+  const q = state.status?.oracle?.health?.quality;
+  const issues = state.digest?.body?.quality?.issues || [];
+  if (!q) return;
+  $("quality-sub").innerHTML = q.overall ? tag(q.overall) : "";
+  $("quality").innerHTML = `<dl class="kv">
+      <dt>available</dt><dd>${q.available ? "yes" : "no"}</dd>
+      <dt>overall</dt><dd>${esc(q.overall || "–")}</dd>
+      <dt>as of slot</dt><dd>${num(q.as_of_slot)}</dd>
+      <dt>age</dt><dd>${q.age_secs != null ? q.age_secs + " s" : "–"}</dd></dl>` +
+    (issues.length ? `<ul class="headline" style="margin-top:6px">${issues.map((i) => `<li>${tag(i.status || "warn")} ${esc(i.id)} · ${num(i.violations)} violations</li>`).join("")}</ul>` : "");
+}
+
+function renderCommons() {
+  const c = state.commons;
+  if (!c) return;
+  if (!c.ok) { $("commons").innerHTML = `<div class="error">${esc(c.error)}</div><div class="meta">${ago(c.ran_at)}</div>`; return; }
+  const r = c.report;
+  const arts = r.artifacts || [];
+  $("commons").innerHTML = `<div class="counts">
+      <div><b>${tag(r.overall)}</b><span>overall</span></div>
+      <div><b>${arts.length}</b><span>artifacts</span></div>
+      <div><b>${arts.filter((a) => a.verdict === "pass").length}</b><span>passed</span></div>
+      <div><b>${arts.filter((a) => a.verdict !== "pass").length}</b><span>not passed</span></div>
+      <div><b>${num(c.duration_ms)}</b><span>ms · ${ago(c.ran_at)}</span></div></div>
+    <table><thead><tr><th>verdict</th><th>artifact</th><th>kind</th><th>stages</th><th>failed checks</th></tr></thead><tbody>
+    ${arts.map((a) => {
+      const failed = (a.stages || []).flatMap((s) => (s.checks || []).filter((k) => k.status !== "pass" && k.status !== "skip").map((k) => `${s.stage}: ${k.id} ${k.detail}`));
+      return `<tr><td>${tag(a.verdict)}</td><td class="mono">${esc(a.label)}</td><td>${esc(a.kind)}</td>
+        <td>${(a.stages || []).map((s) => `${esc(s.stage)} ${tag(s.status)}`).join(" ")}</td>
+        <td>${failed.length ? failed.map((f) => `<div>${esc(f)}</div>`).join("") : "–"}</td></tr>`;
+    }).join("")}</tbody></table>
+    <div class="meta" style="color:var(--dim);font-size:12px;margin-top:6px">repo ${esc(c.repo_root)} · verifier ${esc(r.verifier_version)} · fixtures ${esc(short(r.fixture_set_hash, 8))}</div>`;
+}
+
+// ---- Ask ORACLE / SQL -----------------------------------------------------
+const QUESTIONS = [
+  "top 10 mints by transfers in the last hour",
+  "mints by transfer volume",
+  "busiest programs",
+  "transactions by status",
+  "how many distinct mints",
+];
+const SQLS = {
+  "Top 10 mints (all data)": "SELECT mint_token_address AS mint, COUNT(*) AS transfers, COUNT(DISTINCT tx_signature) AS transactions,\n       MIN(slot) AS first_slot, MAX(slot) AS last_slot\nFROM solana.token_transfers\nWHERE mint_token_address IS NOT NULL\nGROUP BY mint_token_address\nORDER BY transfers DESC\nLIMIT 10",
+  "Newest slots": "SELECT slot, transaction_count, block_time FROM solana.slots ORDER BY slot DESC LIMIT 10",
+};
+$("ask-chips").innerHTML = QUESTIONS.map((q) => `<button class="chip" type="button">${esc(q)}</button>`).join("");
+$("sql-chips").innerHTML = Object.keys(SQLS).map((k) => `<button class="chip" type="button">${esc(k)}</button>`).join("");
+$("sql-input").value = SQLS["Top 10 mints (all data)"];
+$("ask-chips").addEventListener("click", (e) => { if (e.target.matches(".chip")) { $("ask-input").value = e.target.textContent; ask(); } });
+$("sql-chips").addEventListener("click", (e) => { if (e.target.matches(".chip")) { $("sql-input").value = SQLS[e.target.textContent]; runSql(); } });
+$("ask-form").addEventListener("submit", (e) => { e.preventDefault(); ask(); });
+$("sql-btn").addEventListener("click", runSql);
+document.querySelectorAll(".tabs button").forEach((b) => b.addEventListener("click", () => {
+  document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("active", x === b));
+  $("tab-ask").hidden = b.dataset.tab !== "ask"; $("tab-sql").hidden = b.dataset.tab !== "sql";
+}));
+document.querySelectorAll(".filters input").forEach((c) => c.addEventListener("change", () => { filters[c.dataset.kind] = c.checked; renderFeed(); }));
+
+async function postJson(url, body) {
+  const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  return { ok: res.ok, status: res.status, data };
+}
+
+function resultTable(columns, rows) {
+  if (!rows.length) return `<div class="empty">no rows</div>`;
+  return `<div class="scroll"><table><thead><tr><th class="num">#</th>${columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${
+    rows.map((r, i) => `<tr><td class="num">${i + 1}</td>${r.map((v) => typeof v === "number" ? `<td class="num">${v.toLocaleString()}</td>` : `<td class="mono">${esc(v ?? "∅")}</td>`).join("")}</tr>`).join("")
+  }</tbody></table></div>`;
+}
+
+async function ask() {
+  const question = $("ask-input").value.trim();
+  if (!question) return;
+  $("ask-btn").disabled = true; $("ask-status").textContent = "asking…";
+  try {
+    const { ok, status, data } = await postJson("/api/oracle/ask", { question });
+    $("answer").innerHTML = ok ? renderAnswer(data) : `<div class="error">${esc(data?.error || "HTTP " + status)}</div>`;
+  } catch (err) { $("answer").innerHTML = `<div class="error">${esc(err)}</div>`; }
+  $("ask-btn").disabled = false; $("ask-status").textContent = "";
+}
+
+function renderAnswer(d) {
+  const head = `<div>${tag(d.outcome)} ${d.understood_as ? `<span class="understood">${esc(d.understood_as)}</span>` : ""}</div>`;
+  if (d.outcome === "matched") {
+    const a = d.answer;
+    const assumptions = (d.assumptions || []).length ? `<div class="meta">assuming: ${d.assumptions.map(esc).join(" · ")}</div>` : "";
+    if (!a) return head + assumptions;
+    const cols = a.columns.map((c) => c.name || c.id || c.label || JSON.stringify(c));
+    return head + assumptions + `<div class="meta">slots ${num(a.window?.start_slot)}–${num(a.window?.end_slot)} · as of slot ${num(a.as_of_slot)} · ${num(a.duration_ms)} ms${a.has_more ? " · more rows exist" : ""}</div>` +
+      resultTable(cols, a.rows) + (a.warnings?.length ? `<div class="meta">${a.warnings.map(esc).join("<br>")}</div>` : "") +
+      `<details><summary>SQL</summary><pre>${esc(a.sql)}</pre></details>`;
+  }
+  if (d.outcome === "ambiguous") {
+    return head + `<div class="meta">Did you mean:</div><div class="chips">${(d.candidates || []).map((c) =>
+      `<button class="chip" type="button" onclick="document.getElementById('ask-input').value=this.textContent;ask()">${esc(c.understood_as)}</button>`).join("")}</div>`;
+  }
+  const sugg = (d.suggestions || []).length ? `<div class="meta">Try:</div><div class="chips">${d.suggestions.map((s) =>
+    `<button class="chip" type="button" onclick="document.getElementById('ask-input').value=this.textContent;ask()">${esc(s)}</button>`).join("")}</div>` : "";
+  return head + `<div>${esc(d.message || "")}</div>${d.hint ? `<div class="meta">${esc(d.hint)}</div>` : ""}` + sugg;
+}
+
+async function runSql() {
+  const sql = $("sql-input").value.trim();
+  if (!sql) return;
+  $("sql-btn").disabled = true; $("ask-status").textContent = "running…";
+  try {
+    const { ok, status, data } = await postJson("/api/lens/query", { sql });
+    if (!ok) $("answer").innerHTML = `<div class="error">${esc(data?.error || "HTTP " + status)}</div>`;
+    else {
+      const rows = data.rows || [];
+      const cols = rows.length ? Object.keys(rows[0]) : [];
+      $("answer").innerHTML = `<div class="meta">${num(data.row_count)} rows · ${num(data.duration_ms)} ms${data.truncated ? " · truncated" : ""}</div>` +
+        resultTable(cols, rows.map((r) => cols.map((c) => r[c])));
+    }
+  } catch (err) { $("answer").innerHTML = `<div class="error">${esc(err)}</div>`; }
+  $("sql-btn").disabled = false; $("ask-status").textContent = "";
+}
+
+// ---- COMMONS --------------------------------------------------------------
+$("verify-btn").addEventListener("click", async () => {
+  $("verify-btn").disabled = true; $("verify-btn").textContent = "Verifying…";
+  try {
+    const { data } = await postJson("/api/commons/verify", {});
+    if (data) { state.commons = data; renderCommons(); }
+  } catch (err) { $("commons").innerHTML = `<div class="error">${esc(err)}</div>`; }
+  $("verify-btn").disabled = false; $("verify-btn").textContent = "Run verify";
+});
+
+setInterval(() => { renderPrism(); }, 5000);
+connect();
+</script>
+</body>
+</html>

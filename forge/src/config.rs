@@ -55,6 +55,7 @@
 //! | `lens_client/`      | [`LensClientError`]              |
 //! | `registry/`         | [`RegistryError`]                |
 //! | `webhook/`          | [`WebhookError`]                 |
+//! | `service.rs`        | [`TaskFailed`]                   |
 //!
 //! As in PRISM and LENS, there are deliberately no blanket `From`
 //! conversions: a bare `?` could not supply the context each variant needs.
@@ -74,6 +75,7 @@
 //! [`RegistryError`]: ForgeError::RegistryError
 //! [`WebhookError`]: ForgeError::WebhookError
 //! [`IoError`]: ForgeError::IoError
+//! [`TaskFailed`]: ForgeError::TaskFailed
 
 use std::ffi::OsString;
 use std::fmt::Display;
@@ -631,6 +633,16 @@ pub enum ForgeError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
+
+    /// A background task of a running [`crate::Forge`] panicked or ended
+    /// while FORGE was meant to be running.
+    #[error("task {task} failed: {reason}")]
+    TaskFailed {
+        /// The task's name: `"alert_engine"`.
+        task: String,
+        /// What happened to it.
+        reason: String,
+    },
 }
 
 impl ForgeError {
@@ -682,6 +694,11 @@ impl ForgeError {
         }
     }
 
+    /// Build a [`ForgeError::TaskFailed`].
+    pub fn task_failed(task: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::TaskFailed { task: task.into(), reason: reason.into() }
+    }
+
     /// Stable `snake_case` name of the variant, for logs and metric labels.
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -691,6 +708,7 @@ impl ForgeError {
             Self::RegistryError { .. } => "registry_error",
             Self::WebhookError { .. } => "webhook_error",
             Self::IoError { .. } => "io_error",
+            Self::TaskFailed { .. } => "task_failed",
         }
     }
 

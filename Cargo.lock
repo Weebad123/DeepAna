@@ -2846,6 +2846,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepana"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "commons",
+ "forge",
+ "futures-util",
+ "http-body-util",
+ "lens",
+ "oracle",
+ "prism",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"

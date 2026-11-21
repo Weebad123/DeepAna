@@ -3,13 +3,15 @@
 //! until Ctrl-C or SIGTERM.
 //!
 //! ```text
-//!   config ─► tracing ─► Registry::open (takes the lock) ─► CheckpointStore + ChangelogReader::open
-//!     ─► LensClient ─► WebhookService::start ─► AlertEngine (handle taken, run spawned)
-//!     ─► release_final(committed Final slot) ─► api::serve
-//!                                                   │ Ctrl-C / SIGTERM, or the engine stops
+//!   config ─► tracing ─► forge::start (registry, change log, LENS client,
+//!     webhook dispatcher, alert engine) ─► bind ─► axum::serve(forge.router())
+//!                                                   │ Ctrl-C / SIGTERM, or FORGE stops
 //!                                                   ▼
-//!       drop the registry (releases the lock) ◄── await both ◄── cancel the engine, stop the dispatcher
+//!       drop the registry (releases the lock) ◄── forge.wait() ◄── cancel the token
 //! ```
+//!
+//! Everything but binding and serving lives in the library; see
+//! `forge::start`.
 //!
 //! Every variable is read from the environment; see `forge::config`. A
 //! config error is reported on stderr before tracing is set up, since the
@@ -18,19 +20,16 @@
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::sync::Arc;
 
-use forge::{
-    AlertEngine, AppState, ChangelogReader, CheckpointStore, ForgeConfig, LensApi, LensClient, Registry,
-    WebhookService,
-};
+use forge::{ForgeConfig, ForgeError};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let config = match ForgeConfig::load() {
-        Ok(config) => Arc::new(config),
+        Ok(config) => config,
         Err(err) => {
             eprintln!("forge: {err}");
             return ExitCode::FAILURE;
@@ -53,62 +52,53 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(config: Arc<ForgeConfig>) -> forge::ForgeResult<()> {
-    // Held until the end of this function: dropping it releases the lock.
-    let registry = Arc::new(Registry::open(&config)?);
-    let reader = ChangelogReader::open(&config, CheckpointStore::for_config(&config))?;
-    let committed_final = reader.highest_final_slot();
-    let lens: Arc<dyn LensApi> = Arc::new(LensClient::new(&config)?);
-    let webhook = Arc::new(WebhookService::start(&config, registry.db().clone())?);
-
-    let engine = AlertEngine::new(registry.clone(), reader, lens.clone(), webhook.clone(), &config)?;
-    let handle = engine.handle();
-    let cancel = CancellationToken::new();
-    let engine_task = tokio::spawn({
-        let cancel = cancel.clone();
-        async move { engine.run(cancel).await }
-    });
-
-    // Deliveries held for slots the committed change log already finalized,
-    // in case the last run stopped between the two.
-    if committed_final > 0 {
-        match webhook.release_final(committed_final) {
-            Ok(released) => tracing::info!(final_slot = committed_final, released, "released held deliveries"),
-            Err(err) => tracing::warn!(final_slot = committed_final, error = %err, "cannot release held deliveries"),
+async fn run(config: ForgeConfig) -> forge::ForgeResult<()> {
+    let addr = config.socket_addr();
+    let lens_url = config.lens_url().to_owned();
+    let token = CancellationToken::new();
+    let forge = forge::start(config, token.clone()).await?;
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            token.cancel();
+            let _ = forge.wait().await;
+            return Err(ForgeError::io(format!("bind address {addr}"), err));
         }
-    }
+    };
+    tracing::info!(
+        address = %addr,
+        lens_url,
+        max_body_bytes = forge::MAX_BODY_BYTES,
+        request_timeout_secs = forge::API_REQUEST_TIMEOUT.as_secs(),
+        "FORGE listening"
+    );
 
-    let state = AppState::new(registry.clone(), lens, webhook.clone(), handle, config);
-    // Stop serving on a signal, and also if the engine stops on its own: a
-    // FORGE that answers requests but evaluates no alerts would look healthy.
+    // Stop serving on a signal, and also if FORGE stops on its own: a FORGE
+    // that answers requests but evaluates no alerts would look healthy.
     let stop = {
-        let cancel = cancel.clone();
+        let token = token.clone();
         async move {
             tokio::select! {
-                () = forge::shutdown_signal() => {}
-                () = cancel.cancelled() => {}
+                () = forge::shutdown_signal() => tracing::info!("shutdown signal received; draining requests"),
+                () = token.cancelled() => {}
             }
         }
     };
-    let engine_watch = tokio::spawn({
-        let cancel = cancel.clone();
-        async move {
-            let result = engine_task.await;
-            cancel.cancel();
-            result
-        }
+    let router = forge.router();
+    let serve = async {
+        let served = axum::serve(listener, router).with_graceful_shutdown(stop).await;
+        token.cancel();
+        served
+    };
+    let (served, ()) = tokio::join!(serve, async {
+        forge.stopped().await;
+        token.cancel();
     });
-    let served = forge::serve(state, stop).await;
 
-    cancel.cancel();
-    webhook.shutdown().await;
-    match engine_watch.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => tracing::error!(error = %err, "alert engine task panicked"),
-        Err(err) => tracing::error!(error = %err, "alert engine watcher panicked"),
-    }
-    drop(webhook);
-    drop(registry);
-    tracing::info!("FORGE stopped");
-    served
+    token.cancel();
+    // Consumes the handle: with the router already dropped by `serve`, this
+    // releases the registry lock.
+    let stopped = forge.wait().await;
+    // A task failure is the root cause of a serve error that follows it.
+    stopped.and(served.map_err(|err| ForgeError::io(format!("serving on {addr}"), err)))
 }

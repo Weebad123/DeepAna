@@ -257,7 +257,9 @@ pub fn status_for(err: &LensError) -> StatusCode {
         LensError::SerializationError { .. }
         | LensError::CatalogError { .. }
         | LensError::IoError { .. }
-        | LensError::ConfigError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        | LensError::ConfigError { .. }
+        | LensError::PrismError { .. }
+        | LensError::TaskFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

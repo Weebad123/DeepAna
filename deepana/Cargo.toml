@@ -1,0 +1,33 @@
+[package]
+name = "deepana"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The four services, run in this one process.
+lens = { path = "../lens" }
+forge = { path = "../forge" }
+oracle = { path = "../oracle" }
+# The COMMONS panel runs `commons verify` in-process.
+commons = { path = "../commons" }
+# One HTTP server: the dashboard, the nested service routers and the SSE
+# stream. `tower`'s `util` drives those routers in-process from the poller.
+axum.workspace = true
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs", "io-util"] }
+tokio-util.workspace = true
+# The SSE body stream. Already in the build through DataFusion and reqwest.
+futures-util = "0.3.34"
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# The end-to-end test writes real Parquet into <DIR> with PRISM's writer,
+# and checks the layout against PRISM's own file names.
+prism = { path = "../prism" }
+tempfile.workspace = true
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }

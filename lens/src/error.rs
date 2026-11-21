@@ -10,6 +10,7 @@
 //! | `catalog/`        | [`CatalogError`], [`IoError`]                                    |
 //! | `engine/`         | [`QueryPlanError`], [`QueryExecutionError`], [`QueryTimeout`]    |
 //! | `result/`         | [`SerializationError`]                                           |
+//! | `service.rs`      | [`PrismError`], [`TaskFailed`]                                   |
 //!
 //! As in PRISM, there are deliberately no blanket `From` conversions: a bare
 //! `?` could not supply the context each variant needs. Use the constructors
@@ -30,6 +31,8 @@
 //! [`QueryExecutionError`]: LensError::QueryExecutionError
 //! [`SerializationError`]: LensError::SerializationError
 //! [`IoError`]: LensError::IoError
+//! [`PrismError`]: LensError::PrismError
+//! [`TaskFailed`]: LensError::TaskFailed
 
 use thiserror::Error;
 
@@ -105,6 +108,26 @@ pub enum LensError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
+
+    /// PRISM, run in-process by [`crate::start`], could not be built or
+    /// stopped with an error.
+    #[error("PRISM {operation} failed: {source}")]
+    PrismError {
+        /// What PRISM was doing: `"startup"`, `"ingest"`.
+        operation: String,
+        /// The underlying error.
+        source: BoxError,
+    },
+
+    /// A background task of a running [`crate::Lens`] panicked or ended
+    /// while LENS was meant to be running.
+    #[error("task {task} failed: {reason}")]
+    TaskFailed {
+        /// The task's name: `"prism"`, `"catalog_refresh"`.
+        task: String,
+        /// What happened to it.
+        reason: String,
+    },
 }
 
 impl LensError {
@@ -164,6 +187,16 @@ impl LensError {
         }
     }
 
+    /// Build a [`LensError::PrismError`].
+    pub fn prism(operation: impl Into<String>, source: impl Into<BoxError>) -> Self {
+        Self::PrismError { operation: operation.into(), source: source.into() }
+    }
+
+    /// Build a [`LensError::TaskFailed`].
+    pub fn task_failed(task: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::TaskFailed { task: task.into(), reason: reason.into() }
+    }
+
     /// Stable `snake_case` name of the variant, for logs and metric labels.
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -174,6 +207,8 @@ impl LensError {
             Self::QueryExecutionError { .. } => "query_execution_error",
             Self::SerializationError { .. } => "serialization_error",
             Self::IoError { .. } => "io_error",
+            Self::PrismError { .. } => "prism_error",
+            Self::TaskFailed { .. } => "task_failed",
         }
     }
 

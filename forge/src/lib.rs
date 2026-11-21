@@ -5,6 +5,7 @@ mod registry;
 mod changelog_reader;
 mod api;
 mod webhook;
+mod service;
 
 pub use lens_client::*;
 pub use alerts::*;
@@ -12,4 +13,5 @@ pub use registry::*;
 pub use api::*;
 pub use webhook::*;
 pub use changelog_reader::*;
+pub use service::{ALERT_ENGINE_TASK, Forge, start};
 pub use config::{BoxError, ForgeConfig, ForgeError, ForgeResult};

@@ -14,29 +14,17 @@
 //! stop together: on Ctrl-C or SIGTERM, or as soon as either one fails.
 
 use std::ffi::OsString;
-use std::fs;
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::sync::Arc;
 
-use lens::config::ENV_DATA_DIR;
-use lens::{LensConfig, LensError, LensResult, QueryEngine};
-use prism::adapter::ChainAdapter;
-use prism::changelog::{ChangeLog, LocalChangeLog};
-use prism::commitment::CommitmentTracker;
-use prism::ingestor::{Cluster, Ingestor, IngestorConfig, helius_api_key_from_env, helius_solana_adapter};
-use prism::storage::TableKind;
-use prism::storage::partition::CHAIN_DIR;
-use prism::types::error::PrismResult;
+use lens::{LensConfig, LensError, LensResult, LensServiceConfig};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 
 const PARQUET_DIRECTORY_FLAG: &str = "--parquet-directory";
-
-/// The cluster PRISM ingests when started with `--parquet-directory`.
-const PRISM_CLUSTER: Cluster = Cluster::Devnet;
 
 const USAGE: &str = "\
 usage: lens [--parquet-directory <DIR>]
@@ -70,107 +58,81 @@ async fn main() -> ExitCode {
     // Before tracing is set up (its level is in the config), so report
     // config errors on stderr directly.
     let loaded = match &parquet_directory {
-        Some(dir) => create_table_dirs(dir).and_then(|()| {
-            LensConfig::load_with(|name| {
-                if name == ENV_DATA_DIR { Some(dir.clone().into_os_string()) } else { std::env::var_os(name) }
-            })
-        }),
-        None => LensConfig::load(),
+        Some(dir) => LensServiceConfig::for_parquet_directory(dir, |name| std::env::var_os(name)),
+        None => LensConfig::load().map(LensServiceConfig::serve_only),
     };
-    let config = match loaded {
-        Ok(config) => Arc::new(config),
+    let service = match loaded {
+        Ok(service) => service,
         Err(err) => {
             eprintln!("lens: {err}");
             return ExitCode::FAILURE;
         }
     };
 
-    let level = Level::from_str(config.log_level()).expect("log_level is validated when the config is loaded");
+    let level = Level::from_str(service.config.log_level()).expect("log_level is validated when the config is loaded");
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(false)
         .with_ansi(std::io::stdout().is_terminal())
         .init();
-    config.log_startup();
+    service.config.log_startup();
 
-    // Built before LENS starts listening, so a missing API key fails fast.
-    let ingestor = match parquet_directory {
-        Some(_) => match build_ingestor(config.data_dir()).await {
-            Ok(ingestor) => Some(Arc::new(ingestor)),
-            Err(err) => {
-                tracing::error!(kind = err.kind(), error = %err, "could not start PRISM");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => None,
-    };
-
-    let engine = match QueryEngine::new(config) {
-        Ok(engine) => Arc::new(engine),
+    match run(service).await {
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            tracing::error!(kind = err.kind(), error = %err, "could not start the query engine");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let shutdown = CancellationToken::new();
-    tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            lens::shutdown_signal().await;
-            shutdown.cancel();
-        }
-    });
-
-    let prism = ingestor.map(|ingestor| {
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let stop = ingestor.shutdown_token();
-            let forward = tokio::spawn({
-                let shutdown = shutdown.clone();
-                async move {
-                    shutdown.cancelled().await;
-                    stop.cancel();
-                }
-            });
-            let result = ingestor.run().await;
-            forward.abort();
-            // LENS would otherwise keep serving data that no longer grows.
-            shutdown.cancel();
-            result
-        })
-    });
-
-    let mut ok = match lens::serve(engine, shutdown.clone().cancelled_owned()).await {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::error!(kind = err.kind(), error = %err, "server failed");
-            false
-        }
-    };
-    // Lets PRISM flush its buffer and save its cursor if LENS stopped first.
-    shutdown.cancel();
-
-    if let Some(prism) = prism {
-        match prism.await {
-            Ok(Ok(report)) => tracing::info!(
-                slots_processed = report.slots_processed,
-                slots_skipped = report.slots_skipped,
-                last_flush_slot = report.cursor.last_flush_slot,
-                "PRISM stopped"
-            ),
-            Ok(Err(err)) => {
-                tracing::error!(kind = err.kind(), error = %err, "PRISM failed");
-                ok = false;
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "PRISM task panicked");
-                ok = false;
-            }
+            tracing::error!(kind = err.kind(), error = %err, "LENS failed");
+            ExitCode::FAILURE
         }
     }
+}
 
-    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+/// Start LENS (and PRISM), serve until Ctrl-C, SIGTERM, or LENS stopping on
+/// its own, then wait for everything to stop.
+async fn run(service: LensServiceConfig) -> LensResult<()> {
+    let addr = service.config.socket_addr();
+    let token = CancellationToken::new();
+    let lens = lens::start(service, token.clone()).await?;
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            // Lets PRISM flush and release its change log.
+            token.cancel();
+            let _ = lens.wait().await;
+            return Err(LensError::io(format!("bind address {addr}"), err));
+        }
+    };
+    tracing::info!(address = %addr, "LENS listening");
+
+    // Stop serving on a signal, and also if LENS stops on its own: LENS
+    // would otherwise keep serving data that no longer grows.
+    let stop = {
+        let token = token.clone();
+        async move {
+            tokio::select! {
+                () = lens::shutdown_signal() => tracing::info!("shutdown signal received; draining requests"),
+                () = token.cancelled() => {}
+            }
+        }
+    };
+    let watch = {
+        let token = token.clone();
+        let router = lens.router();
+        async move {
+            let served = axum::serve(listener, router).with_graceful_shutdown(stop).await;
+            token.cancel();
+            served
+        }
+    };
+    let (served, ()) = tokio::join!(watch, async {
+        lens.stopped().await;
+        token.cancel();
+    });
+
+    // Lets PRISM flush its buffer and save its cursor if LENS stopped first.
+    token.cancel();
+    let stopped = lens.wait().await;
+    // A task failure is the root cause of a serve error that follows it.
+    stopped.and(served.map_err(|err| LensError::io(format!("serving on {addr}"), err)))
 }
 
 /// Parse the arguments after the program name.
@@ -199,31 +161,6 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
         }
     }
     Ok(Cli::Run { parquet_directory })
-}
-
-/// Create `{dir}/solana/{table}` for every table PRISM writes. PRISM would
-/// create them on its first flush, but LENS refuses to start on a directory
-/// without any, and an empty table directory reads as an empty table.
-fn create_table_dirs(dir: &Path) -> LensResult<()> {
-    for table in TableKind::ALL {
-        let table_dir = dir.join(CHAIN_DIR).join(table.as_str());
-        fs::create_dir_all(&table_dir).map_err(|err| LensError::io(table_dir.display().to_string(), err))?;
-    }
-    Ok(())
-}
-
-/// PRISM's ingestor over Helius, writing under `data_dir`.
-///
-/// One change log, `{data_dir}/changelog.jsonl`, is shared by all three
-/// producers: the finality poller (`Final`), and through the ingestor the
-/// gap handler (`Skip`) and the writer task (`New`). LENS itself does not
-/// read it; it finds new files by re-scanning the directory.
-async fn build_ingestor(data_dir: &Path) -> PrismResult<Ingestor> {
-    let api_key = helius_api_key_from_env()?;
-    let adapter: Arc<dyn ChainAdapter> = Arc::new(helius_solana_adapter(&api_key, PRISM_CLUSTER).await?);
-    let changelog: Arc<dyn ChangeLog> = Arc::new(LocalChangeLog::open(data_dir, adapter.chain_id())?);
-    let tracker = CommitmentTracker::spawn(Arc::clone(&adapter), Arc::clone(&changelog));
-    Ingestor::new(adapter, Arc::new(tracker), changelog, IngestorConfig::new(data_dir))
 }
 
 #[cfg(test)]
@@ -271,8 +208,10 @@ mod tests {
 
     #[test]
     fn table_dirs_satisfy_the_lens_config() {
+        use lens::config::ENV_DATA_DIR;
+        use std::fs;
         let dir = std::env::temp_dir().join(format!("lens-main-test-{}", std::process::id()));
-        create_table_dirs(&dir).unwrap();
+        lens::create_table_dirs(&dir).unwrap();
         let config = LensConfig::load_with(|name| (name == ENV_DATA_DIR).then(|| dir.clone().into_os_string()))
             .unwrap();
         for table in lens::config::TABLE_DIRS {
