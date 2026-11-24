@@ -51,11 +51,18 @@
 //!
 //! The ingestor also executes the rewinds the
 //! [`Reconciler`](crate::reconcile::Reconciler) decides on, through the
-//! [`IngestorRewinder`] from [`Ingestor::rewinder`]. A rewind stops both
-//! tasks *without* flushing (the buffered slots are above the rewind point
-//! and about to be dropped), lowers the cursor, deletes the files at or above
-//! the rewind point and starts the pipeline again from there. Before the
-//! first start, [`Ingestor::run`] finishes a rewind a crash interrupted
+//! [`IngestorRewinder`] from [`Ingestor::rewinder`]. This is the "stop,
+//! rewind, restart" loop of [`Ingestor::run`]: one *epoch* runs both tasks
+//! until a rewind request arrives, which stops them *without* flushing (the
+//! buffered slots are above the rewind point and about to be dropped); then
+//!
+//! 1. the correction is announced and the change log flushed (nothing of
+//!    the stopped epoch can be announced after it),
+//! 2. the cursor is lowered,
+//! 3. the files at or above the rewind point are deleted,
+//!
+//! and the next epoch starts from there. Before the first epoch,
+//! [`Ingestor::run`] finishes a rewind a crash interrupted
 //! ([`Reconciler::recover`](crate::reconcile::Reconciler::recover)).
 //!
 //! Slots already below the finalized watermark are fetched at `finalized`,
@@ -73,7 +80,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::account_resolver::{AccountResolver, ResolverMetrics};
+use crate::account_resolver::{AccountResolver, ResolverMetrics, TokenAccountIndex};
 use crate::adapter::config::{SolanaAdapterConfig, TransactionEncoding};
 use crate::adapter::solana::SolanaAdapter;
 use crate::adapter::{ChainAdapter, CommitmentLevel};
@@ -81,12 +88,12 @@ use crate::changelog::ChangeLog;
 use crate::commitment::CommitmentTracker;
 use crate::decoder::DecoderRegistry;
 use crate::normalizer::{NormalizedBlock, Normalizer};
-use crate::reconcile::{ReconcileContext, Reconciler, Rewind};
+use crate::reconcile::{InFlight, ReconcileContext, Reconciler, Rewind};
 use crate::slot_processor::{GapHandler, ProcessedSlot, SlotFetcher, SlotFetcherConfig, SlotProcessor};
 use crate::storage::{ParquetWriter, Storage, WriterMetrics};
 use crate::types::error::{PrismError, PrismResult};
 use crate::types::event::ChangeEvent;
-use crate::types::udm::DeepAnaSlot;
+use crate::types::udm::{DeepAnaSlot, DeepAnaTokenTransfer, DeepAnaTransaction};
 
 pub mod cursor;
 
@@ -451,7 +458,7 @@ impl Ingestor {
             .rewind_rx
             .try_lock()
             .map_err(|_| PrismError::config("ingestor", "is already running"))?;
-        if let Some(from_slot) = Reconciler::recover(&self.config.data_dir, &self.cursor)? {
+        if let Some(from_slot) = Reconciler::recover(&self.config.data_dir, &self.cursor, self.changelog.as_ref())? {
             info!(from_slot, "finished an interrupted reconcile rewind");
         }
 
@@ -474,8 +481,8 @@ impl Ingestor {
             let (epoch, request) = self.run_epoch(first, &mut rewinds).await?;
             totals.add(&epoch);
             let Some(request) = request else { break };
-            let RewindRequest { from_slot, reply } = request;
-            match self.apply_rewind(from_slot) {
+            let RewindRequest { from_slot, announce, reply } = request;
+            match self.apply_rewind(from_slot, announce) {
                 Ok(()) => {
                     report.rewinds += 1;
                     let _ = reply.send(Ok(()));
@@ -606,11 +613,17 @@ impl Ingestor {
         Ok((totals, request))
     }
 
-    /// Lower the cursor so ingestion resumes at `from_slot` (never above the
-    /// flush edge), then delete files and buffered rows from there. The
-    /// cursor goes first: if the process dies in between, the next
-    /// [`Self::run`] rolls back from the lowered resume point anyway.
-    fn apply_rewind(&self, from_slot: u64) -> PrismResult<()> {
+    /// With the pipeline stopped: announce `announce` (if any) and flush the
+    /// change log, lower the cursor so ingestion resumes at `from_slot`
+    /// (never above the flush edge), then delete files and buffered rows
+    /// from there. Nothing is changed unless the announcement is durable.
+    /// The cursor goes before the files: if the process dies in between, the
+    /// next [`Self::run`] rolls back from the lowered resume point anyway.
+    fn apply_rewind(&self, from_slot: u64, announce: Option<ChangeEvent>) -> PrismResult<()> {
+        if let Some(event) = announce {
+            self.changelog.emit(event)?;
+            self.changelog.flush()?;
+        }
         let point = from_slot.min(self.cursor.state().last_flush_slot + 1);
         self.cursor.rewind(point)?;
         lock(&self.writer).rollback(point)?;
@@ -739,6 +752,13 @@ async fn process_task(
 /// `slot` through the slot processor, then, when it has data, its
 /// instructions decoded and its token transfers resolved into
 /// [`ProcessedSlot::udm_transfers`].
+///
+/// Only transfers of transactions that succeeded are kept: a failed
+/// transaction is rolled back whole, so its transfer instructions moved
+/// nothing on chain (their instruction rows are still written, decoded).
+/// The rest are completed from the transactions' own token balances first
+/// and the mint accounts second; see
+/// [`AccountResolver::resolve_with_metadata`].
 async fn process_slot(
     processor: &SlotProcessor,
     decoders: &DecoderRegistry,
@@ -754,13 +774,39 @@ async fn process_slot(
         slot: udm_slot,
         transactions: std::mem::take(&mut processed.udm_transactions),
         instructions: std::mem::take(&mut processed.udm_instructions),
+        token_balances: Vec::new(),
     };
-    let transfers = decoders.decode_block(&mut block);
-    processed.udm_transfers = resolver.lock().await.resolve(transfers).await?;
+    let transfers = executed_transfers(decoders.decode_block(&mut block), &block.transactions);
+    // Read once here; the writer has no use for them.
+    let metadata = TokenAccountIndex::from_balances(&std::mem::take(&mut processed.token_balances));
+    processed.udm_transfers = resolver
+        .lock()
+        .await
+        .resolve_with_metadata(transfers, &metadata)
+        .await?;
     processed.udm_slot = Some(block.slot);
     processed.udm_transactions = block.transactions;
     processed.udm_instructions = block.instructions;
     Ok(processed)
+}
+
+/// `transfers` without those of transactions that failed.
+pub fn executed_transfers(
+    transfers: Vec<DeepAnaTokenTransfer>,
+    transactions: &[DeepAnaTransaction],
+) -> Vec<DeepAnaTokenTransfer> {
+    let failed: std::collections::HashSet<&str> = transactions
+        .iter()
+        .filter(|tx| !tx.is_success())
+        .map(|tx| tx.tx_signature.as_str())
+        .collect();
+    if failed.is_empty() {
+        return transfers;
+    }
+    transfers
+        .into_iter()
+        .filter(|transfer| !failed.contains(transfer.tx_signature.as_str()))
+        .collect()
 }
 
 /// Sleep for `duration`; `false` when shutdown came first.
@@ -940,6 +986,8 @@ impl WriterTask {
 /// A rewind asked of [`Ingestor::run`], with where to send the outcome.
 struct RewindRequest {
     from_slot: u64,
+    /// Emitted once the pipeline has stopped, before anything is deleted.
+    announce: Option<ChangeEvent>,
     reply: oneshot::Sender<PrismResult<()>>,
 }
 
@@ -950,12 +998,11 @@ pub struct IngestorRewinder {
     tx: mpsc::Sender<RewindRequest>,
 }
 
-#[async_trait]
-impl Rewind for IngestorRewinder {
-    async fn rewind_to(&self, from_slot: u64) -> PrismResult<()> {
+impl IngestorRewinder {
+    async fn request(&self, from_slot: u64, announce: Option<ChangeEvent>) -> PrismResult<()> {
         let (reply, outcome) = oneshot::channel();
         self.tx
-            .send(RewindRequest { from_slot, reply })
+            .send(RewindRequest { from_slot, announce, reply })
             .await
             .map_err(|_| PrismError::config("ingestor", "is gone; the rewind was not executed"))?;
         outcome.await.map_err(|_| {
@@ -964,9 +1011,29 @@ impl Rewind for IngestorRewinder {
     }
 }
 
+#[async_trait]
+impl Rewind for IngestorRewinder {
+    async fn rewind_to(&self, from_slot: u64) -> PrismResult<()> {
+        self.request(from_slot, None).await
+    }
+
+    /// Stops the pipeline first, then announces on the ingestor's own change
+    /// log (the one its `New` and `Skip` events go to; `_changelog` should be
+    /// that same log), then rewinds.
+    async fn correct(&self, correction: &InFlight, _changelog: &dyn ChangeLog) -> PrismResult<()> {
+        self.request(correction.from_slot, Some(correction.event())).await
+    }
+}
+
 /// The ingestor's [`ReconcileContext`]: the cursor's durable flush edge and
-/// processed edge, the commitment tracker's finalized watermark, and the
-/// genesis hash it was built with.
+/// processed edge, the commitment tracker's *durable* finalized watermark,
+/// and the genesis hash it was built with.
+///
+/// The durable watermark (see
+/// [`CommitmentTracker::durable_finalized_slot`]) is what a restart starts
+/// from, so every slot the reconciler acts on is still known to be finalized
+/// after a crash, and its re-ingest is read at `finalized` from the first
+/// slot on.
 #[derive(Clone)]
 pub struct IngestorReconcileContext {
     cursor: IngestorCursor,
@@ -978,7 +1045,7 @@ impl std::fmt::Debug for IngestorReconcileContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IngestorReconcileContext")
             .field("cursor", &self.cursor.state())
-            .field("finalized_slot", &self.tracker.finalized_slot())
+            .field("finalized_slot", &self.tracker.durable_finalized_slot())
             .field("genesis_hash", &self.genesis_hash)
             .finish()
     }
@@ -994,7 +1061,7 @@ impl ReconcileContext for IngestorReconcileContext {
     }
 
     fn finalized_slot(&self) -> u64 {
-        self.tracker.finalized_slot()
+        self.tracker.durable_finalized_slot()
     }
 
     fn genesis_hash(&self) -> String {

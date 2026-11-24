@@ -547,7 +547,10 @@ async fn a_retry_after_hint_is_capped_at_max_delay() {
 #[tokio::test(start_paused = true)]
 async fn last_fetch_latency_tracks_the_most_recent_fetch() {
     let adapter = ScriptedAdapter::new();
-    let fetcher = fetcher(&adapter, fast_config());
+    // The timeout must outlast the slowest scripted answer, or the first
+    // fetch times out instead of measuring 1 234 ms.
+    let config = SlotFetcherConfig { request_timeout_ms: 5_000, ..fast_config() };
+    let fetcher = fetcher(&adapter, config);
 
     adapter.set_latency(Duration::from_millis(1_234));
     fetcher.fetch(1).await.unwrap();

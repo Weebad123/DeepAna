@@ -20,8 +20,8 @@
 //! instead, so a downgrade cannot throw away state it does not understand.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 use super::classify::FindingKind;
 use crate::types::error::{PrismError, PrismResult};
-use crate::types::event::CorrectionReason;
+use crate::types::event::{ChangeEvent, CorrectionReason};
 
 /// Name of the state file in the data directory.
 pub const RECONCILE_FILE_NAME: &str = "reconcile.json";
@@ -98,6 +98,19 @@ pub struct InFlight {
     pub slots: Vec<u64>,
     /// Unix seconds.
     pub started_at: i64,
+}
+
+impl InFlight {
+    /// The [`ChangeEvent::Correction`] that announces this rewind.
+    pub fn event(&self) -> ChangeEvent {
+        ChangeEvent::correction(self.from_slot, self.to_slot, self.reason, self.affected)
+    }
+
+    /// Whether `other` is the same rewind (same range, same start time):
+    /// how a completion recorded by someone else is told apart.
+    pub fn is_same_rewind(&self, other: &Self) -> bool {
+        self.from_slot == other.from_slot && self.to_slot == other.to_slot && self.started_at == other.started_at
+    }
 }
 
 /// Why the reconciler stopped for good. Cleared only by an operator
@@ -297,7 +310,7 @@ impl StateStore {
     /// Replace the file with `state`, atomically.
     pub fn save(&self, state: &ReconcileState) -> PrismResult<()> {
         let json = serde_json::to_vec_pretty(state).map_err(|err| self.error(invalid_data(err)))?;
-        write_atomically(&self.path, &json).map_err(|err| self.error(err))
+        crate::storage::write_file_atomically(&self.path, &json).map_err(|err| self.error(err))
     }
 
     /// Move the file aside to `{path}.corrupt-{unix_time}`; returns where.
@@ -335,30 +348,6 @@ fn parse(bytes: &[u8]) -> Result<ReconcileState, Corrupt> {
         serde_json::from_value(value).map_err(|err| Corrupt::Invalid(err.to_string()))?;
     state.validate().map_err(Corrupt::Invalid)?;
     Ok(state)
-}
-
-fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    if let Some(parent) = parent {
-        fs::create_dir_all(parent)?;
-    }
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = PathBuf::from(tmp_name);
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    // Make the rename itself durable. Directories cannot be opened for
-    // syncing everywhere; where they cannot, the rename is as durable as the
-    // platform makes it.
-    #[cfg(unix)]
-    if let Some(parent) = parent {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
 }
 
 fn invalid_data(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {

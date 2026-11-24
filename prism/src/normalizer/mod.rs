@@ -7,21 +7,28 @@
 //!   ChainBlock ──▶ SlotNormalizer ─────────▶ DeepAnaSlot
 //!        │
 //!        └─ each tx ─▶ TransactionNormalizer ──▶ DeepAnaTransaction
-//!                            │ (decoded message)
-//!                            └──▶ InstructionNormalizer ──▶ Vec<DeepAnaInstruction>
+//!                            │ (decoded message: full key list)
+//!                            ├──▶ InstructionNormalizer ──▶ Vec<DeepAnaInstruction>
+//!                            └──▶ token_balance_changes ──▶ Vec<TokenBalanceChange>
 //! ```
 //!
-//! | File              | Holds                                                    |
-//! |-------------------|----------------------------------------------------------|
-//! | `mod.rs`          | [`Normalizer`], [`NormalizedBlock`], [`NormalizerMetrics`] |
-//! | [`slot`]          | [`SlotNormalizer`]: block header → slot row              |
-//! | [`transaction`]   | [`TransactionNormalizer`]: one transaction → its row     |
-//! | [`instruction`]   | [`InstructionNormalizer`]: instruction tree → flat rows  |
+//! | File               | Holds                                                    |
+//! |--------------------|----------------------------------------------------------|
+//! | `mod.rs`           | [`Normalizer`], [`NormalizedBlock`], [`NormalizerMetrics`] |
+//! | [`slot`]           | [`SlotNormalizer`]: block header → slot row              |
+//! | [`transaction`]    | [`TransactionNormalizer`]: one transaction → its row     |
+//! | [`instruction`]    | [`InstructionNormalizer`]: instruction tree → flat rows  |
+//! | [`token_balance`]  | [`TokenBalanceChange`]: the meta's pre/post token balances |
 //!
 //! A block is normalized whole or not at all: the first transaction that
 //! cannot be read fails the block, so no caller ever sees a block with rows
 //! missing. Every transaction is kept, failed ones and votes included;
 //! filtering is left to the stages downstream.
+//!
+//! Versioned (v0) transactions are first-class: instruction accounts and
+//! token balances both resolve against the full key list, static keys then
+//! the addresses loaded from lookup tables, as the RPC reported them in
+//! `meta.loadedAddresses` (see [`transaction`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,10 +39,12 @@ use crate::types::udm::{DeepAnaInstruction, DeepAnaSlot, DeepAnaTransaction};
 
 pub mod instruction;
 pub mod slot;
+pub mod token_balance;
 pub mod transaction;
 
 pub use instruction::InstructionNormalizer;
 pub use slot::SlotNormalizer;
+pub use token_balance::{TokenBalanceChange, TokenBalanceSide, token_balance_changes};
 pub use transaction::{DecodedTransaction, TransactionNormalizer};
 
 /// The UDM rows of one block.
@@ -47,6 +56,10 @@ pub struct NormalizedBlock {
     /// Transaction by transaction in block order; within one transaction, in
     /// the order [`InstructionNormalizer`] describes.
     pub instructions: Vec<DeepAnaInstruction>,
+    /// The token balances every transaction's meta reports, transaction by
+    /// transaction in block order, then by account index. Not a UDM table:
+    /// the account resolver reads token transfer metadata from them.
+    pub token_balances: Vec<TokenBalanceChange>,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +174,7 @@ impl Normalizer {
 
         let mut transactions = Vec::with_capacity(raw.transactions.len());
         let mut instructions = Vec::new();
+        let mut token_balances = Vec::new();
         for (index, tx_with_meta) in raw.transactions.iter().enumerate() {
             let (row, decoded) = self.transaction_normalizer.normalize_with_message(
                 slot_number,
@@ -175,12 +189,20 @@ impl Normalizer {
                 &decoded.instructions,
                 transaction::inner_instructions(tx_with_meta.meta.as_ref()),
             )?);
+            // `row.accounts` is the full key list, lookup-table keys included.
+            token_balances.extend(token_balance_changes(
+                slot_number,
+                &row.tx_signature,
+                &row.accounts,
+                tx_with_meta.meta.as_ref(),
+            )?);
             transactions.push(row);
         }
         Ok(NormalizedBlock {
             slot,
             transactions,
             instructions,
+            token_balances,
         })
     }
 }

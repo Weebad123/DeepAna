@@ -16,12 +16,12 @@
 //! last flush, and the slots between the two edges are fetched again.
 //!
 //! The state is a small JSON file, replaced atomically on every
-//! [`IngestorCursor::persist`]: written to a sibling temp file, fsynced, then
-//! renamed over the old one. A crash mid-write leaves the previous state in
-//! place, never a torn file.
+//! [`IngestorCursor::persist`]: written to a sibling temp file, fsynced,
+//! renamed over the old one, and the directory fsynced. A crash mid-write
+//! leaves the previous state in place, never a torn file.
 
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -226,7 +226,7 @@ impl IngestorCursor {
         let state = self.state();
         let json = serde_json::to_vec_pretty(&state)
             .map_err(|err| cursor_error(&self.path, invalid_data(err)))?;
-        write_atomically(&self.path, &json).map_err(|err| cursor_error(&self.path, err))?;
+        crate::storage::write_file_atomically(&self.path, &json).map_err(|err| cursor_error(&self.path, err))?;
         self.durable_flush.store(state.last_flush_slot, Ordering::Release);
         Ok(())
     }
@@ -236,21 +236,6 @@ impl IngestorCursor {
         // panic elsewhere cannot leave it half-written.
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-}
-
-fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = PathBuf::from(tmp_name);
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)
 }
 
 fn cursor_error(path: &Path, source: io::Error) -> PrismError {

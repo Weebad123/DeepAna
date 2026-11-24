@@ -10,23 +10,29 @@
 //! 5. emits a [`ChangeEvent::Final`] if the finalized watermark has moved
 //!    past what was last announced,
 //! 6. flushes the change log, once,
-//! 7. logs the watermark and waits for the next tick.
+//! 7. when persisting, saves the watermark and the announced slot to
+//!    `finality.json` (see [`finality_store`](super::finality_store)),
+//! 8. logs the watermark and waits for the next tick.
 //!
 //! The poller favours accuracy over liveness. A tip that failed to fetch, or
 //! came back at a commitment other than the one asked for, is dropped rather
 //! than guessed at. A tip below the watermark is rejected by the watermark
 //! itself. A change log that fails to emit or flush is not retried: the
 //! poller stops and [`FinalityPoller::run`] returns the error, which halts
-//! PRISM like a storage failure does. Nothing is lost by that: a restarted
-//! poller announces the whole finalized range again from 0.
+//! PRISM like a storage failure does; so does a failure to save
+//! `finality.json`. Nothing is lost by that: a restarted poller announces
+//! again from the last announcement that was saved (from 0 without a saved
+//! record).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use super::finality_store::{FinalityRecord, FinalityStore};
 use super::finality_watermark::{Advance, FinalityWatermark};
 use crate::adapter::{ChainAdapter, ChainTip, CommitmentLevel};
 use crate::changelog::ChangeLog;
@@ -45,6 +51,18 @@ pub struct FinalityPoller {
     shutdown: CancellationToken,
     /// Finalized slot of the last `Final` event that was emitted.
     announced: u64,
+    /// Where the watermark is saved, when it is.
+    persistence: Option<Persistence>,
+}
+
+/// The poller's link to `finality.json`.
+struct Persistence {
+    store: FinalityStore,
+    chain_id: String,
+    /// The finalized slot as last saved: what survives a crash.
+    durable: Arc<AtomicU64>,
+    /// `(finalized_slot, announced_slot)` as last saved.
+    saved: (u64, u64),
 }
 
 impl FinalityPoller {
@@ -70,7 +88,32 @@ impl FinalityPoller {
             poll_interval,
             shutdown,
             announced,
+            persistence: None,
         })
+    }
+
+    /// Announce only finalized slots above `slot`, e.g. the announced slot a
+    /// saved [`FinalityRecord`] holds. Never above the watermark.
+    #[must_use]
+    pub fn announcing_from(mut self, slot: u64) -> Self {
+        self.announced = slot.min(self.watermark.finalized_slot());
+        self
+    }
+
+    /// Save the watermark to `store` after every poll that moved it (or the
+    /// announced slot), and keep `durable` at the finalized slot last saved.
+    /// The record is written after the poll's `Final` event is flushed, so
+    /// its `announced_slot` never claims an event that could be lost.
+    #[must_use]
+    pub fn persist_to(mut self, store: FinalityStore, durable: Arc<AtomicU64>) -> Self {
+        let saved = (durable.load(Ordering::Acquire), self.announced);
+        self.persistence = Some(Persistence {
+            store,
+            chain_id: self.adapter.chain_id().to_owned(),
+            durable,
+            saved,
+        });
+        self
     }
 
     pub const fn poll_interval(&self) -> Duration {
@@ -154,7 +197,7 @@ impl FinalityPoller {
         }
     }
 
-    /// Steps 3 to 7.
+    /// Steps 3 to 8.
     fn apply(&mut self, (confirmed, finalized): (Option<ChainTip>, Option<ChainTip>)) -> PrismResult<()> {
         if let Some(tip) = confirmed {
             let outcome = self
@@ -170,6 +213,7 @@ impl FinalityPoller {
         }
         self.announce()?;
         self.changelog.flush()?;
+        self.persist()?;
         debug!(
             confirmed_slot = self.watermark.confirmed_slot(),
             finalized_slot = self.watermark.finalized_slot(),
@@ -189,6 +233,25 @@ impl FinalityPoller {
         let event = ChangeEvent::finalized(slot, blockhash, self.announced);
         self.changelog.emit(event)?;
         self.announced = slot;
+        Ok(())
+    }
+
+    /// Step 7: save the watermark if it or the announced slot moved.
+    fn persist(&mut self) -> PrismResult<()> {
+        let Some(persistence) = &mut self.persistence else {
+            return Ok(());
+        };
+        let (slot, blockhash) = self.watermark.finalized_tip();
+        let current = (slot, self.announced.min(slot));
+        if slot == 0 || current == persistence.saved {
+            return Ok(());
+        }
+        let record = FinalityRecord::new(&persistence.chain_id, slot, blockhash, current.1);
+        persistence.store.save(&record).inspect_err(|err| {
+            error!(error = %err, path = %persistence.store.path().display(), "could not save the finality watermark");
+        })?;
+        persistence.saved = current;
+        persistence.durable.store(slot, Ordering::Release);
         Ok(())
     }
 }

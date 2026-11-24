@@ -1140,6 +1140,7 @@ fn normalized_block() -> NormalizedBlock {
             ..Default::default()
         }],
         instructions,
+        token_balances: Vec::new(),
     }
 }
 

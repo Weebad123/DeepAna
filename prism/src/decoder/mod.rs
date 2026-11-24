@@ -304,6 +304,7 @@ impl DecoderRegistry {
             slot,
             transactions,
             instructions,
+            ..
         } = block;
         let accounts_by_signature: HashMap<&str, &[String]> = transactions
             .iter()

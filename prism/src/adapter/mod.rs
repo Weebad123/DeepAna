@@ -113,6 +113,35 @@ pub struct ChainBlock {
     pub raw: ChainBlockData,
 }
 
+/// The identity of one block, without its transactions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockHeader {
+    /// Slot number on Solana, block height on EVM.
+    pub slot_or_height: u64,
+    /// Blockhash / block hash.
+    pub block_id: String,
+    /// The parent's blockhash / hash.
+    pub parent_id: String,
+    /// The parent's slot (Solana) or height (EVM).
+    pub parent_slot: u64,
+    /// Unix seconds, when the chain reports it.
+    pub timestamp: Option<i64>,
+}
+
+impl BlockHeader {
+    /// The header of a fetched block.
+    pub fn of(block: &ChainBlock) -> Self {
+        let ChainBlockData::Solana(raw) = &block.raw;
+        Self {
+            slot_or_height: block.slot_or_height,
+            block_id: block.block_id.clone(),
+            parent_id: block.parent_id.clone(),
+            parent_slot: raw.parent_slot,
+            timestamp: block.timestamp,
+        }
+    }
+}
+
 /// Raw on-chain state of one account.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountData {
@@ -250,6 +279,21 @@ pub trait ChainAdapter: Send + Sync {
     ) -> PrismResult<ChainBlock> {
         let _ = commitment;
         self.get_block(slot_or_height).await
+    }
+
+    /// The header of the block at `slot_or_height`, read at `commitment`:
+    /// what tells two versions of a slot apart. Same errors as
+    /// [`Self::get_block_at`].
+    ///
+    /// The default fetches the whole block and keeps its header, which is
+    /// correct but heavy; adapters that can ask for the header alone
+    /// (Solana: `transactionDetails: none`) should.
+    async fn get_block_header(
+        &self,
+        slot_or_height: u64,
+        commitment: CommitmentLevel,
+    ) -> PrismResult<BlockHeader> {
+        Ok(BlockHeader::of(&self.get_block_at(slot_or_height, commitment).await?))
     }
 
     /// The slots in `from..=to` that hold a block at `commitment`, ascending.

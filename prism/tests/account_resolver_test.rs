@@ -241,6 +241,7 @@ async fn transfer_checked_comes_out_fully_enriched() {
             mint_fetches_succeeded: 1,
             mint_fetches_failed: 0,
             cache_hits: 0,
+            filled_from_metadata: 0,
         }
     );
 }

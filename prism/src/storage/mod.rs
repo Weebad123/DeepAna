@@ -22,6 +22,10 @@
 //! is and the buffers are kept as they were, so the next flush writes the
 //! same rows again.
 
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
 use crate::types::error::PrismResult;
 use crate::types::udm::{DeepAnaInstruction, DeepAnaSlot, DeepAnaTokenTransfer, DeepAnaTransaction};
 
@@ -94,4 +98,34 @@ pub trait Storage: Send + Sync {
     /// Last slot of the most recent successful flush, `None` before the
     /// first.
     fn last_flushed_slot(&self) -> Option<u64>;
+}
+
+/// Replace the file at `path` with `bytes` so that a crash leaves either the
+/// old contents or the new ones, never a torn file: written to a sibling
+/// `.tmp`, fsynced, renamed over `path`, then the directory fsynced so the
+/// rename itself survives a power failure. Parent directories are created.
+///
+/// The small state files next to the tables (`reconcile.json`,
+/// `finality.json`, `cursor.json`) are all written through this.
+pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
+    }
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    // Directories cannot be opened for syncing everywhere; where they
+    // cannot, the rename is as durable as the platform makes it.
+    #[cfg(unix)]
+    if let Some(parent) = parent {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }

@@ -22,6 +22,12 @@
 //! numbers them in, so instruction account indexes point straight into it.
 //! The number of loaded keys must match what the message's lookups ask for;
 //! a mismatch is an error rather than a set of silently wrong accounts.
+//! A legacy transaction loads nothing, so loaded addresses reported for one
+//! are rejected the same way.
+//!
+//! The same full list is what every other index in the meta points into:
+//! instruction accounts (top-level and inner) and the `accountIndex` of the
+//! token balances ([`token_balance`](super::token_balance)).
 //!
 //! | `DeepAnaTransaction`     | Taken from                                    |
 //! |--------------------------|-----------------------------------------------|

@@ -201,6 +201,7 @@ fn classified(findings: &[(u64, FindingKind)]) -> prism::reconcile::Classificati
                 stored.remove(&slot);
                 produced.remove(&slot);
             }
+            FindingKind::Mismatched => unreachable!("a block-level finding: see classify_blocks"),
         }
     }
     classify(window(101, 200), &stored, &produced, &logged)
@@ -549,10 +550,15 @@ fn hash(slot: u64) -> String {
 }
 
 fn block(slot: u64) -> ChainBlock {
+    block_with_parent(slot, slot.saturating_sub(1))
+}
+
+/// A block at `slot` built on `parent`.
+fn block_with_parent(slot: u64, parent: u64) -> ChainBlock {
     let raw: EncodedConfirmedBlock = serde_json::from_value(json!({
-        "previousBlockhash": hash(slot.saturating_sub(1)),
+        "previousBlockhash": hash(parent),
         "blockhash": hash(slot),
-        "parentSlot": slot.saturating_sub(1),
+        "parentSlot": parent,
         "transactions": [],
         "rewards": [],
         "blockTime": 1_700_000_000 + slot as i64,
@@ -562,7 +568,7 @@ fn block(slot: u64) -> ChainBlock {
     ChainBlock {
         slot_or_height: slot,
         block_id: hash(slot),
-        parent_id: hash(slot.saturating_sub(1)),
+        parent_id: hash(parent),
         timestamp: raw.block_time,
         raw: ChainBlockData::Solana(Box::new(raw)),
     }
@@ -631,7 +637,11 @@ impl ChainAdapter for FakeChain {
             self.finalized_reads.lock().unwrap().push(slot);
         }
         if self.has_block(slot, commitment) {
-            Ok(block(slot))
+            // A block's parent is the previous block of the same chain: on
+            // the fork PRISM first saw (confirmed) that may be an orphan, on
+            // the finalized chain it never is.
+            let parent = (0..slot).rev().find(|s| self.has_block(*s, commitment)).unwrap_or(0);
+            Ok(block_with_parent(slot, parent))
         } else {
             Err(PrismError::slot_skipped(slot))
         }
@@ -948,7 +958,8 @@ fn recovery_lowers_the_cursor_deletes_the_files_and_completes_the_rewind() {
     cursor.record_processed(105, "h");
     cursor.record_flush(105).unwrap();
 
-    assert_eq!(Reconciler::recover(&dir, &cursor).unwrap(), None, "no state file");
+    let changelog = RecordingChangeLog::default();
+    assert_eq!(Reconciler::recover(&dir, &cursor, &changelog).unwrap(), None, "no state file");
 
     let mut state = state_at(99);
     state.strikes = vec![Strike { slot: 102, kind: FindingKind::Orphaned, seen: 2 }];
@@ -962,7 +973,9 @@ fn recovery_lowers_the_cursor_deletes_the_files_and_completes_the_rewind() {
     });
     StateStore::new(&dir).save(&state).unwrap();
 
-    assert_eq!(Reconciler::recover(&dir, &cursor).unwrap(), Some(102));
+    assert_eq!(Reconciler::recover(&dir, &cursor, &changelog).unwrap(), Some(102));
+    // The correction is announced again: the crash may have come before it.
+    assert_eq!(changelog.corrections(), vec![ChangeEvent::correction(102, 102, CorrectionReason::Orphaned, 1)]);
     assert_eq!(cursor.state().last_flush_slot, 101);
     assert_eq!(cursor.durable_flush_slot(), 101);
     assert_eq!(IngestorCursor::load_or_init(dir.join(CURSOR_FILE_NAME)).unwrap().state().last_flush_slot, 101);
@@ -972,8 +985,9 @@ fn recovery_lowers_the_cursor_deletes_the_files_and_completes_the_rewind() {
     assert_eq!(state.attempts, vec![Attempt { slot: 102, count: 1 }]);
     assert!(state.strikes.is_empty());
 
-    // Idempotent: nothing left to do.
-    assert_eq!(Reconciler::recover(&dir, &cursor).unwrap(), None);
+    // Idempotent: nothing left to do, nothing announced again.
+    assert_eq!(Reconciler::recover(&dir, &cursor, &changelog).unwrap(), None);
+    assert_eq!(changelog.corrections().len(), 1);
 }
 
 #[test]

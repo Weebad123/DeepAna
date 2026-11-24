@@ -3,26 +3,28 @@
 //!
 //! | Input      | Source                                                        |
 //! |------------|---------------------------------------------------------------|
-//! | stored     | the `slot` column of the `slots` Parquet files                |
+//! | stored     | the `slot` (and `parent_slot`, `blockhash`) columns of the `slots` files |
 //! | logged     | `validator_skipped` lines of the skip log                     |
-//! | produced   | the adapter's block list for the window, at `finalized`       |
+//! | produced   | the adapter's block list for the window (plus a lookback), at `finalized` |
+//! | hashes     | the adapter's block headers at `finalized`, when verifying     |
 //!
 //! A failure to read any of them is returned as an error and is never
 //! evidence: a file that cannot be opened is not "nothing stored", an RPC
 //! error is not "no blocks".
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::UInt64Type;
+use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::errors::ParquetError;
 
-use super::classify::SlotWindow;
+use super::classify::{FinalizedChain, SlotWindow, StoredBlock};
 use crate::adapter::{ChainAdapter, CommitmentLevel};
 use crate::storage::partition::PARQUET_EXTENSION;
 use crate::storage::{PartitionKey, TableKind};
@@ -31,6 +33,8 @@ use crate::types::event::SkipReason;
 
 /// Name of the column the slots table is keyed by.
 const SLOT_COLUMN: &str = "slot";
+const PARENT_SLOT_COLUMN: &str = "parent_slot";
+const BLOCKHASH_COLUMN: &str = "blockhash";
 
 // ---------------------------------------------------------------------------
 // Stored slots
@@ -115,6 +119,64 @@ fn read_slot_column(path: &Path, window: SlotWindow, into: &mut BTreeSet<u64>) -
                 if window.contains(slot) {
                     into.insert(slot);
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The stored blocks of `window`: slot → blockhash and parent slot. Only
+/// files whose name overlaps the window are opened, and only those three
+/// columns are read.
+pub fn stored_blocks(data_dir: &Path, window: SlotWindow) -> PrismResult<BTreeMap<u64, StoredBlock>> {
+    let range = (window.start, window.end);
+    let fail = |err: ParquetError| PrismError::storage(TableKind::Slots.as_str(), range, err);
+    let files = slot_files(data_dir).map_err(|err| fail(err.into()))?;
+    let mut stored = BTreeMap::new();
+    for (path, from, to) in files {
+        if to < window.start || from > window.end {
+            continue;
+        }
+        read_block_columns(&path, window, &mut stored).map_err(fail)?;
+    }
+    Ok(stored)
+}
+
+fn read_block_columns(
+    path: &Path,
+    window: SlotWindow,
+    into: &mut BTreeMap<u64, StoredBlock>,
+) -> Result<(), ParquetError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+    let missing = |column: &str| ParquetError::General(format!("{} has no {column} column", path.display()));
+    let schema = builder.schema().clone();
+    let index = |column: &str| schema.index_of(column).map_err(|_| missing(column));
+    let indexes = [index(SLOT_COLUMN)?, index(PARENT_SLOT_COLUMN)?, index(BLOCKHASH_COLUMN)?];
+    let mask = ProjectionMask::roots(builder.parquet_schema(), indexes);
+    for batch in builder.with_projection(mask).build()? {
+        let batch = batch?;
+        let wrong = |column: &str| ParquetError::General(format!("{column} column of {} has the wrong type", path.display()));
+        let u64_column = |batch: &RecordBatch, column: &str| {
+            batch
+                .column_by_name(column)
+                .and_then(|c| c.as_primitive_opt::<UInt64Type>().cloned())
+                .ok_or_else(|| wrong(column))
+        };
+        let slots = u64_column(&batch, SLOT_COLUMN)?;
+        let parents = u64_column(&batch, PARENT_SLOT_COLUMN)?;
+        let hashes = batch
+            .column_by_name(BLOCKHASH_COLUMN)
+            .and_then(|c| c.as_string_opt::<i32>().cloned())
+            .ok_or_else(|| wrong(BLOCKHASH_COLUMN))?;
+        for i in 0..slots.len() {
+            if slots.is_valid(i) && window.contains(slots.value(i)) {
+                into.insert(
+                    slots.value(i),
+                    StoredBlock {
+                        blockhash: hashes.value(i).to_owned(),
+                        parent_slot: parents.value(i),
+                    },
+                );
             }
         }
     }
@@ -253,4 +315,42 @@ pub async fn produced_slots(adapter: &dyn ChainAdapter, window: SlotWindow) -> P
         .get_blocks_in_range(window.start, window.end, CommitmentLevel::Finalized)
         .await?;
     Ok(slots.into_iter().filter(|slot| window.contains(*slot)).collect())
+}
+
+/// The finalized blocks of `window`, plus the last finalized block in the
+/// `lookback` slots below it (the parent of the window's first block). One
+/// block list request.
+pub async fn finalized_chain(
+    adapter: &dyn ChainAdapter,
+    window: SlotWindow,
+    lookback: u64,
+) -> PrismResult<FinalizedChain> {
+    let from = window.start.saturating_sub(lookback);
+    let slots = adapter
+        .get_blocks_in_range(from, window.end, CommitmentLevel::Finalized)
+        .await?;
+    let mut chain = FinalizedChain::default();
+    for slot in slots {
+        if window.contains(slot) {
+            chain.produced.insert(slot);
+        } else if (from..window.start).contains(&slot) {
+            chain.predecessor = chain.predecessor.max(Some(slot));
+        }
+    }
+    Ok(chain)
+}
+
+/// The finalized blockhash of each of `slots`. Any failure, a slot the
+/// chain now calls skipped included, is an error: the block list said it
+/// has a block, so the two answers disagree and nothing can be concluded.
+pub async fn finalized_blockhashes(
+    adapter: &dyn ChainAdapter,
+    slots: impl IntoIterator<Item = u64>,
+) -> PrismResult<BTreeMap<u64, String>> {
+    let mut hashes = BTreeMap::new();
+    for slot in slots {
+        let header = adapter.get_block_header(slot, CommitmentLevel::Finalized).await?;
+        hashes.insert(slot, header.block_id);
+    }
+    Ok(hashes)
 }

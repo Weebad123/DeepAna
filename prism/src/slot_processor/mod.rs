@@ -31,7 +31,7 @@ use tokio::time::Instant;
 use tracing::warn;
 
 use crate::adapter::CommitmentLevel;
-use crate::normalizer::{NormalizedBlock, Normalizer};
+use crate::normalizer::{NormalizedBlock, Normalizer, TokenBalanceChange};
 use crate::types::error::{PrismError, PrismResult};
 use crate::types::event::SkipReason;
 use crate::types::udm::{DeepAnaInstruction, DeepAnaSlot, DeepAnaTokenTransfer, DeepAnaTransaction};
@@ -58,6 +58,10 @@ pub struct ProcessedSlot {
     /// Left empty by the processor; the ingestor fills it in after the
     /// decoder and account resolver have run.
     pub udm_transfers: Vec<DeepAnaTokenTransfer>,
+    /// The token balances the transactions' metas report (see
+    /// [`TokenBalanceChange`]). Not written anywhere: the ingestor hands them
+    /// to the account resolver, which fills the transfer rows from them.
+    pub token_balances: Vec<TokenBalanceChange>,
     /// Wall time of the fetch, retries and backoff included.
     pub fetch_duration_ms: u64,
 }
@@ -71,6 +75,7 @@ impl ProcessedSlot {
             udm_transactions: block.transactions,
             udm_instructions: block.instructions,
             udm_transfers: Vec::new(),
+            token_balances: block.token_balances,
             fetch_duration_ms,
         }
     }
@@ -83,6 +88,7 @@ impl ProcessedSlot {
             udm_transactions: Vec::new(),
             udm_instructions: Vec::new(),
             udm_transfers: Vec::new(),
+            token_balances: Vec::new(),
             fetch_duration_ms,
         }
     }

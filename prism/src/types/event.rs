@@ -100,6 +100,9 @@ pub enum CorrectionReason {
     /// Rows were stored for a slot that has no block on the finalized chain:
     /// they came from an abandoned fork.
     Orphaned,
+    /// The finalized chain has a block for the slot, but not the one stored:
+    /// the stored block names another parent, or another blockhash.
+    Mismatched,
     /// The finalized chain has a block for the slot, but nothing was stored
     /// and no skip was recorded.
     Missing,
@@ -109,8 +112,9 @@ pub enum CorrectionReason {
 }
 
 impl CorrectionReason {
-    pub const ALL: [CorrectionReason; 3] = [
+    pub const ALL: [CorrectionReason; 4] = [
         CorrectionReason::Orphaned,
+        CorrectionReason::Mismatched,
         CorrectionReason::Missing,
         CorrectionReason::FalseSkip,
     ];
@@ -119,6 +123,7 @@ impl CorrectionReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Orphaned => "orphaned",
+            Self::Mismatched => "mismatched",
             Self::Missing => "missing",
             Self::FalseSkip => "false_skip",
         }
@@ -127,7 +132,8 @@ impl CorrectionReason {
     /// Higher is more severe.
     pub const fn severity(self) -> u8 {
         match self {
-            Self::Orphaned => 3,
+            Self::Orphaned => 4,
+            Self::Mismatched => 3,
             Self::Missing => 2,
             Self::FalseSkip => 1,
         }
@@ -158,6 +164,7 @@ impl FromStr for CorrectionReason {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "orphaned" => Ok(Self::Orphaned),
+            "mismatched" => Ok(Self::Mismatched),
             "missing" => Ok(Self::Missing),
             "false_skip" => Ok(Self::FalseSkip),
             other => Err(format!("unknown correction reason: {other:?}")),
@@ -194,9 +201,9 @@ pub enum ChangeEvent {
         reason: SkipReason,
     },
     /// The finalized watermark advanced: every slot at or below `slot` is now
-    /// finalized and can never be rolled back. Rows written with
-    /// `is_finalized = false` for slots in `previous_slot + 1..=slot` are now
-    /// permanent.
+    /// finalized and can never be rolled back. Rows already written for
+    /// slots in `previous_slot + 1..=slot` are now permanent (the tables
+    /// carry no finality flag; a row's finality follows from its `slot`).
     Final {
         /// The new finalized watermark.
         slot: u64,

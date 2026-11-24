@@ -12,6 +12,9 @@
 //!   [`ChainTip`] is consistent without a second, racy call.
 //! * **`getBlock` rejects blocks containing versioned transactions** unless
 //!   the request states the highest version it understands. It always does.
+//! * **A block header is a `getBlock` without transactions.**
+//!   `transactionDetails: none` and no rewards: the node answers with the
+//!   blockhash, parent and times only, a few hundred bytes.
 //! * **`getBlock` does not accept `processed`.** With that commitment
 //!   configured, blocks are fetched at `confirmed`, the lowest it supports.
 //! * **A skipped slot is an RPC error**, not an empty result. The skip codes
@@ -64,8 +67,8 @@ use tracing::warn;
 
 use super::config::{SolanaAdapterConfig, TransactionEncoding};
 use super::{
-    AccountData, AdapterMetrics, ChainAdapter, ChainBlock, ChainBlockData, ChainFamily, ChainTip,
-    CommitmentLevel,
+    AccountData, AdapterMetrics, BlockHeader, ChainAdapter, ChainBlock, ChainBlockData, ChainFamily,
+    ChainTip, CommitmentLevel,
 };
 use crate::types::error::{PrismError, PrismResult};
 
@@ -310,6 +313,29 @@ impl ChainAdapter for SolanaAdapter {
             parent_id: block.previous_blockhash.clone(),
             timestamp: block.block_time,
             raw: ChainBlockData::Solana(Box::new(block.into())),
+        })
+    }
+
+    /// One `getBlock` with `transactionDetails: none` and no rewards.
+    async fn get_block_header(&self, slot: u64, commitment: CommitmentLevel) -> PrismResult<BlockHeader> {
+        let config = RpcBlockConfig {
+            encoding: None,
+            transaction_details: Some(TransactionDetails::None),
+            rewards: Some(false),
+            commitment: Some(block_commitment_config(commitment)),
+            max_supported_transaction_version: Some(MAX_SUPPORTED_TRANSACTION_VERSION),
+        };
+        let block = self
+            .with_retry("getBlock", Some(slot), || {
+                self.client.get_block_with_config(slot, config)
+            })
+            .await?;
+        Ok(BlockHeader {
+            slot_or_height: slot,
+            block_id: block.blockhash,
+            parent_id: block.previous_blockhash,
+            parent_slot: block.parent_slot,
+            timestamp: block.block_time,
         })
     }
 

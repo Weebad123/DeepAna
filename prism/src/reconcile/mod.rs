@@ -15,7 +15,7 @@
 //! | File          | Holds                                                         |
 //! |---------------|---------------------------------------------------------------|
 //! | `mod.rs`      | [`Reconciler`]: the timer loop, one pass, the rewind trigger   |
-//! | [`classify`]  | pure: stored, produced and logged slots → findings             |
+//! | [`classify`]  | pure: stored blocks, produced and logged slots → findings      |
 //! | [`decide`]    | pure: two-pass rule, caps, mass-mismatch refusal → action      |
 //! | [`sources`]   | stored slots from Parquet, skip-log parser, chain truth        |
 //! | [`state`]     | `reconcile.json`: atomic persistence, quarantine               |
@@ -26,7 +26,13 @@
 //!
 //! # Rules
 //!
-//! * **Only the set of slots is compared**, never the rows' contents.
+//! * **Slots are compared as sets first**: stored, on the finalized chain,
+//!   logged as skipped. A slot both stored and on the chain must then be
+//!   the *same block*: its stored `parent_slot` must be the finalized
+//!   parent (free, from the block list) and, with
+//!   [`ReconcileConfig::verify_blockhashes`], its blockhash the finalized
+//!   one. Otherwise it is `mismatched`. Transactions and transfers are not
+//!   compared row by row: a slot re-ingested at `finalized` is the chain's.
 //! * **Only safe slots are examined**: at or below both the durable flush
 //!   edge (so their files are complete) and the finalized watermark (so the
 //!   chain's answer is final).
@@ -51,16 +57,26 @@
 //! # The rewind
 //!
 //! 1. `in_flight` is written to `reconcile.json`.
-//! 2. A [`ChangeEvent::Correction`] is emitted and the change log flushed.
-//! 3. The [`Rewind`] lowers the ingestor's cursor to `from_slot - 1`, then
-//!    deletes every file at or above `from_slot` (both idempotent; the
-//!    cursor goes first, so a crash between the two is finished by the
-//!    restart's own rollback).
-//! 4. The attempt and the rewind time are recorded and `in_flight` cleared.
+//! 2. The [`Rewind`] is asked to [correct](Rewind::correct): the ingestor
+//!    stops its pipeline without flushing, emits the
+//!    [`ChangeEvent::Correction`] and flushes the change log, lowers its
+//!    cursor to `from_slot - 1`, deletes every file at or above `from_slot`
+//!    and resumes. Stopping first means no `New` or `Skip` for a slot at or
+//!    above `from_slot` can land between the correction and the deletion:
+//!    every such event after the correction is from the re-ingest. Lowering
+//!    the cursor and deleting are idempotent, and the cursor goes first, so
+//!    a crash between the two is finished by the restart's own rollback.
+//! 4. The attempt and the rewind time are recorded and `in_flight` cleared,
+//!    unless recovery already did so (see below).
 //!
-//! A failure in 2 or 3 propagates out of [`Reconciler::run`] with
-//! `in_flight` still set. [`Reconciler::recover`], which the ingestor calls
-//! before its pipeline starts, then performs 3 and 4.
+//! A failure in 2 propagates out of [`Reconciler::run`] with `in_flight`
+//! still set. [`Reconciler::recover`], which the ingestor calls before its
+//! pipeline starts, then announces the correction again (it may never have
+//! been emitted), performs the rest of 2, and records 4.
+//!
+//! `reconcile.json` is the single source of truth: the reconciler reloads it
+//! at the start of every pass and before recording a rewind as done, so a
+//! completion recovery wrote is adopted rather than counted a second time.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -76,14 +92,14 @@ use crate::changelog::ChangeLog;
 use crate::ingestor::{IngestorCursor, SKIP_LOG_FILE_NAME};
 use crate::storage::{ParquetWriter, Storage};
 use crate::types::error::{PrismError, PrismResult};
-use crate::types::event::ChangeEvent;
-
 pub mod classify;
 pub mod decide;
 pub mod sources;
 pub mod state;
 
-pub use classify::{Classification, Finding, FindingKind, SlotWindow, classify};
+pub use classify::{
+    Classification, FinalizedChain, Finding, FindingKind, SlotWindow, StoredBlock, classify, classify_blocks,
+};
 pub use decide::{Action, Decision, Limits, RewindPlan, decide, plan_window};
 pub use sources::SkipLogReader;
 pub use state::{
@@ -114,6 +130,21 @@ pub trait Rewind: Send + Sync {
     /// file at or above `from_slot` and resume from there. Returns once the
     /// cursor and the files are changed. Idempotent.
     async fn rewind_to(&self, from_slot: u64) -> PrismResult<()>;
+
+    /// Announce `correction` on `changelog` and rewind to its `from_slot`.
+    ///
+    /// The default emits and flushes first, then calls [`Self::rewind_to`].
+    /// An implementation that owns a running pipeline should override it to
+    /// stop the pipeline *before* announcing, so that nothing it writes for
+    /// slots at or above `from_slot` is announced after the correction (the
+    /// ingestor's [`IngestorRewinder`](crate::ingestor::IngestorRewinder)
+    /// does, through its own change log). Either way, nothing is rewound
+    /// unless the announcement was made durable.
+    async fn correct(&self, correction: &InFlight, changelog: &dyn ChangeLog) -> PrismResult<()> {
+        changelog.emit(correction.event())?;
+        changelog.flush()?;
+        self.rewind_to(correction.from_slot).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +161,16 @@ pub struct ReconcileConfig {
     pub start_slot: Option<u64>,
     /// The skip log to read. `None` is `{data_dir}/skipped_slots.log`.
     pub skip_log_path: Option<PathBuf>,
+    /// How far below a window to look for the finalized parent of its first
+    /// block (the lineage check). Longer runs of skipped slots than this
+    /// leave that one slot's lineage unchecked.
+    pub lineage_lookback: u64,
+    /// Also compare every stored blockhash of a window with the finalized
+    /// block's: one header request per stored slot. Catches a stored block
+    /// with the right parent but other contents (a duplicate block), which
+    /// the free checks cannot see. Off by default: it costs as many requests
+    /// as the window has blocks, shared with ingestion's rate limit.
+    pub verify_blockhashes: bool,
     pub limits: Limits,
 }
 
@@ -139,6 +180,8 @@ impl Default for ReconcileConfig {
             interval: Duration::from_secs(60),
             start_slot: None,
             skip_log_path: None,
+            lineage_lookback: 512,
+            verify_blockhashes: false,
             limits: Limits::default(),
         }
     }
@@ -184,6 +227,7 @@ pub struct PassReport {
     pub window: SlotWindow,
     pub examined: u64,
     pub orphaned: u64,
+    pub mismatched: u64,
     pub missing: u64,
     pub false_skip: u64,
     pub unlogged_skip: u64,
@@ -309,14 +353,21 @@ impl Reconciler {
         })
     }
 
-    /// Finish a rewind a crash or failure interrupted: lower `cursor` to
+    /// Finish a rewind a crash or failure interrupted: announce its
+    /// correction on `changelog` again (a crash may have come before it was
+    /// emitted; delivery is at least once), lower `cursor` to
     /// `from_slot - 1`, delete the files at or above `from_slot` (both
     /// idempotent) and record the rewind as done. Run before the pipeline
     /// starts, which [`Ingestor::run`](crate::ingestor::Ingestor::run) does.
     ///
     /// Returns the rewind point when there was a rewind to finish. A missing
-    /// state file has none; a corrupt one is quarantined.
-    pub fn recover(data_dir: impl AsRef<Path>, cursor: &IngestorCursor) -> PrismResult<Option<u64>> {
+    /// state file has none; a corrupt one is quarantined. Nothing is deleted
+    /// unless the announcement was made durable.
+    pub fn recover(
+        data_dir: impl AsRef<Path>,
+        cursor: &IngestorCursor,
+        changelog: &dyn ChangeLog,
+    ) -> PrismResult<Option<u64>> {
         let data_dir = data_dir.as_ref();
         let store = StateStore::new(data_dir);
         let Some(mut state) = store.load()? else {
@@ -332,6 +383,8 @@ impl Reconciler {
             reason = %in_flight.reason,
             "finishing an interrupted reconcile rewind"
         );
+        changelog.emit(in_flight.event())?;
+        changelog.flush()?;
         cursor.rewind(from_slot)?;
         ParquetWriter::new(data_dir).rollback(from_slot)?;
         state.complete_in_flight(now());
@@ -419,16 +472,16 @@ impl Reconciler {
     /// One pass: finish a rewind left in flight, check the cluster, plan
     /// the window, read the sources, classify, decide, persist, act.
     pub async fn run_pass(&mut self) -> PrismResult<PassOutcome> {
+        // The file is the truth: recovery may have changed it since.
+        self.reload()?;
         if let Some(reason) = self.state.halted {
             return Ok(PassOutcome::Halted(reason));
         }
         if let Some(in_flight) = self.state.in_flight.clone() {
             // Recovery did not run (or the rewind failed after it): the
-            // ingestor finishes it now. Idempotent.
-            self.rewinder.rewind_to(in_flight.from_slot).await?;
-            self.state.complete_in_flight(now());
-            self.save()?;
-            lock(&self.stats).rewinds += 1;
+            // ingestor finishes it now, announcing it again. Idempotent.
+            self.rewinder.correct(&in_flight, self.changelog.as_ref()).await?;
+            self.finish_rewind(&in_flight)?;
         }
 
         let genesis = self.ctx.genesis_hash();
@@ -531,9 +584,15 @@ impl Reconciler {
     async fn gather(&mut self, window: SlotWindow) -> PrismResult<Classification> {
         self.skip_log.refresh()?;
         let logged = self.skip_log.logged_in(window);
-        let stored = sources::stored_slots(&self.data_dir, window)?;
-        let produced = sources::produced_slots(self.adapter.as_ref(), window).await?;
-        Ok(classify(window, &stored, &produced, &logged))
+        let stored = sources::stored_blocks(&self.data_dir, window)?;
+        let chain = sources::finalized_chain(self.adapter.as_ref(), window, self.config.lineage_lookback).await?;
+        let hashes = if self.config.verify_blockhashes {
+            let both = stored.keys().copied().filter(|slot| chain.produced.contains(slot));
+            sources::finalized_blockhashes(self.adapter.as_ref(), both).await?
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        Ok(classify_blocks(window, &stored, &chain, &logged, &hashes))
     }
 
     /// Steps 1 to 4 of the module docs.
@@ -554,17 +613,36 @@ impl Reconciler {
             started_at: now(),
         });
         self.save()?;
-        self.changelog.emit(ChangeEvent::correction(
-            plan.from_slot,
-            plan.to_slot,
-            plan.reason,
-            plan.affected(),
-        ))?;
-        self.changelog.flush()?;
-        self.rewinder.rewind_to(plan.from_slot).await?;
-        self.state.complete_in_flight(now());
-        self.save()?;
+        let in_flight = self.state.in_flight.clone().expect("just set");
+        self.rewinder.correct(&in_flight, self.changelog.as_ref()).await?;
+        self.finish_rewind(&in_flight)?;
+        Ok(())
+    }
+
+    /// Step 4: record `in_flight` as done, unless someone else (recovery, in
+    /// [`Ingestor::run`](crate::ingestor::Ingestor::run)) already did, in
+    /// which case their record is adopted and the rewind not counted twice.
+    fn finish_rewind(&mut self, in_flight: &InFlight) -> PrismResult<()> {
+        self.reload()?;
+        match &self.state.in_flight {
+            Some(current) if current.is_same_rewind(in_flight) => {
+                self.state.complete_in_flight(now());
+                self.save()?;
+            }
+            _ => info!(
+                from_slot = in_flight.from_slot,
+                "the rewind was already recorded as done by recovery"
+            ),
+        }
         lock(&self.stats).rewinds += 1;
+        Ok(())
+    }
+
+    /// Replace the working copy with what `reconcile.json` holds (a fresh
+    /// state when there is no file), and publish it.
+    fn reload(&mut self) -> PrismResult<()> {
+        self.state = self.store.load()?.unwrap_or_default();
+        *lock(&self.shared_state) = self.state.clone();
         Ok(())
     }
 
@@ -595,6 +673,7 @@ impl Reconciler {
             window: classification.window,
             examined: classification.examined,
             orphaned: classification.count(FindingKind::Orphaned),
+            mismatched: classification.count(FindingKind::Mismatched),
             missing: classification.count(FindingKind::Missing),
             false_skip: classification.count(FindingKind::FalseSkip),
             unlogged_skip: classification.count(FindingKind::UnloggedSkip),
