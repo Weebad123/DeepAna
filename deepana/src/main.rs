@@ -36,8 +36,9 @@ struct Cli {
     #[arg(long)]
     open: bool,
     /// The COMMONS repository (artifacts/ + fixtures/) the dashboard
-    /// verifies. Only read. Default: <DIR>/commons.
-    #[arg(long, value_name = "PATH")]
+    /// verifies. Only read. Default: <DIR>/commons. `--repo-root` is an
+    /// alias, the name `commons verify` uses.
+    #[arg(long, visible_alias = "repo-root", value_name = "PATH")]
     commons_root: Option<PathBuf>,
 }
 

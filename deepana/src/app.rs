@@ -16,6 +16,8 @@
 //!     /api/stream           SSE
 //!     /api/commons/report   last COMMONS verify report
 //!     /api/commons/verify   POST: run verify now
+//!     /api/demo/alert       POST: create FORGE's demo alert
+//!     /demo/hook            POST: the demo alert's webhook
 //! ```
 //!
 //! # Supervision: fail-stop
@@ -33,8 +35,9 @@
 use std::net::SocketAddr;
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use oracle::Oracle;
@@ -44,6 +47,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::commons_panel::CommonsPanel;
 use crate::config::{FORGE_PREFIX, LENS_PREFIX, ORACLE_PREFIX, ServiceConfigs};
+use crate::demo_hook::{self, DEMO_ALERT_NAME, DEMO_HOOK_PATH, DemoHook};
 use crate::layout::Layout;
 use crate::stream::{self, Hub};
 
@@ -55,6 +59,9 @@ pub const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 pub struct AppState {
     pub hub: Hub,
     pub commons: CommonsPanel,
+    pub demo: DemoHook,
+    /// The nested service routers, for in-process calls.
+    pub api: Router,
 }
 
 /// The services' routers, nested under their prefixes.
@@ -69,6 +76,8 @@ pub fn app_router(api: Router, state: AppState) -> Router {
         .route("/api/stream", get(stream_handler))
         .route("/api/commons/report", get(commons_report))
         .route("/api/commons/verify", post(commons_verify))
+        .route("/api/demo/alert", post(demo_alert))
+        .route(DEMO_HOOK_PATH, post(demo_receive))
         .with_state(state);
     own.merge(api)
 }
@@ -97,6 +106,21 @@ async fn commons_verify(State(state): State<AppState>) -> Response {
     let report = state.commons.verify().await;
     state.hub.publish_commons(report.clone());
     axum::Json(report).into_response()
+}
+
+async fn demo_alert(State(state): State<AppState>) -> Response {
+    let (status, body) = state.demo.create(&state.api).await;
+    (status, axum::Json(body)).into_response()
+}
+
+async fn demo_receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let (status, receipt) = state.demo.receive(&headers, &body, demo_hook::now_secs());
+    if !status.is_success() {
+        tracing::warn!(reason = %receipt["error"], "refused a /demo/hook request");
+    }
+    state.hub.publish_demo_delivery(receipt);
+    let answer = if status.is_success() { json!({ "ok": true }) } else { json!({ "error": "signature check failed" }) };
+    (status, axum::Json(answer)).into_response()
 }
 
 /// What [`run`] needs.
@@ -154,6 +178,7 @@ pub async fn serve_on(
 ) -> Result<(), RunError> {
     let local = listener.local_addr().map_err(|err| RunError::one(format!("listener address: {err}")))?;
     let ServiceConfigs { lens: lens_config, forge: forge_config, oracle: oracle_config } = configs;
+    let settings = dashboard_settings(&oracle_config);
 
     // LENS first: it creates the change log FORGE opens.
     let lens = lens::start(lens_config, root.clone())
@@ -184,9 +209,26 @@ pub async fn serve_on(
 
     let api = api_router(lens.router(), forge.router(), oracle.router());
     let hub = Hub::new(layout.changelog(), layout.root().display().to_string(), root.clone());
+    hub.set_settings(settings);
     let poller = tokio::spawn(hub.clone().run(api.clone()));
-    let state = AppState { hub: hub.clone(), commons: commons.clone() };
-    let app = app_router(api, state);
+    let demo = DemoHook::new(local);
+    let state = AppState { hub: hub.clone(), commons: commons.clone(), demo: demo.clone(), api: api.clone() };
+    let app = app_router(api.clone(), state);
+
+    // An existing demo alert gets this process's secret and webhook URL.
+    let demo_sync = tokio::spawn({
+        let root = root.clone();
+        async move {
+            tokio::select! {
+                () = root.cancelled() => {}
+                synced = demo.sync(&api) => match synced {
+                    Ok(Some(_)) => tracing::info!(alert = DEMO_ALERT_NAME, "demo alert now delivers to this process"),
+                    Ok(None) => {}
+                    Err(err) => tracing::warn!(alert = DEMO_ALERT_NAME, error = %err, "cannot update the demo alert"),
+                },
+            }
+        }
+    });
 
     // A first COMMONS report, so the panel is not empty.
     let first_verify = tokio::spawn({
@@ -251,6 +293,7 @@ pub async fn serve_on(
     }
     let _ = poller.await;
     let _ = first_verify.await;
+    let _ = demo_sync.await;
     let (l, f, o) = tokio::join!(lens.wait(), forge.wait(), oracle.wait());
     failures.extend(l.err().map(|e| format!("LENS: {e}")));
     failures.extend(f.err().map(|e| format!("FORGE: {e}")));
@@ -262,6 +305,21 @@ pub async fn serve_on(
     } else {
         Err(RunError { failures })
     }
+}
+
+/// What the dashboard needs that no API serves: ORACLE's slot time and
+/// detector baseline, and the demo alert's name.
+pub fn dashboard_settings(oracle: &oracle::OracleConfig) -> serde_json::Value {
+    use oracle::detect::detectors::{SLOT_MS, bucket_slots};
+    json!({
+        "ms_per_slot": SLOT_MS,
+        "bucket_secs": oracle.bucket_secs(),
+        "bucket_slots": bucket_slots(oracle.bucket_secs()),
+        // Buckets of history a detector needs before it scores anything.
+        "baseline_need_buckets": oracle::detect::min_history(u64::from(oracle.baseline_buckets())),
+        "digest_buckets": oracle::digest::DIGEST_BUCKETS,
+        "demo_alert_name": DEMO_ALERT_NAME,
+    })
 }
 
 /// Open `url` in the default browser. Best effort: a failure is logged.

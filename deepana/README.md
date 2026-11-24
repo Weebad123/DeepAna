@@ -14,7 +14,7 @@ cargo run -p deepana -- --parquet-directory ./data --open
 |------|---------|
 | `--parquet-directory <DIR>` | The data directory (required, created if missing). The same flag LENS takes. |
 | `--open` | Open the dashboard in the default browser once it is up. |
-| `--commons-root <PATH>` | COMMONS repository (`artifacts/` + `fixtures/`) to verify. Default `<DIR>/commons`. Only read. |
+| `--commons-root <PATH>`, `--repo-root <PATH>` | COMMONS repository (`artifacts/` + `fixtures/`) to verify. Default `<DIR>/commons`. Only read. Without one the panel says "not configured". |
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -52,6 +52,12 @@ working directory.
 | `/api/oracle/...` | ORACLE (`/ask`, `/anomalies`, `/digest`, `/health`, ...) |
 | `/api/stream` | Server-sent events feeding the dashboard |
 | `/api/commons/report`, `POST /api/commons/verify` | COMMONS verify |
+| `POST /api/demo/alert` | Create FORGE's demo alert (every 50th slot) |
+| `POST /demo/hook` | The demo alert's webhook: checks the signature, keeps the last 50 deliveries in memory |
+
+The demo alert's secret is generated per process and never leaves the
+server: not in any response, not on disk. On startup an existing demo alert
+is given the new secret and this process's webhook URL.
 
 FORGE and ORACLE reach LENS at `http://127.0.0.1:<port>/api/lens`, through
 this same port.
@@ -80,5 +86,7 @@ One background poller feeds a broadcast channel, however many tabs are
 open. It tails `<DIR>/changelog.jsonl` every second, and every 3 seconds
 asks (in-process, not over TCP) LENS, FORGE and ORACLE for their health,
 LENS for `MAX(slot)`, FORGE for its alerts and recent deliveries, and ORACLE
-for new anomalies and the latest digest. A tab gets a full snapshot when it
-connects.
+for its detectors, new anomalies and the latest digest. `/demo/hook` receipts
+are pushed as they arrive. A tab gets a full snapshot when it connects.
+Data quality is not on the stream: each tab fetches `/api/oracle/quality`
+itself on load and every 5 minutes, one request at a time.

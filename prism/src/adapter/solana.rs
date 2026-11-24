@@ -78,6 +78,9 @@ pub type RateLimiter = governor::DefaultDirectRateLimiter;
 /// SDK and raise this.
 const MAX_SUPPORTED_TRANSACTION_VERSION: u8 = 1;
 
+/// Widest slot range one `getBlocks` call may cover (an RPC limit).
+const MAX_GET_BLOCKS_RANGE: u64 = 500_000;
+
 /// JSON-RPC 2.0 "Internal error": the node failed while serving the request.
 const JSON_RPC_INTERNAL_ERROR: i64 = -32603;
 
@@ -285,11 +288,15 @@ impl ChainAdapter for SolanaAdapter {
     }
 
     async fn get_block(&self, slot: u64) -> PrismResult<ChainBlock> {
+        self.get_block_at(slot, self.config.commitment).await
+    }
+
+    async fn get_block_at(&self, slot: u64, commitment: CommitmentLevel) -> PrismResult<ChainBlock> {
         let config = RpcBlockConfig {
             encoding: Some(self.config.encoding.into()),
             transaction_details: Some(TransactionDetails::Full),
             rewards: Some(true),
-            commitment: Some(block_commitment_config(self.config.commitment)),
+            commitment: Some(block_commitment_config(commitment)),
             max_supported_transaction_version: Some(MAX_SUPPORTED_TRANSACTION_VERSION),
         };
         let block = self
@@ -304,6 +311,42 @@ impl ChainAdapter for SolanaAdapter {
             timestamp: block.block_time,
             raw: ChainBlockData::Solana(Box::new(block.into())),
         })
+    }
+
+    /// One `getBlocks` call per [`MAX_GET_BLOCKS_RANGE`] slots.
+    async fn get_blocks_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        commitment: CommitmentLevel,
+    ) -> PrismResult<Vec<u64>> {
+        let commitment = block_commitment_config(commitment);
+        let mut produced = Vec::new();
+        let mut start = from;
+        while start <= to {
+            let end = to.min(start.saturating_add(MAX_GET_BLOCKS_RANGE - 1));
+            let slots = self
+                .with_retry("getBlocks", None, || {
+                    self.client.get_blocks_with_commitment(start, Some(end), commitment)
+                })
+                .await?;
+            // No slot is passed above: a "slot skipped" code must not be read
+            // as an answer about one slot. Nor is an answer outside the
+            // requested range trusted.
+            produced.extend(slots.into_iter().filter(|slot| (start..=end).contains(slot)));
+            let Some(next) = end.checked_add(1) else { break };
+            start = next;
+        }
+        produced.sort_unstable();
+        produced.dedup();
+        Ok(produced)
+    }
+
+    async fn genesis_hash(&self) -> PrismResult<String> {
+        let hash = self
+            .with_retry("getGenesisHash", None, || self.client.get_genesis_hash())
+            .await?;
+        Ok(hash.to_string())
     }
 
     async fn get_accounts(&self, addresses: &[String]) -> PrismResult<Vec<Option<AccountData>>> {

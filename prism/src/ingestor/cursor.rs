@@ -23,6 +23,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -89,6 +90,8 @@ impl CursorState {
 pub struct IngestorCursor {
     path: Arc<PathBuf>,
     state: Arc<Mutex<CursorState>>,
+    /// `last_flush_slot` as of the last successful persist (or load).
+    durable_flush: Arc<AtomicU64>,
 }
 
 impl IngestorCursor {
@@ -114,6 +117,7 @@ impl IngestorCursor {
         };
         Ok(Self {
             path: Arc::new(path),
+            durable_flush: Arc::new(AtomicU64::new(state.last_flush_slot)),
             state: Arc::new(Mutex::new(state)),
         })
     }
@@ -179,12 +183,52 @@ impl IngestorCursor {
         Ok(flushed)
     }
 
+    /// The flush edge as it is on disk: `last_flush_slot` of the last
+    /// successful [`Self::persist`] (or of the loaded file). Every slot up to
+    /// it has its files written. Lags [`CursorState::last_flush_slot`] only
+    /// between a flush and its persist, or after a failed persist.
+    pub fn durable_flush_slot(&self) -> u64 {
+        self.durable_flush.load(Ordering::Acquire)
+    }
+
+    /// Move both edges down so that ingestion resumes at `from_slot`, and
+    /// persist. For a rewind: whatever was buffered is being thrown away, so
+    /// the processed edge drops to the flush edge too.
+    ///
+    /// The flush edge becomes `min(last_flush_slot, from_slot - 1)`: it is
+    /// never raised. Idempotent. Fails with [`PrismError::ConfigError`] when
+    /// `from_slot` is below 2, which would leave a cursor that looks fresh
+    /// and resumes somewhere else entirely.
+    pub fn rewind(&self, from_slot: u64) -> PrismResult<()> {
+        if from_slot < 2 {
+            return Err(PrismError::config(
+                "from_slot",
+                format!("cannot rewind the cursor to slot {from_slot}"),
+            ));
+        }
+        {
+            let mut state = self.lock();
+            let flush = state.last_flush_slot.min(from_slot - 1);
+            if flush != state.last_flush_slot || state.last_processed_slot != flush {
+                state.last_flush_slot = flush;
+                state.last_processed_slot = flush;
+                // The blockhash belonged to a slot that is no longer
+                // processed.
+                state.last_processed_blockhash.clear();
+                state.updated_at = now();
+            }
+        }
+        self.persist()
+    }
+
     /// Write the current state to disk atomically.
     pub fn persist(&self) -> PrismResult<()> {
         let state = self.state();
         let json = serde_json::to_vec_pretty(&state)
             .map_err(|err| cursor_error(&self.path, invalid_data(err)))?;
-        write_atomically(&self.path, &json).map_err(|err| cursor_error(&self.path, err))
+        write_atomically(&self.path, &json).map_err(|err| cursor_error(&self.path, err))?;
+        self.durable_flush.store(state.last_flush_slot, Ordering::Release);
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, CursorState> {

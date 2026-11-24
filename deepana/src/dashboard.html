@@ -77,6 +77,32 @@
   .error { color: var(--red); }
   details summary { cursor: pointer; color: var(--dim); font-size: 12px; }
   pre { white-space: pre-wrap; font: 12px var(--mono); color: var(--dim); margin: 6px 0; }
+
+  /* Pipeline lag */
+  .lag { flex: 1.4; }
+  .lag .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 12px; color: var(--dim); }
+  .lag .row b { font: 600 15px var(--mono); color: var(--text); white-space: nowrap; }
+  .lag .row b.amber { color: var(--amber); } .lag .row b.red { color: var(--red); }
+
+  /* Ask ORACLE: as tall as the change log, its own scroll */
+  .ask-panel { display: flex; flex-direction: column; }
+  .ask-body { flex: 1 1 0; min-height: 0; overflow: auto; contain: size; }
+  .ask-body .scroll { max-height: none; overflow: visible; }
+  @media (max-width: 1100px) { .ask-body { flex: none; contain: none; max-height: 480px; } }
+  .recent { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin: 0 0 8px; font-size: 12px; color: var(--dim); }
+  .recent .chip { font-size: 11px; padding: 1px 8px; }
+  .notes { color: var(--dim); font-size: 12px; margin: 4px 0; padding-left: 18px; }
+  .warnings { color: var(--amber); font-size: 12px; margin: 4px 0; }
+
+  /* Neutral and warning notices, and wrapping long text */
+  .notice { color: var(--dim); border: 1px dashed var(--line); border-radius: 6px; padding: 8px 10px; overflow-wrap: anywhere; }
+  .notice code { color: var(--text); font-family: var(--mono); }
+  .notice.warn { color: var(--amber); border-color: #d2992266; }
+  #commons .wrap, #commons .meta { overflow-wrap: anywhere; }
+  #commons td { white-space: nowrap; } #commons td.wrap { white-space: normal; }
+  #commons td .tag { margin: 1px 0; }
+  .progress { font-size: 12px; color: var(--dim); margin-top: 8px; }
+  .progress div { font-family: var(--mono); overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -93,12 +119,18 @@
       <div class="stage"><div class="name"><span class="light" id="l-lens"></span>LENS</div><div class="detail" id="d-lens">–</div></div>
       <div class="stage"><div class="name"><span class="light" id="l-forge"></span>FORGE</div><div class="detail" id="d-forge">–</div></div>
       <div class="stage"><div class="name"><span class="light" id="l-oracle"></span>ORACLE</div><div class="detail" id="d-oracle">–</div></div>
+      <div class="stage lag">
+        <div class="row"><span>PRISM behind chain</span><b id="lag-prism">n/a</b></div>
+        <div class="detail" id="lag-prism-sub">highest Final slot − newest New slot</div>
+        <div class="row"><span>LENS behind PRISM</span><b id="lag-lens">n/a</b></div>
+        <div class="detail" id="lag-lens-sub">newest New slot − MAX(slot) in LENS</div>
+      </div>
       <div class="stage slot"><div class="detail">newest slot in LENS</div><div class="big" id="newest-slot">–</div><div class="detail" id="slot-sub"></div></div>
     </div>
   </section>
 
   <!-- Ask ORACLE -->
-  <section class="panel w7">
+  <section class="panel w7 ask-panel">
     <h2>Ask ORACLE <span class="sub" id="ask-status"></span></h2>
     <div class="tabs">
       <button class="active" data-tab="ask">Question</button>
@@ -110,13 +142,14 @@
         <button type="submit" id="ask-btn">Ask</button>
       </form>
       <div class="chips" id="ask-chips"></div>
+      <div class="recent" id="ask-recent"></div>
     </div>
     <div id="tab-sql" hidden>
       <textarea id="sql-input" spellcheck="false"></textarea>
       <div class="chips" id="sql-chips"></div>
       <button id="sql-btn">Run on LENS</button>
     </div>
-    <div class="answer" id="answer"></div>
+    <div class="ask-body"><div class="answer" id="answer"></div></div>
   </section>
 
   <!-- Changelog feed -->
@@ -144,21 +177,23 @@
     <h2>FORGE alerts and deliveries <span class="sub" id="forge-sub"></span></h2>
     <div class="counts" id="outbox"></div>
     <table><thead><tr><th>alert</th><th>enabled</th><th class="num">last evaluated slot</th><th>webhook</th></tr></thead><tbody id="alerts"></tbody></table>
+    <div id="forge-demo" style="margin-top:8px"></div>
     <h2 style="margin-top:12px">Recent deliveries</h2>
-    <div class="scroll" style="max-height:200px"><table><thead><tr><th>status</th><th>alert</th><th class="num">to slot</th><th class="num">attempts</th><th>last error</th><th>created</th></tr></thead><tbody id="deliveries"></tbody></table></div>
+    <div class="scroll" style="max-height:200px"><table><thead><tr><th>status</th><th>alert</th><th class="num">to slot</th><th class="num">attempts</th><th>last error</th><th>received by /demo/hook</th><th>created</th></tr></thead><tbody id="deliveries"></tbody></table></div>
   </section>
 
   <!-- ORACLE anomalies -->
   <section class="panel w7">
     <h2>ORACLE anomalies <span class="sub" id="anom-sub"></span></h2>
     <div class="scroll"><table><thead><tr><th>metric</th><th>subject</th><th>kind</th><th class="num">score</th><th class="num">value</th><th class="num">baseline</th><th class="num">slots</th><th>detected</th></tr></thead><tbody id="anomalies"></tbody></table></div>
+    <div class="progress" id="detectors"></div>
   </section>
 
   <!-- Digest + quality -->
   <section class="panel w5">
     <h2>Digest <span class="sub" id="digest-sub"></span></h2>
     <div id="digest"><div class="empty">no digest yet: ORACLE builds one once a full window of data is in</div></div>
-    <h2 style="margin-top:14px">Data quality <span class="sub" id="quality-sub"></span></h2>
+    <h2 style="margin-top:14px">Data quality <span class="sub"><span id="quality-sub"></span> <button class="secondary" id="quality-btn">Run now</button></span></h2>
     <div id="quality"><div class="empty">–</div></div>
   </section>
 
@@ -185,7 +220,7 @@ const tag = (t) => `<span class="tag ${esc(String(t).toLowerCase())}">${esc(t)}<
 const light = (id, cls) => { $(id).className = "light " + (cls || ""); };
 const statusClass = (s) => s === "healthy" ? "ok" : s === "degraded" ? "warn" : s ? "bad" : "";
 
-const state = { feed: [], prism: null, status: null, anomalies: [], digest: null, commons: null, seen: new Set() };
+const state = { feed: [], prism: null, status: null, anomalies: [], digest: null, commons: null, seen: new Set(), settings: {}, demoDeliveries: [] };
 const filters = { new: true, skip: true, final: true };
 
 // ---- SSE ------------------------------------------------------------------
@@ -200,6 +235,7 @@ function connect() {
     addEvents(s.changelog || []);
     state.prism = s.prism; state.status = s.status; state.anomalies = s.anomalies || [];
     state.digest = s.digest; state.commons = s.commons;
+    state.settings = s.settings || {}; state.demoDeliveries = s.demo_deliveries || [];
     renderAll();
   });
   es.addEventListener("changelog", (e) => { const d = JSON.parse(e.data); addEvents(d.events); state.prism = d.prism; renderFeed(); renderPrism(); });
@@ -210,6 +246,9 @@ function connect() {
   });
   es.addEventListener("digest", (e) => { state.digest = JSON.parse(e.data); renderDigest(); });
   es.addEventListener("commons", (e) => { state.commons = JSON.parse(e.data); renderCommons(); });
+  es.addEventListener("demo_delivery", (e) => {
+    state.demoDeliveries = [JSON.parse(e.data)].concat(state.demoDeliveries).slice(0, 50); renderDeliveries(); renderForgeDemo();
+  });
 }
 function addEvents(events) {
   for (const ev of events) {
@@ -223,6 +262,47 @@ function addEvents(events) {
 // ---- Rendering ------------------------------------------------------------
 function renderAll() { renderPrism(); renderFeed(); renderStatus(); renderAnomalies(); renderDigest(); renderCommons(); }
 
+// ---- Pipeline lag -----------------------------------------------------------
+// PRISM behind chain: highest Final slot − newest New slot. LENS behind PRISM:
+// newest New slot − MAX(slot) in LENS. Neutral up to 200 slots, amber above,
+// red above 1000. The PRISM trend compares with the value about 60 s ago.
+const LAG_WINDOW_MS = 60000;
+const lagHistory = [];
+const lagClass = (slots) => slots > 1000 ? "red" : slots > 200 ? "amber" : "";
+const dur = (secs) => secs < 90 ? `${Math.round(secs)} s` : secs < 5400 ? `${(secs / 60).toFixed(1)} min` : `${(secs / 3600).toFixed(1)} h`;
+// 400 ms per slot unless DeepAna says otherwise (it passes ORACLE's own setting).
+const slotSecs = (slots) => "≈ " + dur(slots * (state.settings.ms_per_slot || 400) / 1000);
+function renderLag() {
+  const p = state.prism || {};
+  const fin = p.last_final_slot, newest = p.last_new_slot, lens = state.status?.lens?.newest_slot;
+  const prism = (fin != null && newest != null) ? fin - newest : null;
+  const lensLag = (newest != null && lens != null) ? newest - lens : null;
+  const now = Date.now();
+
+  const pb = $("lag-prism"), ps = $("lag-prism-sub");
+  if (prism === null) { pb.textContent = "n/a"; pb.className = ""; ps.textContent = "needs a Final and a New event in the change log"; lagHistory.length = 0; }
+  else {
+    const behind = Math.max(0, prism);
+    if (!lagHistory.length || lagHistory[lagHistory.length - 1].v !== behind || now - lagHistory[lagHistory.length - 1].t > 5000) lagHistory.push({ t: now, v: behind });
+    // Keep the newest sample at least 60 s old, and everything after it.
+    while (lagHistory.length > 1 && lagHistory[1].t <= now - LAG_WINDOW_MS) lagHistory.shift();
+    const then = lagHistory[0], span = Math.round((now - then.t) / 1000);
+    const arrow = behind > then.v ? "↑" : behind < then.v ? "↓" : "→";
+    const trend = span < 5 ? "" : `${arrow} ${behind > then.v ? "grew" : behind < then.v ? "shrank" : "steady"} over ${span >= 55 ? "the last 60 s" : `${span} s`}`;
+    pb.textContent = `${behind.toLocaleString()} slots ${span < 5 ? "" : arrow}`.trim(); pb.className = lagClass(behind);
+    pb.title = span < 5 ? "" : `was ${then.v.toLocaleString()} slots ${span} s ago`;
+    ps.textContent = [slotSecs(behind), trend, prism < 0 ? `New is ${(-prism).toLocaleString()} past Final` : ""].filter(Boolean).join(" · ");
+  }
+
+  const lb = $("lag-lens"), ls = $("lag-lens-sub");
+  if (lensLag === null) { lb.textContent = "n/a"; lb.className = ""; ls.textContent = "needs a New event and a slot in LENS"; }
+  else {
+    const behind = Math.max(0, lensLag);
+    lb.textContent = `${behind.toLocaleString()} slots`; lb.className = lagClass(behind);
+    ls.textContent = lensLag < 0 ? `LENS is ${(-lensLag).toLocaleString()} past the change log` : "newest New slot − MAX(slot) in LENS";
+  }
+}
+
 function renderPrism() {
   const p = state.prism;
   if (!p || !p.last_event_at) { light("l-prism", ""); $("d-prism").textContent = "no change log events yet"; }
@@ -234,6 +314,7 @@ function renderPrism() {
   $("prism-counts").innerHTML = p ? [
     ["New", p.new_events], ["Skip", p.skip_events], ["Final", p.final_events], ["finalized ≤", p.last_final_slot],
   ].map(([k, v]) => `<div><b>${num(v)}</b><span>${k}</span></div>`).join("") : "";
+  renderLag();
 }
 
 function renderFeed() {
@@ -258,7 +339,7 @@ function renderStatus() {
   $("slot-sub").textContent = s.lens.newest_slot_error ? s.lens.newest_slot_error : (s.lens.newest_slot == null ? "no rows yet" : "MAX(slot) in solana.slots");
   const tables = lh.tables || {};
   $("lens-tables").innerHTML = Object.keys(tables).length ? Object.entries(tables).map(([name, t]) =>
-    `<tr><td class="mono">${esc(name)}</td><td class="num">${num(t.file_count)}</td><td>${t.registered ? tag("pass") : (t.dir_exists ? tag("fail") : "–")}</td></tr>`).join("")
+    `<tr><td class="mono">${esc(name)}</td><td class="num">${num(t.file_count)}</td><td>${t.registered ? "yes" : "no"}</td></tr>`).join("")
     : `<tr><td colspan="3" class="empty">${esc(lh.error || "–")}</td></tr>`;
   $("lens-sub").textContent = lh.status || "";
   $("lens-kv").innerHTML = lh.catalog ? [
@@ -276,20 +357,100 @@ function renderStatus() {
   $("outbox").innerHTML = ob ? [["held", ob.held], ["pending", ob.pending], ["delivered", ob.delivered], ["failed", ob.failed]]
     .map(([k, v]) => `<div><b>${num(v)}</b><span>${k}</span></div>`).join("") : "";
   const alerts = s.forge.alerts?.alerts || [];
-  const names = Object.fromEntries(alerts.map((a) => [a.id, a.name]));
   $("alerts").innerHTML = alerts.length ? alerts.map((a) =>
     `<tr><td>${esc(a.name)}</td><td>${a.enabled ? tag("pass") : tag("held")}</td><td class="num">${num(a.last_evaluated_slot)}</td><td class="mono">${esc(a.webhook_url)}</td></tr>`).join("")
-    : `<tr><td colspan="4" class="empty">${esc(s.forge.alerts?.error || "no alerts: create one with POST /api/forge/alerts")}</td></tr>`;
-  const ds = s.forge.deliveries || [];
-  $("deliveries").innerHTML = ds.length ? ds.map((d) =>
-    `<tr><td>${tag(d.status)}</td><td>${esc(names[d.alert_id] || short(d.alert_id, 6))}</td><td class="num">${num(d.to_slot)}</td><td class="num">${num(d.attempts)}</td><td>${esc(d.last_error || "")}</td><td>${ago(d.created_at / 1000)}</td></tr>`).join("")
-    : `<tr><td colspan="6" class="empty">no deliveries yet</td></tr>`;
+    : `<tr><td colspan="4" class="empty">${esc(s.forge.alerts?.error || "no alerts yet")}</td></tr>`;
+  renderForgeDemo();
+  renderDeliveries();
 
   // ORACLE
   const oh = s.oracle.health || {};
   light("l-oracle", oh.error ? "bad" : statusClass(oh.status));
   $("d-oracle").textContent = oh.error ? oh.error : `${oh.status} · ${num(oh.store?.anomalies)} anomalies · ${num(oh.store?.digests)} digests`;
-  renderQuality();
+  renderDetectors();
+  renderDigest();
+}
+
+// ---- FORGE demo alert -------------------------------------------------------
+const demo = { creating: false, error: null };
+const demoAlert = () => (state.status?.forge?.alerts?.alerts || []).find((a) => a.name === state.settings.demo_alert_name);
+
+function renderForgeDemo() {
+  const a = demoAlert();
+  if (a) {
+    demo.creating = false;
+    const received = state.demoDeliveries.filter((r) => r.verified).length;
+    $("forge-demo").innerHTML = `<div class="meta" style="color:var(--dim);font-size:12px">demo alert <b style="color:var(--text)">${esc(a.name)}</b> ${a.enabled ? tag("pass") : tag("held")}
+      fires on every 50th slot and delivers to <span class="mono">POST /demo/hook</span> · last evaluated slot ${num(a.last_evaluated_slot)} · ${received} ${received === 1 ? "delivery" : "deliveries"} received since DeepAna started</div>`;
+    return;
+  }
+  if (state.status?.forge?.alerts?.error) { $("forge-demo").innerHTML = ""; return; }
+  $("forge-demo").innerHTML = `<button id="demo-btn" ${demo.creating ? "disabled" : ""}>${demo.creating ? "Creating…" : "Create demo alert"}</button>
+    <span class="meta" style="color:var(--dim);font-size:12px;margin-left:8px">fires on every 50th slot, delivers to this DeepAna at POST /demo/hook</span>
+    ${demo.error ? `<div class="error" style="margin-top:4px">${esc(demo.error)}</div>` : ""}`;
+}
+
+$("forge-demo").addEventListener("click", async (e) => {
+  if (!e.target.matches("#demo-btn") || demo.creating) return;
+  demo.creating = true; demo.error = null; renderForgeDemo();
+  try {
+    const { ok, status, data } = await postJson("/api/demo/alert", {});
+    if (!ok) { demo.error = data?.error || "HTTP " + status; demo.creating = false; }
+    // On success the button stays disabled until the next status poll lists the alert.
+    else if (data?.alert && state.status?.forge?.alerts?.alerts && !demoAlert()) state.status.forge.alerts.alerts.push(data.alert);
+  } catch (err) { demo.error = String(err); demo.creating = false; }
+  if (state.status) renderStatus(); else renderForgeDemo();
+});
+
+// FORGE's recent deliveries, merged by delivery id with what /demo/hook received.
+function renderDeliveries() {
+  const s = state.status;
+  const alerts = s?.forge?.alerts?.alerts || [];
+  const names = Object.fromEntries(alerts.map((a) => [a.id, a.name]));
+  const receipts = new Map();
+  for (const r of state.demoDeliveries) if (r.delivery_id && !receipts.has(r.delivery_id)) receipts.set(r.delivery_id, r);
+  const rows = (s?.forge?.deliveries || []).map((d) => ({ d, r: receipts.get(d.delivery_id), at: d.created_at }));
+  const listed = new Set(rows.map((x) => x.d.delivery_id));
+  for (const [id, r] of receipts) if (!listed.has(id)) rows.push({ d: null, r, at: (r.received_at || 0) * 1000 });
+  rows.sort((a, b) => b.at - a.at);
+  const receivedText = (r) => !r ? "" : r.verified
+    ? `${tag("delivered")} ${num(r.row_count)} rows${r.slots?.length ? ` · slots ${r.slots.map((x) => num(x)).join(", ")}` : ""} · signature ok · ${ago(r.received_at)}`
+    : `${tag("rejected")} ${esc(r.error)} · ${ago(r.received_at)}`;
+  $("deliveries").innerHTML = rows.length ? rows.slice(0, 60).map(({ d, r }) => d
+    ? `<tr><td>${tag(d.status)}</td><td>${esc(names[d.alert_id] || short(d.alert_id, 6))}</td><td class="num">${num(d.to_slot)}</td><td class="num">${num(d.attempts)}</td><td>${esc(d.last_error || "")}</td><td>${receivedText(r)}</td><td>${ago(d.created_at / 1000)}</td></tr>`
+    : `<tr><td>${tag(r.verified ? "delivered" : "rejected")}</td><td>${esc(r.alert || state.settings.demo_alert_name || "")}</td><td class="num">${num(r.to_slot)}</td><td class="num">${num(r.attempt)}</td><td></td><td>${receivedText(r)}</td><td>${ago(r.received_at)}</td></tr>`).join("")
+    : `<tr><td colspan="7" class="empty">no deliveries yet</td></tr>`;
+}
+
+// ---- ORACLE detectors and digest status -------------------------------------
+const DETECTOR_STATES = {
+  pending: "waiting for its first turn", disabled: "disabled", baselined: "baselined", up_to_date: "up to date",
+  catching_up: "catching up", not_ready: "not ready", retrying: "retrying", ahead_of_data: "ahead of the data", failing: "failing",
+};
+// One line per detector: why it has (or has not) scored anything yet.
+function detectorLines() {
+  const d = state.status?.oracle?.detectors;
+  if (!d) return [];
+  if (d.error) return [`detectors: ${d.error}`];
+  const st = state.settings, need = st.baseline_need_buckets, w = d.watermark;
+  // History before the newest complete bucket, which is what the newest bucket is scored against.
+  const have = w ? Math.max(0, w.complete_max - w.first_complete_bucket) : 0;
+  const eta = (n) => st.bucket_secs ? ` (≈ ${dur(n * st.bucket_secs)} to go)` : "";
+  return (d.detectors || []).map((x) => {
+    const label = DETECTOR_STATES[x.state] || x.state;
+    if (!x.enabled || x.state === "disabled") return `${x.id}: disabled`;
+    if (["not_ready", "retrying", "ahead_of_data", "failing"].includes(x.state)) return `${x.id}: ${label}${x.message ? ": " + x.message : ""}`;
+    if (!w) return `${x.id}: ${x.state === "pending" ? label + ", " : ""}waiting for a first complete bucket (${num(st.bucket_slots)} slots)`;
+    if (need && have < need) return `${x.id}: baselining, ${have} of ${need} buckets${eta(need - have)}`;
+    return `${x.id}: ${label}, scoring${x.anomalies_inserted ? ` · ${x.anomalies_inserted} found` : ""}`;
+  });
+}
+
+function renderDetectors() {
+  const lines = detectorLines();
+  $("detectors").innerHTML = lines.length ? `<div style="margin-bottom:2px">detectors${state.status?.oracle?.detectors?.tick_error ? ` · last tick: ${esc(state.status.oracle.detectors.tick_error)}` : ""}</div>` +
+    lines.map((l) => `<div>${esc(l)}</div>`).join("") : "";
+  if (!state.anomalies.length) renderAnomalies();
 }
 
 function renderAnomalies() {
@@ -299,35 +460,106 @@ function renderAnomalies() {
     `<tr><td class="mono">${esc(a.metric)}</td><td class="mono" title="${esc(a.subject)}">${esc(short(a.subject) || "(global)")}</td><td>${tag(a.kind)}</td>
      <td class="num">${fixed(a.score)}</td><td class="num">${fixed(a.value, 0)}</td><td class="num">${fixed(a.baseline, 1)}</td>
      <td class="num">${num(a.start_slot)}–${num(a.end_slot)}</td><td>${ago(a.detected_at / 1000)}</td></tr>`).join("")
-    : `<tr><td colspan="8" class="empty">no anomalies: detectors need a baseline of several buckets before they score anything</td></tr>`;
+    : `<tr><td colspan="8" class="empty">no anomalies yet${detectorLines().length ? ": see each detector's state below" : ""}</td></tr>`;
+}
+
+const DIGEST_STATES = {
+  Idle: "idle: nothing due until the next full window of data is in",
+  Building: "building a digest now",
+  Waiting: "the window's data is in; waiting for the detectors to score it",
+  NotReady: "not ready: LENS has no data or table yet",
+  AheadOfData: "ahead of the data: the latest digest ends above LENS's data",
+  Failing: "failing: the last build failed, retried next tick",
+};
+function digestStatusText() {
+  const g = state.status?.oracle?.health?.digest;
+  if (!g) return "";
+  const st = state.settings;
+  const size = st.digest_buckets && st.bucket_slots
+    ? ` · one digest per ${st.digest_buckets} buckets (${num(st.digest_buckets * st.bucket_slots)} slots, ${slotSecs(st.digest_buckets * st.bucket_slots)})` : "";
+  return `digester ${DIGEST_STATES[g.state] || g.state}${g.last_error ? ` (${g.last_error})` : ""} · ${num(g.windows_built)} built since start${g.lag_windows ? ` · ${g.lag_windows} windows behind` : ""}${size}`;
 }
 
 function renderDigest() {
   const d = state.digest;
-  if (!d || !d.body) return;
+  if (!d || !d.body) {
+    const status = digestStatusText();
+    const lines = detectorLines();
+    $("digest-sub").textContent = "";
+    $("digest").innerHTML = `<div class="empty">no digest yet${status ? "" : ": ORACLE builds one once a full window of data is in"}</div>` +
+      (status ? `<div class="progress" style="margin-top:0">${esc(status)}</div>` : "") +
+      (lines.length ? `<div class="progress">${lines.map((l) => `<div>${esc(l)}</div>`).join("")}</div>` : "");
+    return;
+  }
   const b = d.body;
   $("digest-sub").textContent = `slots ${num(d.start_slot)}–${num(d.end_slot)}${b.provisional ? " · provisional" : ""}`;
-  $("digest").innerHTML = `<ul class="headline">${(b.headline || []).map((h) => `<li>${esc(h)}</li>`).join("")}</ul>`;
+  $("digest").innerHTML = `<ul class="headline">${(b.headline || []).map((h) => `<li>${esc(h)}</li>`).join("")}</ul>` +
+    (digestStatusText() ? `<div class="progress">${esc(digestStatusText())}</div>` : "");
+}
+
+// ---- Data quality: GET /api/oracle/quality on load, every 5 minutes, and on
+// "Run now"; never two requests at once. The next periodic fetch is scheduled
+// only once the current one has finished.
+const QUALITY_EVERY_MS = 5 * 60 * 1000;
+const quality = { running: false, report: null, error: null, timer: null };
+const STATUS_RANK = { fail: 0, error: 1, not_ready: 2, warn: 3 };
+
+async function loadQuality(force) {
+  if (quality.running) return;
+  quality.running = true; clearTimeout(quality.timer); renderQuality();
+  try {
+    // max_age_secs=0 forces a new audit instead of ORACLE's cached report.
+    const res = await fetch("/api/oracle/quality" + (force ? "?max_age_secs=0" : ""));
+    let data = null; try { data = await res.json(); } catch (_) {}
+    if (res.ok && data) { quality.report = data; quality.error = null; }
+    else quality.error = data?.error || "HTTP " + res.status;
+  } catch (err) { quality.error = String(err); }
+  quality.running = false;
+  quality.timer = setTimeout(() => loadQuality(false), QUALITY_EVERY_MS);
   renderQuality();
 }
 
 function renderQuality() {
-  const q = state.status?.oracle?.health?.quality;
-  const issues = state.digest?.body?.quality?.issues || [];
-  if (!q) return;
-  $("quality-sub").innerHTML = q.overall ? tag(q.overall) : "";
-  $("quality").innerHTML = `<dl class="kv">
-      <dt>available</dt><dd>${q.available ? "yes" : "no"}</dd>
-      <dt>overall</dt><dd>${esc(q.overall || "–")}</dd>
-      <dt>as of slot</dt><dd>${num(q.as_of_slot)}</dd>
-      <dt>age</dt><dd>${q.age_secs != null ? q.age_secs + " s" : "–"}</dd></dl>` +
-    (issues.length ? `<ul class="headline" style="margin-top:6px">${issues.map((i) => `<li>${tag(i.status || "warn")} ${esc(i.id)} · ${num(i.violations)} violations</li>`).join("")}</ul>` : "");
+  const btn = $("quality-btn");
+  btn.disabled = quality.running; btn.textContent = quality.running ? "running…" : "Run now";
+  const q = quality.report;
+  $("quality-sub").innerHTML = q ? tag(q.overall) : "";
+  let html = "";
+  if (quality.error) html += `<div class="notice warn">quality check failed: ${esc(quality.error)}${q ? "<br>showing the last report" : ""}</div>`;
+  if (!q) { $("quality").innerHTML = html || `<div class="empty">${quality.running ? "running the first audit…" : "–"}</div>`; return; }
+  const sm = q.summary || {};
+  const incomplete = (sm.error || 0) + (sm.not_ready || 0);
+  const top = (q.checks || []).filter((c) => c.status !== "pass" && c.status !== "info")
+    .sort((a, b) => (STATUS_RANK[a.status] ?? 9) - (STATUS_RANK[b.status] ?? 9) || b.violations - a.violations).slice(0, 5);
+  html += `<div class="counts">
+      <div><b>${tag(q.overall)}</b><span>overall</span></div>
+      <div><b>${num(sm.pass)}</b><span>pass</span></div>
+      <div><b>${num(sm.warn)}</b><span>warn</span></div>
+      <div><b>${num(sm.fail)}</b><span>fail</span></div>
+      ${incomplete ? `<div><b>${incomplete}</b><span>could not run</span></div>` : ""}</div>` +
+    (top.length ? `<table><thead><tr><th>status</th><th>check</th><th class="num">violations</th></tr></thead><tbody>${top.map((c) =>
+      `<tr><td>${tag(c.status)}</td><td class="mono">${esc(c.id)}</td><td class="num">${c.status === "error" || c.status === "not_ready" ? esc(c.error_kind || "–") : num(c.violations)}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="empty">every check passed</div>`) +
+    `<div class="progress">as of slot ${num(q.as_of_slot)} · slots ${num(q.window?.start_slot)}–${num(q.window?.end_slot)} · audited ${ago(q.generated_at)} in ${num(q.duration_ms)} ms</div>`;
+  $("quality").innerHTML = html;
 }
+$("quality-btn").addEventListener("click", () => loadQuality(true));
 
+const commonsUi = { verifying: false };
 function renderCommons() {
   const c = state.commons;
+  const configured = !c || c.configured !== false;
+  $("verify-btn").disabled = commonsUi.verifying || !configured;
+  $("verify-btn").textContent = commonsUi.verifying ? "Verifying…" : "Run verify";
   if (!c) return;
-  if (!c.ok) { $("commons").innerHTML = `<div class="error">${esc(c.error)}</div><div class="meta">${ago(c.ran_at)}</div>`; return; }
+  // Not a failure: there is simply nothing to verify.
+  if (!configured) {
+    $("commons").innerHTML = `<div class="notice">not configured: pass <code>--repo-root &lt;path&gt;</code> to a COMMONS repository (with <code>artifacts/</code> and <code>fixtures/</code>)
+      <div style="font-size:12px;margin-top:4px">looked in <code>${esc(c.repo_root)}</code></div></div>`;
+    return;
+  }
+  // Verify could not run: amber, red is kept for real verification failures.
+  if (!c.ok) { $("commons").innerHTML = `<div class="notice warn">verify could not run: ${esc(c.error)}</div><div class="meta" style="color:var(--dim);font-size:12px;margin-top:4px">${ago(c.ran_at)}</div>`; return; }
   const r = c.report;
   const arts = r.artifacts || [];
   $("commons").innerHTML = `<div class="counts">
@@ -339,9 +571,9 @@ function renderCommons() {
     <table><thead><tr><th>verdict</th><th>artifact</th><th>kind</th><th>stages</th><th>failed checks</th></tr></thead><tbody>
     ${arts.map((a) => {
       const failed = (a.stages || []).flatMap((s) => (s.checks || []).filter((k) => k.status !== "pass" && k.status !== "skip").map((k) => `${s.stage}: ${k.id} ${k.detail}`));
-      return `<tr><td>${tag(a.verdict)}</td><td class="mono">${esc(a.label)}</td><td>${esc(a.kind)}</td>
-        <td>${(a.stages || []).map((s) => `${esc(s.stage)} ${tag(s.status)}`).join(" ")}</td>
-        <td>${failed.length ? failed.map((f) => `<div>${esc(f)}</div>`).join("") : "–"}</td></tr>`;
+      return `<tr><td>${tag(a.verdict)}</td><td class="mono wrap">${esc(a.label)}</td><td>${esc(a.kind)}</td>
+        <td class="wrap">${(a.stages || []).map((s) => `<span style="white-space:nowrap">${esc(s.stage)} ${tag(s.status)}</span>`).join(" ")}</td>
+        <td class="wrap">${failed.length ? failed.map((f) => `<div>${esc(f)}</div>`).join("") : "–"}</td></tr>`;
     }).join("")}</tbody></table>
     <div class="meta" style="color:var(--dim);font-size:12px;margin-top:6px">repo ${esc(c.repo_root)} · verifier ${esc(r.verifier_version)} · fixtures ${esc(short(r.fixture_set_hash, 8))}</div>`;
 }
@@ -384,9 +616,30 @@ function resultTable(columns, rows) {
   }</tbody></table></div>`;
 }
 
+// The last 10 questions, newest first, kept in this browser; a click asks again.
+const RECENT_KEY = "deepana.recentQuestions";
+let recent = [];
+try { recent = JSON.parse(localStorage.getItem(RECENT_KEY) || "[]").filter((q) => typeof q === "string").slice(0, 10); } catch (_) {}
+function remember(question) {
+  recent = [question].concat(recent.filter((q) => q !== question)).slice(0, 10);
+  try { localStorage.setItem(RECENT_KEY, JSON.stringify(recent)); } catch (_) {}
+  renderRecent();
+}
+function renderRecent() {
+  $("ask-recent").innerHTML = recent.length ? `<span>recent:</span>` + recent.map((q) =>
+    `<button class="chip" type="button" data-q="${esc(q)}" title="ask again">${esc(q)}</button>`).join("") : "";
+}
+renderRecent();
+// Suggestions, candidates and recent questions: set the box and ask.
+for (const id of ["ask-recent", "answer"]) $(id).addEventListener("click", (e) => {
+  const chip = e.target.closest(".chip[data-q]");
+  if (chip) { $("ask-input").value = chip.dataset.q; ask(); }
+});
+
 async function ask() {
   const question = $("ask-input").value.trim();
   if (!question) return;
+  remember(question);
   $("ask-btn").disabled = true; $("ask-status").textContent = "asking…";
   try {
     const { ok, status, data } = await postJson("/api/oracle/ask", { question });
@@ -395,24 +648,34 @@ async function ask() {
   $("ask-btn").disabled = false; $("ask-status").textContent = "";
 }
 
+const askChips = (questions) => `<div class="chips">${questions.map((q) =>
+  `<button class="chip" type="button" data-q="${esc(q)}">${esc(q)}</button>`).join("")}</div>`;
+
 function renderAnswer(d) {
-  const head = `<div>${tag(d.outcome)} ${d.understood_as ? `<span class="understood">${esc(d.understood_as)}</span>` : ""}</div>`;
   if (d.outcome === "matched") {
     const a = d.answer;
-    const assumptions = (d.assumptions || []).length ? `<div class="meta">assuming: ${d.assumptions.map(esc).join(" · ")}</div>` : "";
-    if (!a) return head + assumptions;
-    const cols = a.columns.map((c) => c.name || c.id || c.label || JSON.stringify(c));
-    return head + assumptions + `<div class="meta">slots ${num(a.window?.start_slot)}–${num(a.window?.end_slot)} · as of slot ${num(a.as_of_slot)} · ${num(a.duration_ms)} ms${a.has_more ? " · more rows exist" : ""}</div>` +
-      resultTable(cols, a.rows) + (a.warnings?.length ? `<div class="meta">${a.warnings.map(esc).join("<br>")}</div>` : "") +
-      `<details><summary>SQL</summary><pre>${esc(a.sql)}</pre></details>`;
+    // Above the table: what ORACLE understood, what it assumed, what to beware of.
+    let html = `<div>${tag(d.outcome)} <span class="meta">understood as</span> <span class="understood">${esc(d.understood_as || "–")}</span></div>`;
+    if ((d.assumptions || []).length) html += `<ul class="notes">${d.assumptions.map((x) => `<li>assuming ${esc(x)}</li>`).join("")}</ul>`;
+    if (!a) return html + `<div class="meta">not executed</div>`;
+    if ((a.warnings || []).length) html += `<div class="warnings">${a.warnings.map((w) => `⚠ ${esc(w)}`).join("<br>")}</div>`;
+    html += `<div class="meta">slots ${num(a.window?.start_slot)}–${num(a.window?.end_slot)} · as of slot ${num(a.as_of_slot)} · ${num(a.rows.length)} rows · ${num(a.duration_ms)} ms</div>`;
+    html += resultTable(a.columns.map((c) => c.unit ? `${c.name} (${c.unit})` : c.name), a.rows);
+    // Below the table: whether it is the whole result.
+    const notes = [];
+    if (a.truncated) notes.push("truncated: LENS's row cap cut the result short of the limit, so not every row is shown");
+    else if (a.has_more) notes.push(`has more: more rows exist beyond the limit of ${num(a.limit)}`);
+    if (notes.length) html += `<div class="warnings">${notes.map(esc).join("<br>")}</div>`;
+    return html + `<details><summary>SQL</summary><pre>${esc(a.sql)}</pre></details>`;
   }
+  const head = `<div>${tag(d.outcome)}</div>`;
   if (d.outcome === "ambiguous") {
-    return head + `<div class="meta">Did you mean:</div><div class="chips">${(d.candidates || []).map((c) =>
-      `<button class="chip" type="button" onclick="document.getElementById('ask-input').value=this.textContent;ask()">${esc(c.understood_as)}</button>`).join("")}</div>`;
+    return head + `<div class="meta">Did you mean:</div>` + askChips((d.candidates || []).map((c) => c.understood_as));
   }
-  const sugg = (d.suggestions || []).length ? `<div class="meta">Try:</div><div class="chips">${d.suggestions.map((s) =>
-    `<button class="chip" type="button" onclick="document.getElementById('ask-input').value=this.textContent;ask()">${esc(s)}</button>`).join("")}</div>` : "";
-  return head + `<div>${esc(d.message || "")}</div>${d.hint ? `<div class="meta">${esc(d.hint)}</div>` : ""}` + sugg;
+  // no_match and rejected: the message, then something to click.
+  const suggestions = (d.suggestions || []).length ? d.suggestions : QUESTIONS;
+  return head + `<div style="margin:4px 0">${esc(d.message || "")}</div>${d.hint ? `<div class="meta">${esc(d.hint)}</div>` : ""}` +
+    `<div class="meta">${(d.suggestions || []).length ? "Try:" : "Try one of these:"}</div>` + askChips(suggestions);
 }
 
 async function runSql() {
@@ -434,16 +697,19 @@ async function runSql() {
 
 // ---- COMMONS --------------------------------------------------------------
 $("verify-btn").addEventListener("click", async () => {
-  $("verify-btn").disabled = true; $("verify-btn").textContent = "Verifying…";
+  commonsUi.verifying = true; renderCommons();
+  let failure = null;
   try {
     const { data } = await postJson("/api/commons/verify", {});
-    if (data) { state.commons = data; renderCommons(); }
-  } catch (err) { $("commons").innerHTML = `<div class="error">${esc(err)}</div>`; }
-  $("verify-btn").disabled = false; $("verify-btn").textContent = "Run verify";
+    if (data) state.commons = data;
+  } catch (err) { failure = err; }
+  commonsUi.verifying = false; renderCommons();
+  if (failure) $("commons").innerHTML = `<div class="notice warn">verify request failed: ${esc(failure)}</div>`;
 });
 
 setInterval(() => { renderPrism(); }, 5000);
 connect();
+loadQuality(false);
 </script>
 </body>
 </html>

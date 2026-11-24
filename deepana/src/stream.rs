@@ -5,8 +5,9 @@
 //!     every 1 s   tail <DIR>/changelog.jsonl  ──► "changelog" event (new lines)
 //!     every 3 s   LENS /health + MAX(slot)    ──► "status" event
 //!                 FORGE /health, /alerts, deliveries
-//!                 ORACLE /health, /digest     ──► "digest" event when a new one lands
+//!                 ORACLE /health, /detectors, /digest ──► "digest" event when a new one lands
 //!                 ORACLE /anomalies           ──► "anomalies" event (new ids only)
+//!     on demand   POST /demo/hook receipts    ──► "demo_delivery" event
 //!                        │
 //!                        ▼
 //!               broadcast::Sender<Message>  ──► each SSE client: "snapshot" first, then the events
@@ -60,6 +61,8 @@ pub const DELIVERIES_PER_ALERT: usize = 5;
 pub const CHANNEL_CAPACITY: usize = 256;
 /// Largest response body the poller reads.
 const MAX_BODY: usize = 8 * 1024 * 1024;
+/// Receipts of `POST /demo/hook` the snapshot keeps, newest first.
+pub const DEMO_DELIVERIES_LEN: usize = 50;
 /// The SQL behind the "newest slot" number.
 pub const NEWEST_SLOT_SQL: &str = "SELECT MAX(slot) AS newest_slot FROM solana.slots";
 
@@ -107,6 +110,10 @@ pub struct Snapshot {
     pub anomalies: VecDeque<Value>,
     pub digest: Option<Value>,
     pub commons: Option<Value>,
+    /// Fixed for the process: see [`Hub::set_settings`].
+    pub settings: Value,
+    /// What `POST /demo/hook` received, newest first.
+    pub demo_deliveries: VecDeque<Value>,
 }
 
 /// The poller's shared state and the channel it feeds.
@@ -155,6 +162,22 @@ impl Hub {
     pub fn publish_commons(&self, report: Value) {
         self.lock().commons = Some(report.clone());
         self.send(Message::new("commons", &report));
+    }
+
+    /// Values the dashboard needs that no API serves (ms per slot, the
+    /// detectors' baseline size, ...). Set once, before clients connect.
+    pub fn set_settings(&self, settings: Value) {
+        self.lock().settings = settings;
+    }
+
+    /// Record a `POST /demo/hook` receipt and tell every client.
+    pub fn publish_demo_delivery(&self, receipt: Value) {
+        {
+            let mut snapshot = self.lock();
+            snapshot.demo_deliveries.push_front(receipt.clone());
+            snapshot.demo_deliveries.truncate(DEMO_DELIVERIES_LEN);
+        }
+        self.send(Message::new("demo_delivery", &receipt));
     }
 
     fn send(&self, message: Message) {
@@ -227,10 +250,11 @@ impl Hub {
         let forge_health = get(api, format!("{FORGE_PREFIX}/health"));
         let alerts = get(api, format!("{FORGE_PREFIX}/alerts"));
         let oracle_health = get(api, format!("{ORACLE_PREFIX}/health"));
+        let detectors = get(api, format!("{ORACLE_PREFIX}/detectors"));
         let anomalies = get(api, format!("{ORACLE_PREFIX}/anomalies?limit={ANOMALIES_LEN}"));
         let digest = get(api, format!("{ORACLE_PREFIX}/digest"));
-        let (lens_health, newest, forge_health, alerts, oracle_health, anomalies, digest) =
-            tokio::join!(lens_health, newest, forge_health, alerts, oracle_health, anomalies, digest);
+        let (lens_health, newest, forge_health, alerts, oracle_health, detectors, anomalies, digest) =
+            tokio::join!(lens_health, newest, forge_health, alerts, oracle_health, detectors, anomalies, digest);
 
         let deliveries = match &alerts {
             Reply::Ok(body) => self.deliveries(api, body).await,
@@ -255,6 +279,7 @@ impl Hub {
             },
             "oracle": {
                 "health": oracle_health.to_json(),
+                "detectors": detectors.to_json(),
             },
         });
         self.lock().status = Some(status.clone());
@@ -514,14 +539,22 @@ fn error_text(body: &Value) -> Option<String> {
     body.get("error").and_then(Value::as_str).map(str::to_owned)
 }
 
-async fn get(api: &Router, uri: String) -> Reply {
+pub(crate) async fn get(api: &Router, uri: String) -> Reply {
     let request = Request::builder().method(Method::GET).uri(uri).body(Body::empty());
     send(api, request).await
 }
 
-async fn post(api: &Router, uri: String, body: Value) -> Reply {
+pub(crate) async fn post(api: &Router, uri: String, body: Value) -> Reply {
+    with_body(api, Method::POST, uri, body).await
+}
+
+pub(crate) async fn patch(api: &Router, uri: String, body: Value) -> Reply {
+    with_body(api, Method::PATCH, uri, body).await
+}
+
+async fn with_body(api: &Router, method: Method, uri: String, body: Value) -> Reply {
     let request = Request::builder()
-        .method(Method::POST)
+        .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()));

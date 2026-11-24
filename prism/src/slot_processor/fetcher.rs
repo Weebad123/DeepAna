@@ -26,7 +26,7 @@ use solana_client::client_error::ClientError;
 use tokio::time::Instant;
 use tracing::warn;
 
-use crate::adapter::{ChainAdapter, ChainBlock};
+use crate::adapter::{ChainAdapter, ChainBlock, CommitmentLevel};
 use crate::types::error::{PrismError, PrismResult};
 
 // ---------------------------------------------------------------------------
@@ -197,8 +197,18 @@ impl SlotFetcher {
     /// An `Err` is the last attempt's error: either one that is not
     /// retryable, or a retryable one after `max_retries` retries.
     pub async fn fetch(&self, slot: u64) -> PrismResult<Option<ChainBlock>> {
+        self.fetch_at(slot, None).await
+    }
+
+    /// Like [`Self::fetch`], read at `commitment` instead of the adapter's
+    /// configured commitment when one is given.
+    pub async fn fetch_at(
+        &self,
+        slot: u64,
+        commitment: Option<CommitmentLevel>,
+    ) -> PrismResult<Option<ChainBlock>> {
         let started = Instant::now();
-        let result = self.fetch_with_retry(slot).await;
+        let result = self.fetch_with_retry(slot, commitment).await;
         let latency = started.elapsed();
         match result {
             Ok(block) => {
@@ -216,12 +226,16 @@ impl SlotFetcher {
         }
     }
 
-    async fn fetch_with_retry(&self, slot: u64) -> PrismResult<ChainBlock> {
+    async fn fetch_with_retry(
+        &self,
+        slot: u64,
+        commitment: Option<CommitmentLevel>,
+    ) -> PrismResult<ChainBlock> {
         let max_retries = self.config.max_retries;
         let mut backoff = self.backoff();
         let mut retries = 0;
         loop {
-            let error = match self.attempt(slot).await {
+            let error = match self.attempt(slot, commitment).await {
                 Ok(block) => return Ok(block),
                 Err(err) => err,
             };
@@ -244,9 +258,15 @@ impl SlotFetcher {
     }
 
     /// One `getBlock`, bounded by the request timeout.
-    async fn attempt(&self, slot: u64) -> PrismResult<ChainBlock> {
+    async fn attempt(&self, slot: u64, commitment: Option<CommitmentLevel>) -> PrismResult<ChainBlock> {
         let timeout = self.config.request_timeout();
-        tokio::time::timeout(timeout, self.adapter.get_block(slot))
+        let request = async {
+            match commitment {
+                Some(commitment) => self.adapter.get_block_at(slot, commitment).await,
+                None => self.adapter.get_block(slot).await,
+            }
+        };
+        tokio::time::timeout(timeout, request)
             .await
             .unwrap_or_else(|_elapsed| Err(timed_out(slot, timeout)))
     }

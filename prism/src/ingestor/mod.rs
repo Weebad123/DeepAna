@@ -48,13 +48,27 @@
 //! stops process, whose dropped sender lets writer drain the channel, flush
 //! whatever is left and persist the cursor. The same cascade runs when
 //! process reaches [`IngestorConfig::end_slot`].
+//!
+//! The ingestor also executes the rewinds the
+//! [`Reconciler`](crate::reconcile::Reconciler) decides on, through the
+//! [`IngestorRewinder`] from [`Ingestor::rewinder`]. A rewind stops both
+//! tasks *without* flushing (the buffered slots are above the rewind point
+//! and about to be dropped), lowers the cursor, deletes the files at or above
+//! the rewind point and starts the pipeline again from there. Before the
+//! first start, [`Ingestor::run`] finishes a rewind a crash interrupted
+//! ([`Reconciler::recover`](crate::reconcile::Reconciler::recover)).
+//!
+//! Slots already below the finalized watermark are fetched at `finalized`,
+//! whatever [`IngestorConfig::commitment`] says: a slot that is re-ingested
+//! after a correction can then never be read from the abandoned fork again.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use helius::HeliusBuilder;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -67,6 +81,7 @@ use crate::changelog::ChangeLog;
 use crate::commitment::CommitmentTracker;
 use crate::decoder::DecoderRegistry;
 use crate::normalizer::{NormalizedBlock, Normalizer};
+use crate::reconcile::{ReconcileContext, Reconciler, Rewind};
 use crate::slot_processor::{GapHandler, ProcessedSlot, SlotFetcher, SlotFetcherConfig, SlotProcessor};
 use crate::storage::{ParquetWriter, Storage, WriterMetrics};
 use crate::types::error::{PrismError, PrismResult};
@@ -254,6 +269,8 @@ pub struct IngestorReport {
     /// Successful flushes, including those that only moved the flush edge
     /// past skipped slots.
     pub flushes: u64,
+    /// Rewinds executed for the reconciler during the run.
+    pub rewinds: u64,
     /// Cursor state after the final flush.
     pub cursor: CursorState,
 }
@@ -271,6 +288,9 @@ pub struct Ingestor {
     cursor: IngestorCursor,
     config: IngestorConfig,
     shutdown: CancellationToken,
+    rewind_tx: mpsc::Sender<RewindRequest>,
+    /// Held by [`Ingestor::run`] for as long as it runs.
+    rewind_rx: AsyncMutex<mpsc::Receiver<RewindRequest>>,
 }
 
 impl std::fmt::Debug for Ingestor {
@@ -304,6 +324,7 @@ impl Ingestor {
         );
         let resolver = AccountResolver::new(Arc::clone(&adapter));
         let resolver_metrics = Arc::clone(resolver.metrics());
+        let (rewind_tx, rewind_rx) = mpsc::channel(1);
         Ok(Self {
             adapter,
             commitment_tracker,
@@ -316,6 +337,8 @@ impl Ingestor {
             cursor,
             config,
             shutdown: CancellationToken::new(),
+            rewind_tx,
+            rewind_rx: AsyncMutex::new(rewind_rx),
         })
     }
 
@@ -373,6 +396,25 @@ impl Ingestor {
         self.shutdown.cancel();
     }
 
+    /// The [`Rewind`] the reconciler acts through. Requests are executed by
+    /// [`Self::run`]; one made while it is not running waits for it.
+    pub fn rewinder(&self) -> IngestorRewinder {
+        IngestorRewinder {
+            tx: self.rewind_tx.clone(),
+        }
+    }
+
+    /// The [`ReconcileContext`] the reconciler reads this pipeline through.
+    /// `genesis_hash` is the cluster's, e.g. from
+    /// [`ChainAdapter::genesis_hash`].
+    pub fn reconcile_context(&self, genesis_hash: impl Into<String>) -> IngestorReconcileContext {
+        IngestorReconcileContext {
+            cursor: self.cursor.clone(),
+            tracker: Arc::clone(&self.commitment_tracker),
+            genesis_hash: genesis_hash.into(),
+        }
+    }
+
     /// The first slot this run fetches: the cursor's resume point, else
     /// [`IngestorConfig::start_slot`], else the current tip.
     pub async fn starting_slot(&self) -> PrismResult<u64> {
@@ -388,41 +430,110 @@ impl Ingestor {
     /// Run the pipeline until shut down, until [`IngestorConfig::end_slot`]
     /// is ingested, or until a component fails.
     ///
-    /// Before anything is fetched, files at or above the first slot are
-    /// rolled back: they were written by a flush the cursor never recorded,
-    /// and their slots are about to be written again.
+    /// Before anything is fetched, a reconcile rewind a crash interrupted is
+    /// finished, then files at or above the first slot are rolled back: they
+    /// were written by a flush the cursor never recorded, and their slots are
+    /// about to be written again.
+    ///
+    /// Rewinds requested through [`Self::rewinder`] are executed while the
+    /// pipeline runs: it is stopped without a flush, rewound and started
+    /// again, all within this call.
     ///
     /// The buffer is flushed and the cursor persisted on the way out in every
     /// case where the writer still works. The first error any task hit is
     /// returned. The commitment tracker's poller counts as one of those
     /// tasks: if the change log fails it, the pipeline halts with its error.
+    ///
+    /// Fails with [`PrismError::ConfigError`] when the pipeline is already
+    /// running.
     pub async fn run(&self) -> PrismResult<IngestorReport> {
-        let first = self.starting_slot().await?;
-        if self.config.end_slot.is_some_and(|end| end < first) {
-            self.cursor.persist()?;
-            return Ok(IngestorReport {
-                cursor: self.cursor.state(),
-                ..IngestorReport::default()
-            });
+        let mut rewinds = self
+            .rewind_rx
+            .try_lock()
+            .map_err(|_| PrismError::config("ingestor", "is already running"))?;
+        if let Some(from_slot) = Reconciler::recover(&self.config.data_dir, &self.cursor)? {
+            info!(from_slot, "finished an interrupted reconcile rewind");
         }
-        lock(&self.writer).rollback(first)?;
-        info!(
-            first_slot = first,
-            chain = self.adapter.chain_id(),
-            data_dir = %self.config.data_dir.display(),
-            "ingestor starting"
-        );
 
+        let mut report = IngestorReport::default();
+        let mut totals = WriterTotals::default();
+        loop {
+            let first = self.starting_slot().await?;
+            if self.config.end_slot.is_some_and(|end| end < first) {
+                self.cursor.persist()?;
+                break;
+            }
+            report.first_slot.get_or_insert(first);
+            lock(&self.writer).rollback(first)?;
+            info!(
+                first_slot = first,
+                chain = self.adapter.chain_id(),
+                data_dir = %self.config.data_dir.display(),
+                "ingestor starting"
+            );
+            let (epoch, request) = self.run_epoch(first, &mut rewinds).await?;
+            totals.add(&epoch);
+            let Some(request) = request else { break };
+            let RewindRequest { from_slot, reply } = request;
+            match self.apply_rewind(from_slot) {
+                Ok(()) => {
+                    report.rewinds += 1;
+                    let _ = reply.send(Ok(()));
+                }
+                Err(err) => {
+                    let _ = reply.send(Err(PrismError::config(
+                        "ingestor",
+                        format!("rewind to slot {from_slot} failed: {err}"),
+                    )));
+                    return Err(err);
+                }
+            }
+            if self.shutdown.is_cancelled() {
+                break;
+            }
+        }
+
+        let cursor = self.cursor.state();
+        info!(
+            slots_processed = totals.slots_processed,
+            slots_skipped = totals.slots_skipped,
+            transactions_processed = totals.transactions_processed,
+            rewinds = report.rewinds,
+            last_flush_slot = cursor.last_flush_slot,
+            "ingestor stopped"
+        );
+        Ok(IngestorReport {
+            slots_processed: totals.slots_processed,
+            slots_skipped: totals.slots_skipped,
+            transactions_processed: totals.transactions_processed,
+            flushes: totals.flushes,
+            cursor,
+            ..report
+        })
+    }
+
+    /// Run both tasks from `first` until they stop, or until a rewind is
+    /// requested, which stops them without a flush. Returns the writer's
+    /// totals and the rewind request, if that is what stopped them.
+    async fn run_epoch(
+        &self,
+        first: u64,
+        rewinds: &mut mpsc::Receiver<RewindRequest>,
+    ) -> PrismResult<(WriterTotals, Option<RewindRequest>)> {
+        // A child: a rewind stops this epoch only; shutdown stops them all.
+        let epoch = self.shutdown.child_token();
+        let discard = CancellationToken::new();
         let (tx, rx) = mpsc::channel(self.config.channel_capacity);
         let process = spawn_task(&self.shutdown, process_task(
             Arc::clone(&self.adapter),
             Arc::clone(&self.processor),
             Arc::clone(&self.decoders),
             Arc::clone(&self.resolver),
+            Arc::clone(&self.commitment_tracker),
             self.config.clone(),
             first,
             tx,
-            self.shutdown.clone(),
+            epoch.clone(),
         ));
         let writer = WriterTask {
             writer: Arc::clone(&self.writer),
@@ -435,41 +546,76 @@ impl Ingestor {
             consecutive_failures: 0,
             totals: WriterTotals::default(),
         };
-        let writer = spawn_task(&self.shutdown, writer.run(rx, self.config.flush_interval));
+        let writer = spawn_task(
+            &self.shutdown,
+            writer.run(rx, self.config.flush_interval, discard.clone()),
+        );
         let finality = tokio::spawn(halt_with_tracker(
             Arc::clone(&self.commitment_tracker),
             self.shutdown.clone(),
         ));
 
-        let process_result = self.join("process", process).await;
-        let writer_result = self.join("writer", writer).await;
+        let pipeline = async {
+            let process = self.join("process", process).await;
+            let writer = self.join("writer", writer).await;
+            (process, writer)
+        };
+        tokio::pin!(pipeline);
+        let mut request: Option<RewindRequest> = None;
+        let (process_result, writer_result) = loop {
+            tokio::select! {
+                results = &mut pipeline => break results,
+                Some(next) = rewinds.recv(), if request.is_none() => {
+                    if next.reply.is_closed() {
+                        // Whoever asked has given up.
+                        continue;
+                    }
+                    info!(from_slot = next.from_slot, "rewind requested; stopping the pipeline without a flush");
+                    discard.cancel();
+                    epoch.cancel();
+                    request = Some(next);
+                }
+            }
+        };
         finality.abort();
         // Awaited so its tracker reference is gone once `run` returns.
         let _ = finality.await;
+
+        let failed = |request: Option<RewindRequest>| {
+            if let Some(request) = request {
+                let _ = request.reply.send(Err(PrismError::config(
+                    "ingestor",
+                    "the pipeline failed before the rewind could run",
+                )));
+            }
+        };
         // The poller's change log failure is what stopped the pipeline, so
         // it comes first. A failed log names its original failure in every
         // later error, whichever producer reports it.
         if let Some(err) = self.commitment_tracker.take_error() {
+            failed(request);
             return Err(err);
         }
-        process_result?;
-        let totals = writer_result?;
-        let cursor = self.cursor.state();
-        info!(
-            slots_processed = totals.slots_processed,
-            slots_skipped = totals.slots_skipped,
-            transactions_processed = totals.transactions_processed,
-            last_flush_slot = cursor.last_flush_slot,
-            "ingestor stopped"
-        );
-        Ok(IngestorReport {
-            first_slot: Some(first),
-            slots_processed: totals.slots_processed,
-            slots_skipped: totals.slots_skipped,
-            transactions_processed: totals.transactions_processed,
-            flushes: totals.flushes,
-            cursor,
-        })
+        let totals = match process_result.and(writer_result) {
+            Ok(totals) => totals,
+            Err(err) => {
+                failed(request);
+                return Err(err);
+            }
+        };
+        Ok((totals, request))
+    }
+
+    /// Lower the cursor so ingestion resumes at `from_slot` (never above the
+    /// flush edge), then delete files and buffered rows from there. The
+    /// cursor goes first: if the process dies in between, the next
+    /// [`Self::run`] rolls back from the lowered resume point anyway.
+    fn apply_rewind(&self, from_slot: u64) -> PrismResult<()> {
+        let point = from_slot.min(self.cursor.state().last_flush_slot + 1);
+        self.cursor.rewind(point)?;
+        lock(&self.writer).rollback(point)?;
+        info!(from_slot = point, "rewound; ingesting again from there");
+        Ok(())
     }
 
     /// Await a task. A panic is reported as an error and cancels the rest
@@ -535,6 +681,7 @@ async fn process_task(
     processor: Arc<SlotProcessor>,
     decoders: Arc<DecoderRegistry>,
     resolver: Arc<AsyncMutex<AccountResolver>>,
+    tracker: Arc<CommitmentTracker>,
     config: IngestorConfig,
     mut next: u64,
     tx: mpsc::Sender<ProcessedSlot>,
@@ -561,9 +708,14 @@ async fn process_task(
         };
         let upto = config.end_slot.map_or(tip, |end| end.min(tip));
         while next <= upto {
+            // A finalized slot is read at `finalized`, so a re-ingest never
+            // fetches a block from an abandoned fork.
+            let commitment = (config.commitment != CommitmentLevel::Finalized
+                && tracker.is_finalized(next))
+            .then_some(CommitmentLevel::Finalized);
             let processed = tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
-                processed = process_slot(&processor, &decoders, &resolver, next) => processed?,
+                processed = process_slot(&processor, &decoders, &resolver, next, commitment) => processed?,
             };
             let sent = tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
@@ -592,8 +744,9 @@ async fn process_slot(
     decoders: &DecoderRegistry,
     resolver: &AsyncMutex<AccountResolver>,
     slot: u64,
+    commitment: Option<CommitmentLevel>,
 ) -> PrismResult<ProcessedSlot> {
-    let mut processed = processor.process(slot).await?;
+    let mut processed = processor.process_at(slot, commitment).await?;
     let Some(udm_slot) = processed.udm_slot.take() else {
         return Ok(processed);
     };
@@ -630,6 +783,15 @@ struct WriterTotals {
     flushes: u64,
 }
 
+impl WriterTotals {
+    fn add(&mut self, other: &Self) {
+        self.slots_processed += other.slots_processed;
+        self.slots_skipped += other.slots_skipped;
+        self.transactions_processed += other.transactions_processed;
+        self.flushes += other.flushes;
+    }
+}
+
 /// The consuming end of the pipeline: buffers processed slots in the
 /// [`ParquetWriter`], flushes them, announces them and moves the cursor.
 struct WriterTask {
@@ -651,24 +813,38 @@ struct WriterTask {
 impl WriterTask {
     /// Consume the channel until process hangs up, then flush what is left
     /// and persist the cursor.
+    ///
+    /// Once `discard` is cancelled (a rewind), it stops as soon as it can and
+    /// flushes nothing more: the buffered slots are about to be rolled back,
+    /// and announcing them would point consumers at files that are deleted
+    /// right after.
     async fn run(
         mut self,
         mut rx: mpsc::Receiver<ProcessedSlot>,
         interval: Duration,
+        discard: CancellationToken,
     ) -> PrismResult<WriterTotals> {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
         loop {
             tokio::select! {
+                () = discard.cancelled() => return Ok(self.totals),
                 processed = rx.recv() => {
                     let Some(processed) = processed else { break };
-                    if self.receive(processed)? {
+                    if self.receive(processed)? && !discard.is_cancelled() {
                         self.flush(false).await?;
                     }
                 }
-                _ = ticker.tick() => self.flush(false).await?,
+                _ = ticker.tick() => {
+                    if !discard.is_cancelled() {
+                        self.flush(false).await?;
+                    }
+                }
             }
+        }
+        if discard.is_cancelled() {
+            return Ok(self.totals);
         }
         self.flush(true).await?;
         self.cursor.persist()?;
@@ -754,5 +930,74 @@ impl WriterTask {
         self.high_water = None;
         self.totals.flushes += 1;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile hooks
+// ---------------------------------------------------------------------------
+
+/// A rewind asked of [`Ingestor::run`], with where to send the outcome.
+struct RewindRequest {
+    from_slot: u64,
+    reply: oneshot::Sender<PrismResult<()>>,
+}
+
+/// The ingestor's [`Rewind`]: hands the request to [`Ingestor::run`] and
+/// waits until it has lowered the cursor and deleted the files.
+#[derive(Debug, Clone)]
+pub struct IngestorRewinder {
+    tx: mpsc::Sender<RewindRequest>,
+}
+
+#[async_trait]
+impl Rewind for IngestorRewinder {
+    async fn rewind_to(&self, from_slot: u64) -> PrismResult<()> {
+        let (reply, outcome) = oneshot::channel();
+        self.tx
+            .send(RewindRequest { from_slot, reply })
+            .await
+            .map_err(|_| PrismError::config("ingestor", "is gone; the rewind was not executed"))?;
+        outcome.await.map_err(|_| {
+            PrismError::config("ingestor", "stopped before executing the rewind")
+        })?
+    }
+}
+
+/// The ingestor's [`ReconcileContext`]: the cursor's durable flush edge and
+/// processed edge, the commitment tracker's finalized watermark, and the
+/// genesis hash it was built with.
+#[derive(Clone)]
+pub struct IngestorReconcileContext {
+    cursor: IngestorCursor,
+    tracker: Arc<CommitmentTracker>,
+    genesis_hash: String,
+}
+
+impl std::fmt::Debug for IngestorReconcileContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngestorReconcileContext")
+            .field("cursor", &self.cursor.state())
+            .field("finalized_slot", &self.tracker.finalized_slot())
+            .field("genesis_hash", &self.genesis_hash)
+            .finish()
+    }
+}
+
+impl ReconcileContext for IngestorReconcileContext {
+    fn durable_last_flush_slot(&self) -> u64 {
+        self.cursor.durable_flush_slot()
+    }
+
+    fn cursor_slot(&self) -> u64 {
+        self.cursor.state().last_processed_slot
+    }
+
+    fn finalized_slot(&self) -> u64 {
+        self.tracker.finalized_slot()
+    }
+
+    fn genesis_hash(&self) -> String {
+        self.genesis_hash.clone()
     }
 }

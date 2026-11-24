@@ -12,9 +12,11 @@
 //! | [`app`]           | Starting the services, the router, fail-stop supervision         |
 //! | [`stream`]        | The one poller and `GET /api/stream` (SSE)                       |
 //! | [`commons_panel`] | `commons verify`, run in-process for the dashboard               |
+//! | [`demo_hook`]     | FORGE's demo alert and its webhook, `POST /demo/hook`            |
 
 pub mod app;
 pub mod commons_panel;
 pub mod config;
+pub mod demo_hook;
 pub mod layout;
 pub mod stream;

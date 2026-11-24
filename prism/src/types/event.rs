@@ -10,7 +10,10 @@
 //! after the slot's Parquet files are durably written. [`ChangeEvent::Final`]
 //! is a separate, coarser signal emitted by the commitment tracker whenever the
 //! finalized watermark moves: it says which slots, and so which already
-//! written files, can no longer be invalidated. Wire format is JSON (see
+//! written files, can no longer be invalidated. [`ChangeEvent::Correction`] is
+//! emitted by the reconciler when finalized slots on disk disagree with the
+//! chain: the slots from `from_slot` up are about to be deleted and ingested
+//! again, and their new `New` / `Skip` events follow. Wire format is JSON (see
 //! [`ChangeEvent::to_json`]), with a top-level `"event"` discriminator so the
 //! stream stays forward-compatible when new variants are added.
 //!
@@ -87,6 +90,81 @@ impl FromStr for SkipReason {
     }
 }
 
+/// Why the reconciler corrected stored data. When one correction covers
+/// several kinds of discrepancy, the most severe one is reported: the
+/// variants are listed from most to least severe, and `Ord` follows that
+/// order (`Orphaned` is the greatest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrectionReason {
+    /// Rows were stored for a slot that has no block on the finalized chain:
+    /// they came from an abandoned fork.
+    Orphaned,
+    /// The finalized chain has a block for the slot, but nothing was stored
+    /// and no skip was recorded.
+    Missing,
+    /// A skip was recorded for the slot, but the finalized chain has a block
+    /// for it.
+    FalseSkip,
+}
+
+impl CorrectionReason {
+    pub const ALL: [CorrectionReason; 3] = [
+        CorrectionReason::Orphaned,
+        CorrectionReason::Missing,
+        CorrectionReason::FalseSkip,
+    ];
+
+    /// Wire / log representation (`snake_case`, matches the serde encoding).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Orphaned => "orphaned",
+            Self::Missing => "missing",
+            Self::FalseSkip => "false_skip",
+        }
+    }
+
+    /// Higher is more severe.
+    pub const fn severity(self) -> u8 {
+        match self {
+            Self::Orphaned => 3,
+            Self::Missing => 2,
+            Self::FalseSkip => 1,
+        }
+    }
+}
+
+impl PartialOrd for CorrectionReason {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CorrectionReason {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.severity().cmp(&other.severity())
+    }
+}
+
+impl fmt::Display for CorrectionReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CorrectionReason {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "orphaned" => Ok(Self::Orphaned),
+            "missing" => Ok(Self::Missing),
+            "false_skip" => Ok(Self::FalseSkip),
+            other => Err(format!("unknown correction reason: {other:?}")),
+        }
+    }
+}
+
 /// One entry in PRISM's change log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -128,6 +206,20 @@ pub enum ChangeEvent {
         /// first one of a run).
         previous_slot: u64,
     },
+    /// Finalized slots on disk disagreed with the chain. Every file at or
+    /// above `from_slot` is being deleted and those slots ingested again;
+    /// their `New` / `Skip` events are emitted anew as they are re-written.
+    /// Like every event, it may be delivered more than once.
+    Correction {
+        /// Lowest slot found wrong: the rewind point.
+        from_slot: u64,
+        /// Highest slot found wrong in the same pass.
+        to_slot: u64,
+        /// The most severe kind of discrepancy among them.
+        reason: CorrectionReason,
+        /// How many slots in `from_slot..=to_slot` were found wrong.
+        affected: u64,
+    },
 }
 
 impl ChangeEvent {
@@ -159,10 +251,27 @@ impl ChangeEvent {
         }
     }
 
-    /// The slot this event is about. Every variant has one.
+    /// Build a [`ChangeEvent::Correction`].
+    pub const fn correction(
+        from_slot: u64,
+        to_slot: u64,
+        reason: CorrectionReason,
+        affected: u64,
+    ) -> Self {
+        Self::Correction {
+            from_slot,
+            to_slot,
+            reason,
+            affected,
+        }
+    }
+
+    /// The slot this event is about. Every variant has one; for a
+    /// correction it is `from_slot`.
     pub const fn slot(&self) -> u64 {
         match self {
             Self::New { slot, .. } | Self::Skip { slot, .. } | Self::Final { slot, .. } => *slot,
+            Self::Correction { from_slot, .. } => *from_slot,
         }
     }
 
@@ -172,6 +281,7 @@ impl ChangeEvent {
             Self::New { .. } => "new",
             Self::Skip { .. } => "skip",
             Self::Final { .. } => "final",
+            Self::Correction { .. } => "correction",
         }
     }
 
@@ -187,11 +297,15 @@ impl ChangeEvent {
         matches!(self, Self::Final { .. })
     }
 
-    /// Parquet paths written for this event. Empty for skips and finals.
+    pub const fn is_correction(&self) -> bool {
+        matches!(self, Self::Correction { .. })
+    }
+
+    /// Parquet paths written for this event. Empty for every other kind.
     pub fn parquet_paths(&self) -> &[String] {
         match self {
             Self::New { parquet_paths, .. } => parquet_paths,
-            Self::Skip { .. } | Self::Final { .. } => &[],
+            Self::Skip { .. } | Self::Final { .. } | Self::Correction { .. } => &[],
         }
     }
 
@@ -199,7 +313,7 @@ impl ChangeEvent {
     pub const fn skip_reason(&self) -> Option<SkipReason> {
         match self {
             Self::Skip { reason, .. } => Some(*reason),
-            Self::New { .. } | Self::Final { .. } => None,
+            Self::New { .. } | Self::Final { .. } | Self::Correction { .. } => None,
         }
     }
 
@@ -207,7 +321,7 @@ impl ChangeEvent {
     pub fn block_datetime(&self) -> Option<DateTime<Utc>> {
         match self {
             Self::New { block_time, .. } => block_time.and_then(unix_to_datetime),
-            Self::Skip { .. } | Self::Final { .. } => None,
+            Self::Skip { .. } | Self::Final { .. } | Self::Correction { .. } => None,
         }
     }
 
@@ -245,6 +359,15 @@ impl fmt::Display for ChangeEvent {
             } => write!(
                 f,
                 "final slot={slot} blockhash={blockhash} previous={previous_slot}"
+            ),
+            Self::Correction {
+                from_slot,
+                to_slot,
+                reason,
+                affected,
+            } => write!(
+                f,
+                "correction from={from_slot} to={to_slot} reason={reason} affected={affected}"
             ),
         }
     }

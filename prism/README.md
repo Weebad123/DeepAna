@@ -39,6 +39,7 @@ downstream systems.
 | `commitment` | Tracks the boundary between `confirmed` and `finalized` slots and emits a `Final` event whenever the finalized watermark advances. It can say whether a slot is finalized, but the UDM rows do not carry an `is_finalized` column yet, so nothing is stamped onto the Parquet files. |
 | `storage` | `Storage` is the backend trait. `ParquetWriter` buffers rows in memory and on each flush writes one file per table. `PartitionKey` computes the file paths. Flushes are all-or-nothing, and `rollback` removes slots at or above a given slot (e.g. after a fork). |
 | `changelog` | `ChangeLog`, the sink every change event goes through: `emit` records an event and returns its id, `flush` makes everything recorded durable. Three producers publish to it: the gap handler (`Skip`, as soon as a slot is found skipped or unreachable), the ingestor's writer task (`New`, one per slot once its files are on disk) and the commitment tracker (`Final`). `LocalChangeLog` appends them to `{data_dir}/changelog.jsonl`, see [The change log file](#the-change-log-file). |
+| `reconcile` | Checks finalized slots on disk against the finalized chain. `Reconciler` runs passes on a timer, classifies each slot of a window as ok, `orphaned`, `missing`, `false_skip` or `unlogged_skip`, and when two passes agree asks the ingestor (through `Rewind`) to re-ingest from the lowest wrong slot, announcing it as a `Correction`. State lives in `reconcile.json`. See [Reconciliation](#reconciliation). |
 | `ingestor` | The orchestration layer. It builds and owns the slot processor, decoder registry, account resolver and `ParquetWriter`, and runs them as two Tokio tasks joined by a bounded channel of `ProcessedSlot`s: *process* (fetch, normalize, decode, resolve) and *writer* (append, flush, announce, move the cursor). It persists an `IngestorCursor` so a restart resumes after the last flushed slot. It also builds the Helius-backed adapter. See [Running the ingestor](#running-the-ingestor). |
 
 
@@ -79,8 +80,9 @@ When something goes wrong:
 | `Skip` | gap handler | As soon as a slot is found skipped (`validator_skipped`) or unreachable after retries (`rpc_unavailable`). |
 | `New` | writer task | Once per slot with data, after its flush succeeded. Carries the paths of every file in that flush. |
 | `Final` | commitment tracker | When the finalized watermark advances: one event per newly finalized watermark, then one change log flush per poll. |
+| `Correction` | reconciler | Before a rewind: `from_slot`, `to_slot`, `reason` (the most severe present: `orphaned`, then `missing`, then `false_skip`) and `affected` (how many slots were wrong). Every file at or above `from_slot` is deleted and those slots re-announced with fresh `New` / `Skip` events. |
 
-Delivery is at least once: a `New` event can repeat after a restart. A
+Delivery is at least once: a `New` or `Correction` event can repeat after a restart. A
 `Skip` can arrive before the `New` events of earlier slots that are still
 buffered, so consumers that need strict slot order should sort by slot.
 
@@ -91,6 +93,7 @@ buffered, so consumers that need strict slot order should sort by slot.
   changelog.jsonl       change events, one numbered JSON envelope per line
   cursor.json           resume point: last processed and last flushed slot
   skipped_slots.log     one line per skip: {unix_time},{slot},{reason}
+  reconcile.json        reconciler state: progress, strikes, attempts, rewinds
   solana/
     slots/date=YYYY-MM-DD/slots_{from}_{to}.parquet
     transactions/date=YYYY-MM-DD/txs_{from}_{to}.parquet
@@ -101,6 +104,68 @@ buffered, so consumers that need strict slot order should sort by slot.
 Slot ranges include both ends. The date is the UTC day of the first slot in
 the batch. List-shaped and decoded columns are stored as JSON strings, so
 any Parquet reader can open the files.
+
+## Reconciliation
+
+PRISM writes at `confirmed`, so a stored slot can turn out to belong to a
+fork the cluster abandoned. `Reconciler` looks back at slots that are both
+flushed (per the cursor file) and finalized, and compares three sets: slots
+in the `slots` Parquet table, slots the finalized chain has a block for
+(`getBlocks`), and slots the skip log marks `validator_skipped`.
+
+| Stored | On chain | Skip logged | Finding | Acted on |
+|--------|----------|-------------|---------|----------|
+| yes | yes | any | ok | |
+| yes | no | any | `orphaned` | yes |
+| no | yes | no | `missing` | yes |
+| no | yes | yes | `false_skip` | yes |
+| no | no | yes | ok | |
+| no | no | no | `unlogged_skip` | no, counted only |
+
+A pass runs when at least 20 new safe slots are waiting, and examines at
+most 2,000. A finding is acted on only when the next pass reports it again
+with the same kind. If more than half of a window disagrees, the reconciler
+refuses and halts (`halted: mass_mismatch`): a wrong RPC or data directory
+is more likely than that many forks. The first pass pins the cluster's
+genesis hash, and a different one later also halts it
+(`halted: cluster_mismatch`). A halt holds across restarts until an operator
+clears `halted` in `reconcile.json`. Any read failure (RPC, Parquet, skip
+log) makes the pass inconclusive: nothing is concluded or changed.
+
+Acting means a rewind to the lowest confirmed slot:
+
+1. `in_flight` is written to `reconcile.json`.
+2. A `Correction` is emitted and the change log flushed.
+3. The ingestor stops its pipeline without flushing, lowers the cursor to
+   `from_slot - 1`, deletes every file at or above `from_slot`, and resumes.
+   Slots already finalized are now fetched at `finalized`, so the orphan
+   cannot be read again.
+4. The attempt is recorded and `in_flight` cleared.
+
+If 2 or 3 fails, the error halts PRISM and `in_flight` stays set.
+`Ingestor::run` finishes 3 and 4 before its pipeline starts again.
+
+Limits keep it from looping: a slot is corrected at most twice, never when
+it is more than 5,000 slots below the cursor, and at most 3 rewinds happen
+per hour (after that, confirmed findings wait). A finding past the first two
+limits is `unresolved`: it stays in `reconcile.json` and holds
+`reconciled_through` below it until the slot is found ok again.
+
+Wiring it up next to an ingestor:
+
+```rust
+let genesis = adapter.genesis_hash().await?;
+let reconciler = Reconciler::new(
+    ReconcileConfig::default(),
+    Arc::clone(&adapter),
+    Arc::new(ingestor.reconcile_context(genesis)),
+    Arc::new(ingestor.rewinder()),
+    Arc::clone(&changelog),
+    &data_dir,
+)?;
+let handle = reconciler.handle(); // stats() and state() for dashboards
+tokio::spawn(reconciler.run(shutdown.clone()));
+```
 
 ## The change log file
 

@@ -30,6 +30,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::warn;
 
+use crate::adapter::CommitmentLevel;
 use crate::normalizer::{NormalizedBlock, Normalizer};
 use crate::types::error::{PrismError, PrismResult};
 use crate::types::event::SkipReason;
@@ -189,8 +190,21 @@ impl SlotProcessor {
     /// * the normalizer's error for a block it cannot read;
     /// * the change log's error when a skip could not be published.
     pub async fn process(&self, slot: u64) -> PrismResult<ProcessedSlot> {
+        self.process_at(slot, None).await
+    }
+
+    /// Like [`Self::process`], with the block read at `commitment` instead
+    /// of the adapter's configured commitment when one is given. The
+    /// ingestor asks for `finalized` for slots already below the finalized
+    /// watermark, so a re-ingest can never pick up a block from an
+    /// abandoned fork.
+    pub async fn process_at(
+        &self,
+        slot: u64,
+        commitment: Option<CommitmentLevel>,
+    ) -> PrismResult<ProcessedSlot> {
         let started = Instant::now();
-        let fetched = self.fetcher.fetch(slot).await;
+        let fetched = self.fetcher.fetch_at(slot, commitment).await;
         let fetch_duration_ms = started.elapsed().as_millis() as u64;
         let processed = match fetched {
             Ok(Some(block)) => {

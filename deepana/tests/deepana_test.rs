@@ -17,7 +17,7 @@ use deepana::commons_panel::CommonsPanel;
 use deepana::config::{self, ServiceConfigs};
 use deepana::layout::Layout;
 use prism::storage::{ParquetWriter, Storage};
-use prism::types::udm::{DeepAnaSlot, DeepAnaTokenTransfer, DeepAnaTransaction, TransactionStatus};
+use prism::types::udm::{DeepAnaInstruction, DeepAnaSlot, DeepAnaTokenTransfer, DeepAnaTransaction, TransactionStatus};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -31,8 +31,9 @@ fn no_env(_: &str) -> Option<OsString> {
     None
 }
 
-/// Write `slots` with PRISM's writer: each slot has one transaction and one
-/// token transfer, of mint `mint{slot % 3}`.
+/// Write `slots` with PRISM's writer: each slot has one transaction, one
+/// instruction, of program `prog{slot % 2}`, and one token transfer, of mint
+/// `mint{slot % 3}`.
 fn write_parquet(dir: &Path, slots: std::ops::Range<u64>) {
     let mut writer = ParquetWriter::new(dir);
     for slot in slots {
@@ -72,7 +73,18 @@ fn write_parquet(dir: &Path, slots: std::ops::Range<u64>) {
             decimals: Some(6),
             block_time: Some(1_793_102_400 + slot as i64),
         };
-        writer.append(&row, &[tx], &[], &[transfer]).unwrap();
+        let instruction = DeepAnaInstruction {
+            slot,
+            tx_signature: format!("sig{slot}"),
+            instruction_index: 0,
+            inner_instruction_index: None,
+            program_id: format!("prog{}", slot % 2),
+            accounts: vec!["payer".to_owned()],
+            data_base58: String::new(),
+            instruction_type: None,
+            decoded_data: None,
+        };
+        writer.append(&row, &[tx], &[instruction], &[transfer]).unwrap();
     }
     writer.flush().unwrap();
 }
@@ -301,6 +313,14 @@ async fn one_port_serves_every_service_the_dashboard_and_the_stream() {
     assert_eq!(answer["outcome"], "matched", "{answer}");
     let rows = answer["answer"]["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 3, "{answer}");
+    // The dashboard renders a matched answer as a table of these columns.
+    let ask = json!({ "question": "busiest programs in the last 1000 slots" });
+    let (status, answer) = json_of(addr, "POST", "/api/oracle/ask", Some(&ask)).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["outcome"], "matched", "{answer}");
+    let columns: Vec<&str> = answer["answer"]["columns"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert!(columns.contains(&"program"), "{answer}");
+    assert_eq!(answer["answer"]["rows"].as_array().unwrap().len(), 2, "{answer}");
 
     // The stream: a snapshot on connect holding the existing change log,
     // then a status poll with the newest slot, then new change log lines.
@@ -309,6 +329,8 @@ async fn one_port_serves_every_service_the_dashboard_and_the_stream() {
     })
     .await;
     assert!(first.contains("\"reason\":\"validator_skipped\""), "the snapshot carries the change log so far");
+    assert!(first.contains("\"ms_per_slot\":400"), "the snapshot carries the dashboard settings");
+    assert!(first.contains("\"tick_error\""), "the status carries ORACLE's /detectors");
 
     let reader = tokio::spawn(read_sse_until(addr, Duration::from_secs(20), |s| s.contains("event: changelog") && s.contains("\"slot\":4242")));
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -316,10 +338,29 @@ async fn one_port_serves_every_service_the_dashboard_and_the_stream() {
     let seen = reader.await.unwrap();
     assert!(seen.contains("\"skip_events\":2"), "{seen}");
 
+    // The FORGE demo: created once, adopted after; the secret never leaves.
+    let (status, created) = http(addr, "POST", "/api/demo/alert", Some(&json!({}))).await;
+    assert_eq!(status, 201, "{created}");
+    assert!(!created.contains("secret"), "{created}");
+    let created: Value = serde_json::from_str(&created).unwrap();
+    assert_eq!(created["alert"]["name"], "deepana-demo");
+    assert_eq!(created["alert"]["webhook_url"], format!("http://{addr}/demo/hook"));
+    let (status, again) = http(addr, "POST", "/api/demo/alert", Some(&json!({}))).await;
+    assert_eq!(status, 200, "{again}");
+    assert!(!again.contains("secret"), "{again}");
+    // An unsigned delivery is refused, and shown on the stream as refused.
+    let reader = tokio::spawn(read_sse_until(addr, Duration::from_secs(20), |s| s.contains("event: demo_delivery")));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (status, _) = json_of(addr, "POST", "/demo/hook", Some(&json!({ "rows": [] }))).await;
+    assert_eq!(status, 401);
+    let seen = reader.await.unwrap();
+    assert!(seen.contains("\"verified\":false"), "{seen}");
+
     // COMMONS: verify the sample repository on demand.
     let (status, report) = json_of(addr, "POST", "/api/commons/verify", Some(&json!({}))).await;
     assert_eq!(status, 200, "{report}");
     assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["configured"], true, "{report}");
     assert!(report["report"]["artifacts"].as_array().is_some_and(|a| !a.is_empty()), "{report}");
     let (status, _) = json_of(addr, "GET", "/api/commons/report", None).await;
     assert_eq!(status, 200);
@@ -386,6 +427,7 @@ async fn without_a_commons_repository_the_report_says_so() {
     let panel = CommonsPanel::new(dir.path().join("commons"));
     let report = panel.verify().await;
     assert_eq!(report["ok"], false);
+    assert_eq!(report["configured"], false, "not configured is not a verification failure");
     assert!(report["error"].as_str().unwrap().contains("no COMMONS repository"), "{report}");
     // Only read: nothing created.
     assert!(!dir.path().join("commons").exists());

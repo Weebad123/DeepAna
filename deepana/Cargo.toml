@@ -18,6 +18,8 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net"
 tokio-util.workspace = true
 # The SSE body stream. Already in the build through DataFusion and reqwest.
 futures-util = "0.3.34"
+# The demo webhook secret, generated per process.
+uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true

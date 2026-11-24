@@ -8,6 +8,7 @@ pub mod slot_processor;
 pub mod adapter;
 pub mod account_resolver;
 pub mod changelog;
+pub mod reconcile;
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right

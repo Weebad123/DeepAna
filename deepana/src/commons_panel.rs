@@ -39,6 +39,12 @@ impl CommonsPanel {
         &self.root
     }
 
+    /// Whether the root holds a COMMONS repository (`artifacts/` and
+    /// `fixtures/`). Checked on every call: one may be created later.
+    pub fn is_configured(&self) -> bool {
+        is_repository(&self.root)
+    }
+
     /// Run verify and return the panel's report:
     ///
     /// ```json
@@ -46,7 +52,9 @@ impl CommonsPanel {
     ///  "ok": true, "report": { ...commons verify --format json... }}
     /// ```
     ///
-    /// or, when verify could not run, `"ok": false` with `"error"`. A second
+    /// or, when verify could not run, `"ok": false` with `"error"`.
+    /// `"configured"` says whether the root is a COMMONS repository at
+    /// all; `false` is not a verification failure. A second
     /// call while one runs waits for it, then runs again.
     pub async fn verify(&self) -> Value {
         let _one_at_a_time = self.running.lock().await;
@@ -61,6 +69,7 @@ impl CommonsPanel {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
             "duration_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "configured": self.is_configured(),
         });
         let mut report = base;
         match outcome {
@@ -77,11 +86,15 @@ impl CommonsPanel {
     }
 }
 
+fn is_repository(root: &Path) -> bool {
+    root.join(ARTIFACTS_DIR).is_dir() && root.join(FIXTURES_DIR).is_dir()
+}
+
 /// `commons verify <root>/artifacts --repo-root <root> --format json`, as
 /// a JSON value. Blocking: COMMONS drives DataFusion on its own runtime.
 pub fn run_verify(root: &Path) -> Result<Value, String> {
     let artifacts = root.join(ARTIFACTS_DIR);
-    if !artifacts.is_dir() || !root.join(FIXTURES_DIR).is_dir() {
+    if !is_repository(root) {
         return Err(format!(
             "no COMMONS repository at {}: expected {ARTIFACTS_DIR}/ and {FIXTURES_DIR}/ in it",
             root.display()

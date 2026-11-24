@@ -236,6 +236,57 @@ pub trait ChainAdapter: Send + Sync {
     /// [`PrismError::SlotSkipped`]: crate::types::error::PrismError::SlotSkipped
     async fn get_block(&self, slot_or_height: u64) -> PrismResult<ChainBlock>;
 
+    /// Like [`Self::get_block`], but read at `commitment` instead of the
+    /// adapter's configured one.
+    ///
+    /// The ingestor uses it to re-read slots that are already finalized at
+    /// `finalized`, so a slot written from an abandoned fork can never be
+    /// fetched from that fork again. The default ignores `commitment` and
+    /// calls [`Self::get_block`]; adapters that can honour it should.
+    async fn get_block_at(
+        &self,
+        slot_or_height: u64,
+        commitment: CommitmentLevel,
+    ) -> PrismResult<ChainBlock> {
+        let _ = commitment;
+        self.get_block(slot_or_height).await
+    }
+
+    /// The slots in `from..=to` that hold a block at `commitment`, ascending.
+    ///
+    /// A slot absent from the answer was skipped by the chain. An `Err` says
+    /// nothing about any slot in the range: callers must not read a failure
+    /// as "no blocks". The default asks [`Self::get_block_at`] for every slot,
+    /// which is correct but slow; adapters with a range query (Solana's
+    /// `getBlocks`) should use it.
+    async fn get_blocks_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        commitment: CommitmentLevel,
+    ) -> PrismResult<Vec<u64>> {
+        let mut produced = Vec::new();
+        for slot in from..=to {
+            match self.get_block_at(slot, commitment).await {
+                Ok(_) => produced.push(slot),
+                Err(crate::types::error::PrismError::SlotSkipped { .. }) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(produced)
+    }
+
+    /// The hash of the chain's genesis block: what tells two clusters apart.
+    /// The default fails with a
+    /// [`PrismError::ConfigError`](crate::types::error::PrismError::ConfigError):
+    /// an adapter that cannot name its cluster cannot have it pinned.
+    async fn genesis_hash(&self) -> PrismResult<String> {
+        Err(crate::types::error::PrismError::config(
+            "genesis_hash",
+            format!("not supported by the {} adapter", self.chain_id()),
+        ))
+    }
+
     /// Raw state of `addresses`, read at the adapter's configured commitment.
     ///
     /// The result has the same length and order as `addresses`; an account

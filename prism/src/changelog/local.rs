@@ -53,6 +53,7 @@ pub struct ChangeLogStats {
     pub new_events: u64,
     pub skip_events: u64,
     pub final_events: u64,
+    pub correction_events: u64,
     /// `emitted_at` of the last recorded event; `None` before the first.
     pub last_emit_at: Option<i64>,
     /// Bytes appended to the file, newlines included.
@@ -62,7 +63,7 @@ pub struct ChangeLogStats {
 impl ChangeLogStats {
     /// Events of every kind.
     pub const fn total_events(&self) -> u64 {
-        self.new_events + self.skip_events + self.final_events
+        self.new_events + self.skip_events + self.final_events + self.correction_events
     }
 
     fn record(&mut self, event: &ChangeEvent, emitted_at: i64, bytes: u64) {
@@ -70,6 +71,7 @@ impl ChangeLogStats {
             ChangeEvent::New { .. } => self.new_events += 1,
             ChangeEvent::Skip { .. } => self.skip_events += 1,
             ChangeEvent::Final { .. } => self.final_events += 1,
+            ChangeEvent::Correction { .. } => self.correction_events += 1,
         }
         self.last_emit_at = Some(emitted_at);
         self.bytes_written += bytes;
