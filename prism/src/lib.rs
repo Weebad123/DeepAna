@@ -10,6 +10,7 @@ pub mod account_resolver;
 pub mod changelog;
 pub mod reconcile;
 pub mod metrics;
+pub mod metadata;
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right

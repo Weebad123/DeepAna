@@ -554,3 +554,67 @@ impl UdmRow for DeepAnaTokenTransfer {
         )
     }
 }
+
+// ---------------------------------------------------------------------------
+// DeepAnaTokenMetadata
+// ---------------------------------------------------------------------------
+
+/// One row per mint: its Metaplex metadata as first observed.
+///
+/// Written by the [`metadata`](crate::metadata) enricher, once per mint and
+/// never updated: the row is a snapshot of the metadata account at
+/// `observed_slot`. The table lives under `solana/token_metadata/` and,
+/// unlike the four ingestion tables, is not named or rolled back by slot.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DeepAnaTokenMetadata {
+    /// Base58 mint. Unique across the table.
+    pub mint_address: String,
+    /// Base58 address of the mint's Metaplex metadata account (its PDA).
+    pub metadata_account: String,
+    /// Token name, as stored on chain without its trailing NUL padding.
+    pub name: String,
+    /// Token symbol, same rule as `name`.
+    pub symbol: String,
+    /// Off-chain JSON URI, same rule as `name`. Often empty on devnet.
+    pub uri: String,
+    /// Slot of the token transfer that named the mint and led to the read.
+    pub observed_slot: u64,
+}
+
+static TOKEN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("mint_address", DataType::Utf8, false),
+        Field::new("metadata_account", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("uri", DataType::Utf8, false),
+        Field::new("observed_slot", DataType::UInt64, false),
+    ]))
+});
+
+impl UdmRow for DeepAnaTokenMetadata {
+    const TABLE_NAME: &'static str = "solana_token_metadata";
+
+    fn schema() -> SchemaRef {
+        TOKEN_METADATA_SCHEMA.clone()
+    }
+
+    /// The observation slot. Not a partition key for this table.
+    fn slot(&self) -> u64 {
+        self.observed_slot
+    }
+
+    fn to_record_batch(rows: &[Self]) -> Result<RecordBatch, ArrowError> {
+        RecordBatch::try_new(
+            Self::schema(),
+            vec![
+                utf8_col(rows.iter().map(|r| r.mint_address.as_str())),
+                utf8_col(rows.iter().map(|r| r.metadata_account.as_str())),
+                utf8_col(rows.iter().map(|r| r.name.as_str())),
+                utf8_col(rows.iter().map(|r| r.symbol.as_str())),
+                utf8_col(rows.iter().map(|r| r.uri.as_str())),
+                u64_col(rows.iter().map(|r| r.observed_slot)),
+            ],
+        )
+    }
+}

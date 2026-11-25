@@ -29,8 +29,9 @@
 //! - **A snapshot is not an atomic cut.** Each value is read independently;
 //!   two related counters may be one increment apart.
 //! - **Expose, don't duplicate.** Components that already keep stats (the
-//!   account resolver, the reconciler) hand them in through [`Sources`] at
-//!   snapshot time instead of reporting into `Metrics` twice.
+//!   account resolver, the reconciler, the token metadata enricher) hand
+//!   them in through [`Sources`] at snapshot time instead of reporting into
+//!   `Metrics` twice.
 //! - **Free text only in JSON.** Halt reason and last error are scrubbed with
 //!   [`scrub::clean`] and never appear in the Prometheus output.
 
@@ -43,6 +44,7 @@ use serde::Serialize;
 use solana_client::client_error::ClientErrorKind;
 
 use crate::account_resolver::ResolverMetricsSnapshot;
+use crate::metadata::MetadataStats;
 use crate::reconcile::ReconcileStats;
 use crate::storage::partition::TableKind;
 use crate::types::error::PrismError;
@@ -575,6 +577,7 @@ impl Metrics {
             sources: SourcesSnapshot {
                 resolver: sources.resolver.as_ref().map(resolver_counters),
                 reconcile: sources.reconcile.as_ref().map(reconcile_counters),
+                metadata: sources.metadata.as_ref().map(MetadataStats::counters),
             },
         }
     }
@@ -602,6 +605,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct Sources {
     pub resolver: Option<ResolverMetricsSnapshot>,
     pub reconcile: Option<ReconcileStats>,
+    pub metadata: Option<MetadataStats>,
 }
 
 /// A source's counters by name. Every value is a monotonic counter.
@@ -612,6 +616,8 @@ pub type SourceCounters = BTreeMap<&'static str, u64>;
 pub struct SourcesSnapshot {
     pub resolver: Option<SourceCounters>,
     pub reconcile: Option<SourceCounters>,
+    /// [`MetadataStats::counters`].
+    pub metadata: Option<SourceCounters>,
 }
 
 fn resolver_counters(s: &ResolverMetricsSnapshot) -> SourceCounters {
@@ -789,6 +795,7 @@ mod tests {
                 rewinds: 2,
                 ..Default::default()
             }),
+            metadata: None,
         };
         let s = m.snapshot(&sources);
         assert_eq!(s.sources.resolver.unwrap()["cache_hits"], 3);

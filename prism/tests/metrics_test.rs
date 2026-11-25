@@ -44,6 +44,7 @@ use std::thread;
 use std::time::Duration;
 
 use prism::account_resolver::ResolverMetricsSnapshot;
+use prism::metadata::MetadataStats;
 use prism::adapter::config::{AdapterConfig, SolanaAdapterConfig};
 use prism::adapter::solana::SolanaAdapter;
 use prism::adapter::{ChainAdapter, CommitmentLevel};
@@ -428,6 +429,7 @@ fn expected_series(s: &MetricsSnapshot) -> BTreeMap<String, Exp> {
     for (prefix, counters) in [
         ("resolver", &s.sources.resolver),
         ("reconcile", &s.sources.reconcile),
+        ("metadata", &s.sources.metadata),
     ] {
         for (field, &n) in counters.iter().flatten() {
             out.insert(key(&format!("prism_{prefix}_{field}_total"), &[]), Exp::Int(n));
@@ -1040,11 +1042,14 @@ fn fixed_series_count() -> usize {
 const GAUGES: usize = 7;
 const RESOLVER_FIELDS: usize = 8;
 const RECONCILE_FIELDS: usize = 10;
+/// 13 plain counters, one per fetch error class, one per reject reason.
+const METADATA_FIELDS: usize = 13 + ErrorClass::COUNT + 6;
 
 fn full_sources() -> Sources {
     Sources {
         resolver: Some(ResolverMetricsSnapshot::default()),
         reconcile: Some(ReconcileStats::default()),
+        metadata: Some(MetadataStats::default()),
     }
 }
 
@@ -1057,7 +1062,7 @@ fn cardinality_is_fixed_and_known() {
     assert_eq!(fresh.len(), fixed_series_count());
 
     let (_, with_sources) = render_and_parse(&m.snapshot(&full_sources()));
-    assert_eq!(with_sources.len(), fixed_series_count() + RESOLVER_FIELDS + RECONCILE_FIELDS);
+    assert_eq!(with_sources.len(), fixed_series_count() + RESOLVER_FIELDS + RECONCILE_FIELDS + METADATA_FIELDS);
 
     // Record everything, every label combination, extreme values and hostile
     // free text: the series set (beyond the 7 optional gauges) must not move.
@@ -1079,7 +1084,7 @@ fn cardinality_is_fixed_and_known() {
     m.set_changelog(1, 1);
 
     let (text, busy) = render_and_parse(&m.snapshot(&full_sources()));
-    assert_eq!(busy.len(), fixed_series_count() + GAUGES + RESOLVER_FIELDS + RECONCILE_FIELDS);
+    assert_eq!(busy.len(), fixed_series_count() + GAUGES + RESOLVER_FIELDS + RECONCILE_FIELDS + METADATA_FIELDS);
     let fresh_keys: BTreeSet<_> = fresh.keys().collect();
     let busy_keys: BTreeSet<_> = busy.keys().collect();
     assert!(fresh_keys.is_subset(&busy_keys));
@@ -1894,7 +1899,7 @@ fn source_counters_agree_field_by_field() {
         last_error: Some("source read failed: https://rpc.io/?api-key=RECONCILE_LEAK token=RECONCILE_LEAK".to_owned()),
     };
     let metrics = Metrics::new();
-    let s = metrics.snapshot(&Sources { resolver: Some(resolver), reconcile: Some(reconcile.clone()) });
+    let s = metrics.snapshot(&Sources { resolver: Some(resolver), reconcile: Some(reconcile.clone()), metadata: None });
     let (_, parsed) = render_and_parse(&s);
     let get = |name: &str| parsed[&key(name, &[])].parse::<u64>().unwrap();
 
@@ -1925,7 +1930,7 @@ fn source_counters_agree_field_by_field() {
     assert_eq!(json["sources"]["resolver"]["cache_hits"], 107);
     assert_eq!(json["sources"]["reconcile"]["rewinds"], 207);
     // An absent source is null in JSON and absent from Prometheus.
-    let s = metrics.snapshot(&Sources { resolver: None, reconcile: Some(reconcile) });
+    let s = metrics.snapshot(&Sources { resolver: None, reconcile: Some(reconcile), metadata: None });
     assert!(serde_json::to_value(&s).unwrap()["sources"]["resolver"].is_null());
     let (text, _) = render_and_parse(&s);
     assert!(!text.contains("prism_resolver_"));

@@ -26,6 +26,11 @@ use chrono::{DateTime, NaiveDate};
 /// Top-level directory under `data_dir` that holds every Solana table.
 pub const CHAIN_DIR: &str = "solana";
 
+/// Directory under `{data_dir}/solana/` of the `token_metadata` table, which
+/// the [`metadata`](crate::metadata) enricher writes. It is not keyed by
+/// slot, so rollback never enters it: a rewind must not delete metadata.
+pub const TOKEN_METADATA_DIR: &str = "token_metadata";
+
 /// Extension of every finished data file.
 pub const PARQUET_EXTENSION: &str = "parquet";
 

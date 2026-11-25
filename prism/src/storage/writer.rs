@@ -43,7 +43,7 @@ use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use tracing::{debug, info, warn};
 
-use super::partition::{PARQUET_EXTENSION, PartitionKey, TableKind};
+use super::partition::{PARQUET_EXTENSION, PartitionKey, TOKEN_METADATA_DIR, TableKind};
 use super::{FlushResult, Storage};
 use crate::types::error::{PrismError, PrismResult};
 use crate::types::udm::{
@@ -463,8 +463,10 @@ fn read_rows_below(path: &Path, from_slot: u64) -> Result<RecordBatch, ParquetEr
 }
 
 /// Every `.parquet` file under `root`, recursively, sorted. A missing root
-/// has none.
+/// has none. The `token_metadata` table directory directly under `root` is
+/// not entered: its files are not keyed by slot and survive every rollback.
 fn list_parquet_files(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let metadata_dir = root.join(TOKEN_METADATA_DIR);
     let mut files = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -477,7 +479,9 @@ fn list_parquet_files(root: &Path) -> io::Result<Vec<PathBuf>> {
             let entry = entry?;
             let path = entry.path();
             if entry.file_type()?.is_dir() {
-                pending.push(path);
+                if path != metadata_dir {
+                    pending.push(path);
+                }
             } else if path.extension().is_some_and(|ext| ext == PARQUET_EXTENSION) {
                 files.push(path);
             }

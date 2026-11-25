@@ -112,6 +112,9 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
     if let Some(c) = &s.sources.reconcile {
         source(o, "reconcile", "Reconciler", c);
     }
+    if let Some(c) = &s.sources.metadata {
+        source(o, "metadata", "Token metadata enricher", c);
+    }
 
     out
 }
@@ -246,6 +249,7 @@ mod tests {
         let sources = Sources {
             resolver: Some(ResolverMetricsSnapshot::default()),
             reconcile: Some(Default::default()),
+            metadata: None,
         };
         let text = render_prometheus(&m.snapshot(&sources));
         let mut seen = std::collections::HashSet::new();

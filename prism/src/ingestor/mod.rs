@@ -29,7 +29,8 @@
 //!   or sooner once [`IngestorConfig::flush_max_slots`] slots are buffered,
 //!   it flushes, emits one [`ChangeEvent::New`] per flushed slot carrying the
 //!   files written, and then moves the cursor's flush edge, which persists
-//!   it.
+//!   it. With an enricher attached ([`Ingestor::with_metadata`]) it then
+//!   hints the mint of every flushed transfer, without waiting.
 //!
 //! | File        | Holds                                                    |
 //! |-------------|----------------------------------------------------------|
@@ -69,12 +70,15 @@
 //! whatever [`IngestorConfig::commitment`] says: a slot that is re-ingested
 //! after a correction can then never be read from the abandoned fork again.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use helius::HeliusBuilder;
+use solana_sdk::pubkey::Pubkey;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -87,6 +91,7 @@ use crate::adapter::{ChainAdapter, CommitmentLevel};
 use crate::changelog::ChangeLog;
 use crate::commitment::CommitmentTracker;
 use crate::decoder::DecoderRegistry;
+use crate::metadata::MetadataHandle;
 use crate::normalizer::{NormalizedBlock, Normalizer};
 use crate::reconcile::{InFlight, ReconcileContext, Reconciler, Rewind};
 use crate::slot_processor::{GapHandler, ProcessedSlot, SlotFetcher, SlotFetcherConfig, SlotProcessor};
@@ -298,6 +303,8 @@ pub struct Ingestor {
     rewind_tx: mpsc::Sender<RewindRequest>,
     /// Held by [`Ingestor::run`] for as long as it runs.
     rewind_rx: AsyncMutex<mpsc::Receiver<RewindRequest>>,
+    /// Told about the mints of every flushed transfer, when set.
+    metadata: Option<MetadataHandle>,
 }
 
 impl std::fmt::Debug for Ingestor {
@@ -346,7 +353,23 @@ impl Ingestor {
             shutdown: CancellationToken::new(),
             rewind_tx,
             rewind_rx: AsyncMutex::new(rewind_rx),
+            metadata: None,
         })
+    }
+
+    /// Hint `metadata` with the mint of every token transfer, once its
+    /// flush has succeeded. [`MetadataHandle::hint`] never waits, so this
+    /// cannot slow the pipeline; the caller keeps its own handle to shut
+    /// the enricher down.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: MetadataHandle) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// The token metadata enricher, when one was attached.
+    pub fn metadata(&self) -> Option<&MetadataHandle> {
+        self.metadata.as_ref()
     }
 
     /// Decode with `registry` instead of the default SPL Token registry,
@@ -549,6 +572,8 @@ impl Ingestor {
             flush_max_slots: self.config.flush_max_slots as u64,
             max_flush_failures: self.config.max_flush_failures,
             pending: Vec::new(),
+            metadata: self.metadata.clone(),
+            pending_mints: HashMap::new(),
             high_water: None,
             consecutive_failures: 0,
             totals: WriterTotals::default(),
@@ -849,6 +874,11 @@ struct WriterTask {
     /// Slot rows appended since the last successful flush, in slot order:
     /// each gets a `New` event once its files are written.
     pending: Vec<DeepAnaSlot>,
+    metadata: Option<MetadataHandle>,
+    /// Mints of the transfers appended since the last successful flush,
+    /// with the highest slot each was seen in. Hinted after the flush;
+    /// dropped with the rest of the epoch on a rewind.
+    pending_mints: HashMap<Pubkey, u64>,
     /// Highest slot received since the last successful flush, skipped slots
     /// included. The flush edge moves here.
     high_water: Option<u64>,
@@ -927,6 +957,15 @@ impl WriterTask {
             )?;
             writer.buffered_slot_count()
         };
+        if self.metadata.is_some() {
+            for mint in processed.udm_transfers.iter().filter_map(|t| t.mint_token_address.as_deref()) {
+                // A mint that is not a pubkey has no metadata to look up.
+                if let Ok(mint) = Pubkey::from_str(mint) {
+                    let seen = self.pending_mints.entry(mint).or_insert(slot);
+                    *seen = (*seen).max(slot);
+                }
+            }
+        }
         self.cursor.record_processed(slot, &udm_slot.blockhash);
         self.totals.slots_processed += 1;
         self.totals.transactions_processed += processed.udm_transactions.len() as u64;
@@ -973,6 +1012,13 @@ impl WriterTask {
         self.changelog.flush()?;
         self.pending.clear();
         self.cursor.record_flush(high_water)?;
+        // Only now are the transfers on disk and announced. `hint` never
+        // waits: a full queue drops the hint, never this task's time.
+        if let Some(metadata) = &self.metadata {
+            for (mint, slot) in self.pending_mints.drain() {
+                metadata.hint(mint, slot);
+            }
+        }
         self.high_water = None;
         self.totals.flushes += 1;
         Ok(())

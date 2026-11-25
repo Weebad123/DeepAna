@@ -40,6 +40,7 @@ downstream systems.
 | `storage` | `Storage` is the backend trait. `ParquetWriter` buffers rows in memory and on each flush writes one file per table. `PartitionKey` computes the file paths. Flushes are all-or-nothing, and `rollback` removes slots at or above a given slot (e.g. after a fork). |
 | `changelog` | `ChangeLog`, the sink every change event goes through: `emit` records an event and returns its id, `flush` makes everything recorded durable. Three producers publish to it: the gap handler (`Skip`, as soon as a slot is found skipped or unreachable), the ingestor's writer task (`New`, one per slot once its files are on disk) and the commitment tracker (`Final`). `LocalChangeLog` appends them to `{data_dir}/changelog.jsonl`, see [The change log file](#the-change-log-file). |
 | `reconcile` | Checks finalized slots on disk against the finalized chain. `Reconciler` runs passes on a timer, classifies each slot of a window as ok, `orphaned`, `mismatched`, `missing`, `false_skip` or `unlogged_skip`, and when two passes agree asks the ingestor (through `Rewind`) to re-ingest from the lowest wrong slot, announcing it as a `Correction`. State lives in `reconcile.json`. See [Reconciliation](#reconciliation). |
+| `metadata` | Token name, symbol and URI from each mint's Metaplex metadata account, off the hot path. The writer task hints the mints of every flushed transfer; `MetadataEnricher` batches them, reads the accounts at the derived PDA (`pda`), validates them strictly (`parse`) and writes one row per mint, once, to `token_metadata` (`writer`). See [Token metadata](#token-metadata). |
 | `ingestor` | The orchestration layer. It builds and owns the slot processor, decoder registry, account resolver and `ParquetWriter`, and runs them as two Tokio tasks joined by a bounded channel of `ProcessedSlot`s: *process* (fetch, normalize, decode, resolve) and *writer* (append, flush, announce, move the cursor). It persists an `IngestorCursor` so a restart resumes after the last flushed slot. It also builds the Helius-backed adapter. See [Running the ingestor](#running-the-ingestor). |
 
 
@@ -103,10 +104,12 @@ buffered, so consumers that need strict slot order should sort by slot.
     transactions/date=YYYY-MM-DD/txs_{from}_{to}.parquet
     instructions/date=YYYY-MM-DD/ixs_{from}_{to}.parquet
     token_transfers/date=YYYY-MM-DD/transfers_{from}_{to}.parquet
+    token_metadata/date=YYYY-MM-DD/metadata_{unix_ms}_{seq}.parquet
 ```
 
 Slot ranges include both ends. The date is the UTC day of the first slot in
-the batch. List-shaped and decoded columns are stored as JSON strings, so
+the batch. `token_metadata` is the exception: it is not keyed by slot, its
+date is the day of the write, and rollback never enters it. List-shaped and decoded columns are stored as JSON strings, so
 any Parquet reader can open the files.
 
 ## Reconciliation
@@ -202,6 +205,51 @@ let handle = reconciler.handle(); // stats() and state() for dashboards
 tokio::spawn(reconciler.run(shutdown.clone()));
 ```
 
+## Token metadata
+
+`MetadataEnricher::start(config, adapter, data_dir, metrics, shutdown)`
+returns a `MetadataHandle` at once and never fails: an invalid config gives
+a handle that is `Disabled` and drops every hint. Attach it with
+`Ingestor::with_metadata(handle.clone())`; after each successful flush the
+writer task calls `hint(mint, slot)` for every mint of the flushed
+transfers. `hint` is a `try_send` on a bounded queue (10,000): it never
+waits, and a full queue drops the hint.
+
+The task drops mints already written or negative-cached, batches the rest
+(100 mints or 2 s), makes at most one `getMultipleAccounts` per second for
+their metadata PDAs (`["metadata", program, mint]` under
+`metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s`) and accepts an account only
+if it is owned by the program, is a `MetadataV1`, names the requested mint,
+and has a name, symbol and URI within 32, 10 and 200 bytes and valid UTF-8.
+Strings are stored exactly as on chain, minus the trailing NUL padding.
+Rows are flushed every 5 minutes or at 1,000 rows, and at shutdown.
+
+```text
+DeepAnaTokenMetadata { mint_address, metadata_account, name, symbol, uri: Utf8,
+                       observed_slot: UInt64 }      -- all not null
+```
+
+A mint is written once, and the row is a snapshot of what was first read.
+Write-once rests on the files: on startup every `token_metadata` file is
+read and its mints form the known set; a mint joins it when it is buffered,
+so a repeat hint cannot produce a second row. Files are written to a `.tmp`,
+fsynced and renamed. On devnet most mints have no metadata, so a low fill
+rate (`written` against `not_found`) is normal.
+
+| Failure | What happens |
+|---------|--------------|
+| Queue full | The hint is dropped and counted; the next flush that names the mint hints it again. |
+| RPC error, timeout, rate limit | Retryable errors put the mints back after a backoff (2 s doubling to 60 s, or the server's `Retry-After`), up to 5 attempts, then `exhausted`. Others drop the batch. Counted by class. |
+| No account, or a rejected one | Counted (`not_found`, `rejected` by reason) and not asked for again for an hour. In memory only. |
+| Flush fails | Rows stay buffered, retried one interval later; after 10 in a row the enricher is `Disabled`. Their mints are in no file, so the next run fetches them again. |
+| Unreadable file at startup | `Disabled`, naming the file, which is left alone: with the known set incomplete a mint could be written twice. |
+| Shutdown | Pending hints dropped, buffered rows flushed. |
+| Rewind, reconcile pass, backfill | Nothing: the table is outside rollback and re-ingested mints are already known. |
+
+`handle.stats()` holds every counter; pass it as `Sources::metadata` to
+expose them through `Metrics` (`prism_metadata_*_total`). The adapter's
+`getMultipleAccounts` calls are also recorded in `metrics`.
+
 ## The change log file
 
 `LocalChangeLog::open(data_dir, chain)` opens `{data_dir}/changelog.jsonl`
@@ -245,6 +293,11 @@ Two files check the guarantees end to end rather than a module:
   Parquet back: every transaction and every transfer exactly once with every
   column as expected, and, per transaction, the stored transfers add up to
   the balance changes the chain reported.
+- `metadata_test.rs` checks the PDA against real mainnet metadata accounts
+  (USDC, BONK, JUP, in `tests/fixtures/metadata/`) and an independent
+  SHA-256 derivation, rejects every malformed account for its own reason,
+  times `hint` against an RPC that never answers, and covers write-once
+  across restarts and metadata surviving a live rewind.
 - `finality_reconcile_test.rs` covers `finality.json`, the persistent
   tracker, the lineage and blockhash checks, the ordering of `Correction`
   against re-announcements, and crashes at every step of a rewind with the
