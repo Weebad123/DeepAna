@@ -344,7 +344,7 @@ impl Ingestor {
             commitment_tracker,
             changelog,
             processor: Arc::new(processor),
-            decoders: Arc::new(DecoderRegistry::with_spl_token()),
+            decoders: Arc::new(DecoderRegistry::with_defaults()),
             resolver: Arc::new(AsyncMutex::new(resolver)),
             resolver_metrics,
             writer: Arc::new(Mutex::new(ParquetWriter::new(&config.data_dir))),
@@ -372,8 +372,11 @@ impl Ingestor {
         self.metadata.as_ref()
     }
 
-    /// Decode with `registry` instead of the default SPL Token registry,
-    /// e.g. one with [`AnchorDecoder`](crate::decoder::AnchorDecoder)s added.
+    /// Decode with `registry` instead of the default one
+    /// ([`DecoderRegistry::with_defaults`]), e.g. one with
+    /// [`AnchorDecoder`](crate::decoder::AnchorDecoder)s added. `registry` is
+    /// used as given; call [`DecoderRegistry::register_defaults`] on it to
+    /// keep the built-in decoders for the programs it does not cover.
     #[must_use]
     pub fn with_decoders(mut self, registry: DecoderRegistry) -> Self {
         self.decoders = Arc::new(registry);

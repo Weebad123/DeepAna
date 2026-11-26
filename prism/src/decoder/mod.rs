@@ -19,6 +19,12 @@
 //! | [`discriminant`]  | [`Discriminant`]: the 8-byte Anchor instruction prefix         |
 //! | [`spl_token`]     | [`SplTokenDecoder`]: SPL Token and Token-2022                  |
 //! | [`anchor`]        | [`AnchorDecoder`]: any Anchor program, given its IDL           |
+//! | [`system`]        | [`SystemDecoder`]: the System program (SOL transfers, account creation, nonces) |
+//! | [`memo`]          | [`MemoDecoder`]: SPL Memo v2 and v1                            |
+//!
+//! [`DecoderRegistry::with_defaults`] registers the built-in decoders (SPL
+//! Token, Token-2022, System, Memo v2 and v1); it is what the ingestor uses
+//! unless given a registry of its own.
 //!
 //! Most programs on chain have no decoder registered; their instructions are
 //! counted as [`no_decoder_found`](RegistryMetricsSnapshot::no_decoder_found)
@@ -39,11 +45,15 @@ use crate::types::udm::{DeepAnaInstruction, DeepAnaTokenTransfer, to_json_string
 
 pub mod anchor;
 pub mod discriminant;
+pub mod memo;
 pub mod spl_token;
+pub mod system;
 
 pub use anchor::AnchorDecoder;
 pub use discriminant::Discriminant;
+pub use memo::MemoDecoder;
 pub use spl_token::SplTokenDecoder;
+pub use system::SystemDecoder;
 
 // ---------------------------------------------------------------------------
 // Decoder
@@ -215,6 +225,34 @@ impl DecoderRegistry {
         registry.register(Box::new(SplTokenDecoder::spl_token()));
         registry.register(Box::new(SplTokenDecoder::token_2022()));
         registry
+    }
+
+    /// A registry with every built-in decoder: SPL Token, Token-2022,
+    /// System, Memo v2 and Memo v1. See [`register_defaults`](Self::register_defaults).
+    pub fn with_defaults() -> Self {
+        let mut registry = Self::new();
+        registry.register_defaults();
+        registry
+    }
+
+    /// Adds each built-in decoder (SPL Token, Token-2022, System, Memo v2,
+    /// Memo v1) whose program has no decoder yet. A program the caller has
+    /// already registered a decoder for keeps it and gets no built-in, so
+    /// this can be called on a custom registry without overriding it.
+    pub fn register_defaults(&mut self) -> &mut Self {
+        let defaults: [Box<dyn Decoder>; 5] = [
+            Box::new(SplTokenDecoder::spl_token()),
+            Box::new(SplTokenDecoder::token_2022()),
+            Box::new(SystemDecoder::new()),
+            Box::new(MemoDecoder::v2()),
+            Box::new(MemoDecoder::v1()),
+        ];
+        for decoder in defaults {
+            if !self.has_decoder(decoder.program_id()) {
+                self.register(decoder);
+            }
+        }
+        self
     }
 
     /// Adds `decoder` under its [`Decoder::program_id`], after any decoders

@@ -41,10 +41,12 @@ use prism::adapter::solana::SolanaAdapter;
 use prism::adapter::{ChainAdapter, ChainBlock, CommitmentLevel};
 use prism::decoder::anchor::{EVENT_TYPE_PREFIX, IDL_TYPE_PREFIX, UNDESCRIBED_EVENT_TYPE};
 use prism::decoder::discriminant::{EVENT_IX_TAG, IDL_IX_TAG};
+use prism::decoder::memo::{MEMO_PROGRAM_ID, MEMO_V1_PROGRAM_ID};
 use prism::decoder::spl_token::{SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID};
+use prism::decoder::system::SYSTEM_PROGRAM_ID;
 use prism::decoder::{
-    AnchorDecoder, DecodeResult, Decoder, DecoderRegistry, Discriminant, RegistryMetricsSnapshot,
-    SplTokenDecoder,
+    AnchorDecoder, DecodeResult, Decoder, DecoderRegistry, Discriminant, MemoDecoder,
+    RegistryMetricsSnapshot, SplTokenDecoder, SystemDecoder,
 };
 use prism::ingestor::{HELIUS_API_KEY_ENV, helius_api_key_from_env, helius_solana_adapter};
 use prism::normalizer::{InstructionNormalizer, NormalizedBlock, Normalizer};
@@ -1649,4 +1651,300 @@ async fn live_anchor_decoding_rate() {
             eprintln!("note: {program} has no instructions in the scanned blocks");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// SystemDecoder
+// ---------------------------------------------------------------------------
+//
+// System instructions are encoded here by a minimal bincode writer of the
+// test's own (the SDK in use exposes no System instruction builders): a
+// little-endian u32 variant tag, u64 integers, raw 32-byte pubkeys and
+// u64-length-prefixed strings. It shares no code with the decoder.
+
+/// Bincode encoder for System instruction data.
+struct Bin(Vec<u8>);
+
+impl Bin {
+    fn tag(tag: u32) -> Self {
+        Self(tag.to_le_bytes().to_vec())
+    }
+    fn u64(mut self, n: u64) -> Self {
+        self.0.extend(n.to_le_bytes());
+        self
+    }
+    fn key(mut self, key: Pubkey) -> Self {
+        self.0.extend(key.to_bytes());
+        self
+    }
+    fn str(mut self, s: &str) -> Self {
+        self.0.extend((s.len() as u64).to_le_bytes());
+        self.0.extend(s.as_bytes());
+        self
+    }
+}
+
+fn system_id() -> Pubkey {
+    Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap()
+}
+
+fn keys(ns: &[u8]) -> Vec<String> {
+    ns.iter().map(|&n| key(n).to_string()).collect()
+}
+
+fn system_decode(accounts: Vec<String>, data: &Bin) -> Result<DecodeResult, PrismError> {
+    let ix = row(&system_id(), accounts, &data.0);
+    let decoder = SystemDecoder::new();
+    assert!(decoder.can_decode(&ix.program_id, &data.0), "decoder declines {ix:?}");
+    decoder.decode(&ix, &ix.accounts)
+}
+
+#[test]
+fn system_program_id_constant() {
+    assert_eq!(SYSTEM_PROGRAM_ID, Pubkey::default().to_string());
+    assert_eq!(SystemDecoder::new().program_id(), SYSTEM_PROGRAM_ID);
+}
+
+#[test]
+fn system_transfer_names_source_destination_and_lamports() {
+    let result = system_decode(keys(&[1, 2]), &Bin::tag(2).u64(1_500_000_000)).unwrap();
+    assert_eq!(result.instruction_type, "Transfer");
+    assert_eq!(
+        result.decoded_data,
+        json!({
+            "lamports": 1_500_000_000u64,
+            "accounts": { "source": key(1).to_string(), "destination": key(2).to_string() },
+        })
+    );
+    assert_eq!(result.token_transfer, None, "SOL transfers are not token transfer rows");
+}
+
+#[test]
+fn every_system_instruction_decodes_to_its_type_fields_and_roles() {
+    let k = |n: u8| key(n).to_string();
+    let cases: Vec<(Bin, Vec<String>, &str, Value)> = vec![
+        (Bin::tag(0).u64(2_039_280).u64(165).key(key(9)), keys(&[1, 2]), "CreateAccount",
+            json!({ "lamports": 2_039_280, "space": 165, "owner": k(9),
+                    "accounts": { "source": k(1), "new_account": k(2) } })),
+        (Bin::tag(1).key(key(9)), keys(&[1]), "Assign",
+            json!({ "owner": k(9), "accounts": { "account": k(1) } })),
+        (Bin::tag(3).key(key(3)).str("vault").u64(10).u64(0).key(key(9)), keys(&[1, 2, 3]), "CreateAccountWithSeed",
+            json!({ "base": k(3), "seed": "vault", "lamports": 10, "space": 0, "owner": k(9),
+                    "accounts": { "source": k(1), "new_account": k(2), "base_account": k(3) } })),
+        (Bin::tag(4), keys(&[1, 2, 3]), "AdvanceNonceAccount",
+            json!({ "accounts": { "nonce_account": k(1), "recent_blockhashes_sysvar": k(2), "nonce_authority": k(3) } })),
+        (Bin::tag(5).u64(42), keys(&[1, 2, 3, 4, 5]), "WithdrawNonceAccount",
+            json!({ "lamports": 42, "accounts": { "nonce_account": k(1), "destination": k(2),
+                    "recent_blockhashes_sysvar": k(3), "rent_sysvar": k(4), "nonce_authority": k(5) } })),
+        (Bin::tag(6).key(key(7)), keys(&[1, 2, 3]), "InitializeNonceAccount",
+            json!({ "authorized": k(7), "accounts": { "nonce_account": k(1),
+                    "recent_blockhashes_sysvar": k(2), "rent_sysvar": k(3) } })),
+        (Bin::tag(7).key(key(7)), keys(&[1, 2]), "AuthorizeNonceAccount",
+            json!({ "authorized": k(7), "accounts": { "nonce_account": k(1), "nonce_authority": k(2) } })),
+        (Bin::tag(8).u64(1024), keys(&[1]), "Allocate",
+            json!({ "space": 1024, "accounts": { "account": k(1) } })),
+        (Bin::tag(9).key(key(3)).str("s").u64(8).key(key(9)), keys(&[1, 3]), "AllocateWithSeed",
+            json!({ "base": k(3), "seed": "s", "space": 8, "owner": k(9),
+                    "accounts": { "account": k(1), "base_account": k(3) } })),
+        (Bin::tag(10).key(key(3)).str("").key(key(9)), keys(&[1, 3]), "AssignWithSeed",
+            json!({ "base": k(3), "seed": "", "owner": k(9),
+                    "accounts": { "account": k(1), "base_account": k(3) } })),
+        (Bin::tag(11).u64(5).str("seed-é").key(key(9)), keys(&[1, 2, 3]), "TransferWithSeed",
+            json!({ "lamports": 5, "from_seed": "seed-é", "from_owner": k(9),
+                    "accounts": { "source": k(1), "source_base": k(2), "destination": k(3) } })),
+        (Bin::tag(12), keys(&[1]), "UpgradeNonceAccount",
+            json!({ "accounts": { "nonce_account": k(1) } })),
+    ];
+    for (data, accounts, ty, fields) in cases {
+        let result = system_decode(accounts, &data).unwrap_or_else(|e| panic!("{ty}: {e}"));
+        assert_eq!(result.instruction_type, ty);
+        assert_eq!(result.decoded_data, fields, "{ty}");
+        assert_eq!(result.token_transfer, None, "{ty}");
+    }
+}
+
+#[test]
+fn optional_system_accounts_are_null_and_extra_accounts_ignored() {
+    // CreateAccountWithSeed with base == funder: the base account is not passed.
+    let data = Bin::tag(3).key(key(1)).str("x").u64(1).u64(0).key(key(9));
+    let result = system_decode(keys(&[1, 2]), &data).unwrap();
+    assert_eq!(result.decoded_data["accounts"]["base_account"], Value::Null);
+
+    let result = system_decode(keys(&[1, 2, 3, 4]), &Bin::tag(2).u64(1)).unwrap();
+    assert_eq!(result.decoded_data["accounts"].as_object().unwrap().len(), 2);
+}
+
+#[test]
+fn system_instruction_with_too_few_accounts_fails() {
+    let err = system_decode(keys(&[1]), &Bin::tag(2).u64(1)).unwrap_err();
+    let reason = decode_reason(&err);
+    assert!(reason.contains("Transfer") && reason.contains("source, destination"), "{reason}");
+    assert!(system_decode(keys(&[1, 2, 3]), &Bin::tag(5).u64(1)).is_err());
+}
+
+#[test]
+fn malformed_system_instructions_fail_with_a_decode_error() {
+    let cases: Vec<(Vec<u8>, &str)> = vec![
+        (Bin::tag(2).0[..4].to_vec(), "lamports"),
+        (Bin::tag(0).u64(1).u64(2).0, "owner"),
+        // Seed length far past the data.
+        (Bin::tag(3).key(key(1)).u64(u64::MAX).0, "seed"),
+        // Seed that is not UTF-8.
+        ({ let mut b = Bin::tag(10).key(key(1)).u64(2).0; b.extend([0xFF, 0xFE]); b.extend(key(9).to_bytes()); b }, "UTF-8"),
+    ];
+    for (data, needle) in cases {
+        let ix = row(&system_id(), keys(&[1, 2, 3]), &data);
+        let err = SystemDecoder::new().decode(&ix, &ix.accounts).unwrap_err();
+        assert!(decode_reason(&err).contains(needle), "{needle}: {err}");
+    }
+}
+
+#[test]
+fn system_decoder_declines_unknown_tags_and_short_data() {
+    let d = SystemDecoder::new();
+    assert!(!d.can_decode(SYSTEM_PROGRAM_ID, &[]));
+    assert!(!d.can_decode(SYSTEM_PROGRAM_ID, &[2, 0, 0]));
+    assert!(!d.can_decode(SYSTEM_PROGRAM_ID, &Bin::tag(13).0));
+    assert!(!d.can_decode(SYSTEM_PROGRAM_ID, &Bin::tag(u32::MAX).0));
+    assert!(!d.can_decode(SPL_TOKEN_PROGRAM_ID, &Bin::tag(2).u64(1).0));
+    assert!(d.can_decode(SYSTEM_PROGRAM_ID, &Bin::tag(12).0));
+}
+
+#[test]
+fn system_decoder_never_panics_on_arbitrary_data() {
+    let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+    let accounts: Vec<String> = keys(&[1, 2, 3, 4, 5, 6]);
+    let decoder = SystemDecoder::new();
+    for tag in 0..=14u32 {
+        for len in [0, 1, 7, 8, 16, 31, 32, 39, 40, 48, 60, 80, 120] {
+            let mut data = Bin::tag(tag).0;
+            data.extend(rng.bytes(len));
+            for n_accounts in [0, 1, 3, 6] {
+                let ix = row(&system_id(), accounts[..n_accounts].to_vec(), &data);
+                let _ = decoder.can_decode(&ix.program_id, &data);
+                let _ = decoder.decode(&ix, &accounts);
+            }
+        }
+    }
+    for len in 0..8 {
+        let ix = row(&system_id(), vec![], &rng.bytes(len));
+        let _ = decoder.decode(&ix, &[]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemoDecoder
+// ---------------------------------------------------------------------------
+
+#[test]
+fn memo_program_ids_and_for_program() {
+    assert_eq!(MemoDecoder::v2().program_id(), MEMO_PROGRAM_ID);
+    assert_eq!(MemoDecoder::v1().program_id(), MEMO_V1_PROGRAM_ID);
+    assert_eq!(MemoDecoder::for_program(MEMO_PROGRAM_ID), Some(MemoDecoder::v2()));
+    assert_eq!(MemoDecoder::for_program(MEMO_V1_PROGRAM_ID), Some(MemoDecoder::v1()));
+    assert_eq!(MemoDecoder::for_program(SYSTEM_PROGRAM_ID), None);
+    for id in [MEMO_PROGRAM_ID, MEMO_V1_PROGRAM_ID] {
+        assert_eq!(Pubkey::from_str(id).unwrap().to_string(), id);
+    }
+}
+
+#[test]
+fn memo_decodes_to_its_text_and_signers() {
+    for (decoder, version) in [(MemoDecoder::v2(), "v2"), (MemoDecoder::v1(), "v1")] {
+        let program = Pubkey::from_str(decoder.program_id()).unwrap();
+        let text = "gm ☀️ invoice #42";
+        let ix = row(&program, keys(&[1, 2]), text.as_bytes());
+        assert!(decoder.can_decode(&ix.program_id, text.as_bytes()));
+        let result = decoder.decode(&ix, &ix.accounts).unwrap();
+        assert_eq!(result.instruction_type, "Memo");
+        assert_eq!(
+            result.decoded_data,
+            json!({ "memo": text, "version": version, "accounts": { "signers": keys(&[1, 2]) } })
+        );
+        assert_eq!(result.token_transfer, None);
+    }
+}
+
+#[test]
+fn empty_memo_without_signers_decodes() {
+    let ix = row(&Pubkey::from_str(MEMO_PROGRAM_ID).unwrap(), vec![], &[]);
+    let result = MemoDecoder::v2().decode(&ix, &[]).unwrap();
+    assert_eq!(result.decoded_data, json!({ "memo": "", "version": "v2", "accounts": { "signers": [] } }));
+}
+
+#[test]
+fn memo_that_is_not_utf8_fails_with_a_decode_error() {
+    let ix = row(&Pubkey::from_str(MEMO_PROGRAM_ID).unwrap(), vec![], &[b'h', 0xFF, 0xC0]);
+    let err = MemoDecoder::v2().decode(&ix, &[]).unwrap_err();
+    assert!(decode_reason(&err).contains("UTF-8"), "{err}");
+    // The wrong program is refused too.
+    let ix = row(&system_id(), vec![], b"hi");
+    assert!(!MemoDecoder::v2().can_decode(&ix.program_id, b"hi"));
+    assert!(MemoDecoder::v2().decode(&ix, &[]).is_err());
+}
+
+#[test]
+fn memo_decoder_never_panics_on_arbitrary_data() {
+    let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+    for decoder in [MemoDecoder::v2(), MemoDecoder::v1()] {
+        let program = Pubkey::from_str(decoder.program_id()).unwrap();
+        for len in 0..200 {
+            let ix = row(&program, keys(&[1]), &rng.bytes(len));
+            let _ = decoder.decode(&ix, &[]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default registry
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_registry_has_every_built_in_decoder() {
+    let registry = DecoderRegistry::with_defaults();
+    assert_eq!(registry.len(), 5);
+    for id in [SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, SYSTEM_PROGRAM_ID, MEMO_PROGRAM_ID, MEMO_V1_PROGRAM_ID] {
+        assert!(registry.has_decoder(id), "{id}");
+    }
+
+    let transfer = row(&system_id(), keys(&[1, 2]), &Bin::tag(2).u64(7).0);
+    let memo = row(&Pubkey::from_str(MEMO_V1_PROGRAM_ID).unwrap(), vec![], b"hello");
+    let unknown_tag = row(&system_id(), keys(&[1]), &Bin::tag(99).0);
+    let types: Vec<Option<String>> = [&transfer, &memo, &unknown_tag]
+        .iter()
+        .map(|ix| registry.decode(ix, &ix.accounts).unwrap().map(|r| r.instruction_type))
+        .collect();
+    assert_eq!(types, [Some("Transfer".into()), Some("Memo".into()), None]);
+    let m = registry.metrics().snapshot();
+    assert_eq!((m.successful_decodes, m.no_decoder_found, m.token_transfers_produced), (2, 1, 0));
+}
+
+/// A caller's decoder for the System program, to check the defaults never
+/// displace it.
+struct CallerSystemDecoder;
+
+impl Decoder for CallerSystemDecoder {
+    fn program_id(&self) -> &str {
+        SYSTEM_PROGRAM_ID
+    }
+    fn can_decode(&self, program_id: &str, _data: &[u8]) -> bool {
+        program_id == SYSTEM_PROGRAM_ID
+    }
+    fn decode(&self, _ix: &DeepAnaInstruction, _keys: &[String]) -> Result<DecodeResult, PrismError> {
+        Ok(DecodeResult { instruction_type: "Caller".into(), decoded_data: json!({}), token_transfer: None })
+    }
+}
+
+#[test]
+fn register_defaults_never_replaces_a_callers_decoder() {
+    let mut registry = DecoderRegistry::new();
+    registry.register(Box::new(CallerSystemDecoder));
+    registry.register_defaults();
+    assert_eq!(registry.len(), 5, "System keeps only the caller's decoder");
+    let ix = row(&system_id(), keys(&[1, 2]), &Bin::tag(2).u64(7).0);
+    assert_eq!(registry.decode(&ix, &ix.accounts).unwrap().unwrap().instruction_type, "Caller");
+
+    // Calling it twice adds nothing.
+    registry.register_defaults();
+    assert_eq!(registry.len(), 5);
 }

@@ -34,7 +34,7 @@ downstream systems.
 | `adapter` | The boundary with the chain. `ChainAdapter` is the chain-agnostic trait (tip, block, block header, block list, accounts). `SolanaAdapter` implements it, adding rate limiting, retries and error mapping; a block header is a `getBlock` with `transactionDetails: none`. |
 | `slot_processor` | Takes one slot number to one processed slot. `SlotFetcher` fetches the block with retries. `GapHandler` records skipped or unreachable slots as `Skip` events and in an audit log. |
 | `normalizer` | Splits a raw block into a slot row, transaction rows and a flattened list of instruction rows (inner instructions included), and reads every transaction's `preTokenBalances` / `postTokenBalances` into `TokenBalanceChange`s (not a table: they feed the account resolver). v0 transactions resolve instruction accounts and token balances against the full key list: static keys, then the lookup-table addresses from `meta.loadedAddresses`. A block is normalized in full or not at all. |
-| `decoder` | `DecoderRegistry` routes each instruction to the decoders registered for its program. `SplTokenDecoder` handles SPL Token and Token-2022 and produces token transfer rows. `AnchorDecoder` decodes any Anchor program from its IDL, `emit_cpi!` events included. |
+| `decoder` | `DecoderRegistry` routes each instruction to the decoders registered for its program. `SplTokenDecoder` handles SPL Token and Token-2022 and produces token transfer rows. `SystemDecoder` decodes System program instructions (SOL transfers, account creation, nonces) and `MemoDecoder` memo text; see [Built-in decoders](#built-in-decoders). `AnchorDecoder` decodes any Anchor program from its IDL, `emit_cpi!` events included. |
 | `account_resolver` | Completes token transfer rows: mint (for a plain `Transfer`), decimals and both owners come first from the transaction's own token balances (`TokenAccountIndex`), with no request; only transfers whose decimals are still unknown fall back to reading the mint account over RPC. `MintCache` ensures each mint is fetched from the RPC only once and remembers recent misses for a while. |
 | `commitment` | Tracks the boundary between `confirmed` and `finalized` slots and emits a `Final` event whenever the finalized watermark advances. `CommitmentTracker::spawn_persistent` keeps the watermark in `finality.json`, so a restart knows finality before its first poll and resumes announcing where it stopped. The tables have no `is_finalized` column (the schema is fixed): a row is final when its `slot` is at or below the latest `Final` watermark. |
 | `storage` | `Storage` is the backend trait. `ParquetWriter` buffers rows in memory and on each flush writes one file per table. `PartitionKey` computes the file paths. Flushes are all-or-nothing, and `rollback` removes slots at or above a given slot (e.g. after a fork). |
@@ -89,6 +89,36 @@ When something goes wrong:
 Delivery is at least once: a `New` or `Correction` event can repeat after a restart. A
 `Skip` can arrive before the `New` events of earlier slots that are still
 buffered, so consumers that need strict slot order should sort by slot.
+
+## Built-in decoders
+
+`DecoderRegistry::with_defaults()` is the ingestor's registry unless
+`Ingestor::with_decoders` supplies another (which is then used as given).
+`register_defaults()` adds the built-ins to a custom registry, skipping any
+program that already has a decoder, so a caller's decoder always wins.
+
+| Program | Id | Decoder | `instruction_type` |
+|---------|----|---------|--------------------|
+| SPL Token | `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` | `SplTokenDecoder` | SPL variant name (`TransferChecked`, ...) |
+| Token-2022 | `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb` | `SplTokenDecoder` | as SPL Token, plus extensions |
+| System | `11111111111111111111111111111111` | `SystemDecoder` | `CreateAccount`, `Transfer`, `TransferWithSeed`, `AdvanceNonceAccount`, ... (tags 0 to 12) |
+| Memo v2 / v1 | `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr` / `Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo` | `MemoDecoder` | `Memo` |
+
+System and memo `decoded_data` carries the instruction's fields at the top
+level and its accounts, by role, under `accounts`:
+
+```json
+{ "lamports": 5000, "accounts": { "source": "<from>", "destination": "<to>" } }
+{ "memo": "invoice #42", "version": "v2", "accounts": { "signers": ["<signer>"] } }
+```
+
+Roles the program finds by signature rather than position (the base account
+of `CreateAccountWithSeed`, a nonce authority, ...) are `null` when absent;
+any other missing account, truncated data, a seed or a
+memo that is not UTF-8 is a decode error: logged, counted in
+`decode_errors`, and the row is left undecoded. An unknown System tag counts
+as `no_decoder_found`. SOL transfers produce no `token_transfers` row; that
+table is for token accounts.
 
 ## On-disk layout
 
