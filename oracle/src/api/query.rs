@@ -12,10 +12,16 @@
 //!   `POST /query` with `spec` returns. ORACLE never runs a guess: an
 //!   ambiguous question returns its candidates, each with its spec, and runs
 //!   none.
+//! * `POST /drill`: a [`DrillRequest`] in (the spec of an answer and one of
+//!   its rows), [`SpecRunner::drill`]'s [`DrillAnswer`] out: the rows that
+//!   answer row counted, each carrying the keys of a detail report
+//!   (`GET /profile/transaction/…`, `GET /profile/slot/…`). Its errors are
+//!   `/query`'s.
 //! * `GET /suggest?prefix=&limit=`, `GET /templates`, `GET /catalog`:
 //!   static listings, deterministic.
 //!
 //! [`SpecRunner::run`]: crate::spec::SpecRunner::run
+//! [`SpecRunner::drill`]: crate::spec::SpecRunner::drill
 
 use std::sync::Arc;
 
@@ -24,10 +30,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{ApiError, ApiJson, StrictQuery};
 use crate::AppState;
-use crate::catalog::{DimTable, EntityKind, Limits, Table, Unit};
+use crate::catalog::{DimTable, EntityHint, EntityKind, Limits, Table, Unit};
 use crate::intent::{
     InvalidReason, Interpretation, Matched, NoMatchReason, RejectCode, ResolvedEntity, TemplateId, TemplateInfo,
 };
+use crate::spec::drill::{DrillAnswer, DrillRequest};
 use crate::spec::{QuerySpec, SpecAnswer};
 
 /// Longest `/suggest` prefix, in characters.
@@ -46,6 +53,18 @@ pub async fn run_query(
     ApiJson(spec): ApiJson<QuerySpec>,
 ) -> Result<ApiJson<SpecAnswer>, ApiError> {
     Ok(ApiJson(state.specs.run(&spec, &state.shutdown).await?))
+}
+
+// ---------------------------------------------------------------------------
+// POST /drill
+// ---------------------------------------------------------------------------
+
+/// `POST /drill`.
+pub async fn drill(
+    State(state): State<Arc<AppState>>,
+    ApiJson(req): ApiJson<DrillRequest>,
+) -> Result<ApiJson<DrillAnswer>, ApiError> {
+    Ok(ApiJson(state.specs.drill(&req, &state.shutdown).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +317,8 @@ pub struct DimensionView {
     /// Takes a `bucket_width`.
     pub parameterised: bool,
     pub warnings: &'static [&'static str],
+    /// What the values are, as answer columns of this dimension say.
+    pub entity: Option<EntityHint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -357,6 +378,7 @@ pub async fn catalog(State(state): State<Arc<AppState>>, q: StrictQuery) -> Resu
             filterable: d.filterable,
             parameterised: d.parameterised,
             warnings: d.warnings,
+            entity: d.entity,
         })
         .collect();
     dimensions.sort_by_key(|d| d.id);

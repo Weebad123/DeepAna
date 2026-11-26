@@ -43,6 +43,8 @@
 //!    failure is a compiler bug, reported as [`SpecError::Internal`].
 //! 8. **Warnings**: the catalog warnings of the measures, then of the
 //!    group-by dimensions, in order, each once.
+//! 9. **Columns** carry each dimension's [`EntityHint`] as `entity`, so a
+//!    client links an answer's values from the answer alone.
 //!
 //! A measure's **row conditions** are its own [`Measure::filter`], plus
 //! `{column} IS NOT NULL` when it requires a dimension whose raw column is
@@ -59,7 +61,9 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
-use crate::catalog::{Catalog, ColType, DimExpr, Dimension, MAX_SLOT, Measure, MeasureKind, Pred, SLOT_COLUMN, Table, Unit};
+use crate::catalog::{
+    Catalog, ColType, DimExpr, Dimension, EntityHint, MAX_SLOT, Measure, MeasureKind, Pred, SLOT_COLUMN, Table, Unit,
+};
 
 use super::guard::{OrderKey, ValidSpec};
 use super::{Direction, SlotWindow, SpecError};
@@ -116,6 +120,10 @@ pub struct ColumnInfo {
     /// width + width - 1`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket_width: Option<u64>,
+    /// What the values are, so a client can link them without guessing:
+    /// the dimension's [`EntityHint`], `null` for a measure or a dimension
+    /// whose values open as nothing. Always present.
+    pub entity: Option<EntityHint>,
 }
 
 impl ColumnInfo {
@@ -289,11 +297,27 @@ pub fn compile(valid: &ValidSpec, catalog: &Catalog, window: SlotWindow) -> Resu
     let mut columns = Vec::with_capacity(select.len());
     for (d, width) in &dimensions {
         let (value_type, nullable) = dimension_type(d, table);
-        columns.push(ColumnInfo { name: d.id, role: Role::Dimension, value_type, nullable, unit: None, bucket_width: *width });
+        columns.push(ColumnInfo {
+            name: d.id,
+            role: Role::Dimension,
+            value_type,
+            nullable,
+            unit: None,
+            bucket_width: *width,
+            entity: d.entity,
+        });
     }
     for m in &measures {
         let (value_type, nullable) = measure_type(m);
-        columns.push(ColumnInfo { name: m.id, role: Role::Measure, value_type, nullable, unit: Some(m.unit), bucket_width: None });
+        columns.push(ColumnInfo {
+            name: m.id,
+            role: Role::Measure,
+            value_type,
+            nullable,
+            unit: Some(m.unit),
+            bucket_width: None,
+            entity: None,
+        });
     }
     let mut warnings: Vec<String> = Vec::new();
     let all = measures.iter().flat_map(|m| m.warnings).chain(dimensions.iter().flat_map(|(d, _)| d.warnings));

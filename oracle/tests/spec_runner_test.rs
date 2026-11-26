@@ -167,7 +167,7 @@ async fn a_run_issues_exactly_the_snapshot_then_the_statement() {
     // And it serialises as the API will send it.
     let v = serde_json::to_value(&a).unwrap();
     assert_eq!(v["rows"][0], json!([KEY_A, 5, "184467440737095516150"]));
-    assert_eq!(v["columns"][2], json!({ "name": "transfer_volume_raw", "role": "measure", "type": "decimal", "nullable": true, "unit": "raw_token_amount" }));
+    assert_eq!(v["columns"][2], json!({ "name": "transfer_volume_raw", "role": "measure", "type": "decimal", "nullable": true, "unit": "raw_token_amount", "entity": null }));
     assert_eq!(v["window"], json!({ "from_slot": w - 399, "to_slot": w, "slots": 400 }));
 }
 

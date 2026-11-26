@@ -30,6 +30,8 @@ tracing-subscriber.workspace = true
 # The end-to-end test writes real Parquet into <DIR> with PRISM's writer,
 # and checks the layout against PRISM's own file names.
 prism = { path = "../prism" }
+# The drill-down test writes real 32-byte addresses and 64-byte signatures.
+bs58.workspace = true
 tempfile.workspace = true
 http-body-util.workspace = true
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "test-util", "process"] }

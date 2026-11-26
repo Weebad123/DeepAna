@@ -72,6 +72,40 @@ curl -s localhost:8099/api/lens/query -H 'content-type: application/json' \
   -d '{"sql": "SELECT mint_token_address AS mint, COUNT(*) AS transfers FROM solana.token_transfers WHERE mint_token_address IS NOT NULL GROUP BY 1 ORDER BY 2 DESC LIMIT 10"}'
 ```
 
+## Clicking through on the dashboard
+
+Every transaction, mint, program, token account and slot in a result table is
+a link. Clicking one replaces the results with a detail panel; the panel's
+**‹ Back** (or the browser's) returns to them.
+
+| Click | Opens | URL |
+|-------|-------|-----|
+| A signature | The transaction: status, slot, time, fee, compute units, then memo, token transfers, the instruction tree (each instruction with its own log lines), accounts and logs; a failed one says where and why | `#/tx/<signature>?slot=<n>` |
+| A mint, a program, a token account | Its ORACLE profile, as key-value blocks and tables; a mint or program links its recent transfers or instructions | `#/mint/<address>`, `#/program/<address>`, `#/account/<address>` |
+| A slot | The slot and its transactions, 100 a page | `#/slot/<n>` |
+| **details ›** on a row of an ORACLE answer | The rows that row counted, newest first | `#/rows?q=…` |
+
+What decides a link:
+
+* **ORACLE answers**: each column's `entity`, which ORACLE sends. The page never
+  guesses from a column name. A value becomes a link only if it is what the
+  hint says (a signature, a 32-byte address, a slot number): `unattributed`
+  stays text.
+* **The SQL tab** (raw LENS results, which carry no metadata): PRISM's column
+  names (`tx_signature`, `slot`, `mint_token_address`, `program_id`,
+  `source_token_account`, ...).
+
+The URL is the view. Back, Forward, reload and a pasted link all show the same
+thing. A view makes one request when it opens. The last 20 are kept in
+memory, so Back and Forward redraw without asking again. Nothing polls.
+
+The rules for all of this live in one block of the page, `/* <link-rules> */`.
+The DeepAna tests load that block under Node, render real answers with it, and
+check every link. A second test drives the page in headless Chromium:
+`tests/browser/navigate.mjs`. Both need `node` (and the second, Chromium). Without
+them they print `SKIPPED` and pass. Set `DEEPANA_REQUIRE_NODE=1` or
+`DEEPANA_REQUIRE_BROWSER=1` to make a missing tool a failure.
+
 ## Supervision
 
 Each service runs on a child of one cancellation token and is fail-stop: if

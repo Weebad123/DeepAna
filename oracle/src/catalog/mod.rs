@@ -53,7 +53,9 @@ pub mod dimensions;
 pub mod entities;
 pub mod measures;
 
-pub use dimensions::{DIMENSIONS, DimExpr, DimTable, Dimension, MAX_BUCKET_WIDTH_SLOTS, ValueError, ValueRule};
+pub use dimensions::{
+    DIMENSIONS, DimExpr, DimTable, Dimension, EntityHint, MAX_BUCKET_WIDTH_SLOTS, ValueError, ValueRule,
+};
 pub use entities::{BUILTIN_ENTITIES, BuiltinEntity, Entity, EntityDef, EntityKind, EntityLookup, normalize};
 pub use measures::{MEASURES, Measure, MeasureKind, Pred, Unit};
 

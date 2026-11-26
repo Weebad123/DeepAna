@@ -32,6 +32,12 @@
 //!   definition's own constant, a key only once it is proven base58
 //!   (alphanumeric), a slot only once it is parsed as a number.
 //! * There are no hour or day dimensions: windows are measured in slots.
+//! * **`entity`** says what a dimension's values *are*, so a client can turn
+//!   them into links without guessing from a column name or a value's shape
+//!   ([`EntityHint`]). It is set only where every value that is not a
+//!   placeholder opens as that thing: `mint`, `program`, `token_program`
+//!   and `slot`. An owner or a leader is a wallet or a validator, which
+//!   ORACLE has no report for, so theirs is `None`.
 
 use serde::Serialize;
 use thiserror::Error;
@@ -44,6 +50,50 @@ use super::{
 /// Widest `slot_bucket`: about a day at 400 ms a slot, matching
 /// `ORACLE_BUCKET_SECS`' ceiling.
 pub const MAX_BUCKET_WIDTH_SLOTS: u64 = 216_000;
+
+/// What the values of an answer column are, for a client that links them.
+///
+/// Each one names the report a value opens as:
+///
+/// | Hint            | Opens                                         |
+/// |-----------------|-----------------------------------------------|
+/// | `tx_signature`  | `GET /profile/transaction/{value}?slot={row's slot}` |
+/// | `mint`          | `GET /profile/mint/{value}`                   |
+/// | `program`       | `GET /profile/program/{value}`                |
+/// | `token_account` | `GET /profile/token_account/{value}`          |
+/// | `slot`          | `GET /profile/slot/{value}`                   |
+///
+/// A value that is not one (a placeholder such as `unattributed`, or
+/// `null`) is not a link, whatever the hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityHint {
+    TxSignature,
+    Mint,
+    Program,
+    TokenAccount,
+    Slot,
+}
+
+impl EntityHint {
+    pub const ALL: [EntityHint; 5] =
+        [Self::TxSignature, Self::Mint, Self::Program, Self::TokenAccount, Self::Slot];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TxSignature => "tx_signature",
+            Self::Mint => "mint",
+            Self::Program => "program",
+            Self::TokenAccount => "token_account",
+            Self::Slot => "slot",
+        }
+    }
+
+    /// Whether the hint names a 32-byte address.
+    pub const fn is_address(self) -> bool {
+        matches!(self, Self::Mint | Self::Program | Self::TokenAccount)
+    }
+}
 
 /// What a dimension's filter values (or, for `slot_bucket`, its parameter)
 /// must be.
@@ -154,6 +204,8 @@ pub struct Dimension {
     /// Takes a parameter: only `slot_bucket`, its width.
     pub parameterised: bool,
     pub warnings: &'static [&'static str],
+    /// What the values are, for linking; see [`EntityHint`].
+    pub entity: Option<EntityHint>,
 }
 
 impl Dimension {
@@ -274,6 +326,22 @@ impl Dimension {
         check_text(item, "description", self.description)?;
         check_warnings(item, self.warnings)?;
 
+        // A hint must promise only what the values can keep: an address hint
+        // needs values proven to be addresses, a slot hint slot numbers.
+        match self.entity {
+            None => {}
+            Some(EntityHint::TxSignature) => {
+                return Err(bad(item, "no dimension holds transaction signatures"));
+            }
+            Some(h) if h.is_address() && self.values != ValueRule::Base58Key => {
+                return Err(bad(item, format!("entity {} needs base58 key values", h.as_str())));
+            }
+            Some(EntityHint::Slot) if self.values != ValueRule::SlotRange => {
+                return Err(bad(item, "entity slot needs slot values"));
+            }
+            Some(_) => {}
+        }
+
         let is_bucket = matches!(self.expr, DimExpr::SlotBucket(_));
         if self.parameterised != is_bucket {
             return Err(bad(item, "only a slot bucket, and every slot bucket, is parameterised"));
@@ -377,6 +445,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         filterable: true,
         parameterised: false,
         warnings: &["One group per slot; group by slot_bucket for a series."],
+        entity: Some(EntityHint::Slot),
     },
     Dimension {
         id: "slot_bucket",
@@ -390,6 +459,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         warnings: &[
             "The window is snapped inward to whole buckets, so it may cover fewer slots than requested.",
         ],
+        entity: None,
     },
     Dimension {
         id: "leader",
@@ -401,6 +471,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         filterable: true,
         parameterised: false,
         warnings: &["Slots whose leader PRISM did not record are grouped as unknown."],
+        entity: None,
     },
     Dimension {
         id: "tx_status",
@@ -412,6 +483,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         filterable: true,
         parameterised: false,
         warnings: &[],
+        entity: None,
     },
     Dimension {
         id: "program",
@@ -423,6 +495,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         filterable: true,
         parameterised: false,
         warnings: &[],
+        entity: Some(EntityHint::Program),
     },
     Dimension {
         id: "ix_level",
@@ -434,6 +507,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         filterable: true,
         parameterised: false,
         warnings: &[],
+        entity: None,
     },
     Dimension {
         id: "ix_decoded",
@@ -445,6 +519,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         filterable: true,
         parameterised: false,
         warnings: &[],
+        entity: None,
     },
     Dimension {
         id: "token_program",
@@ -456,6 +531,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         filterable: true,
         parameterised: false,
         warnings: &[],
+        entity: Some(EntityHint::Program),
     },
     Dimension {
         id: "mint",
@@ -467,6 +543,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         filterable: true,
         parameterised: false,
         warnings: &["Transfers whose mint PRISM could not resolve are grouped as unattributed."],
+        entity: Some(EntityHint::Mint),
     },
     Dimension {
         id: "source_owner",
@@ -478,6 +555,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         filterable: true,
         parameterised: false,
         warnings: &["Transfers whose source owner PRISM could not resolve are grouped as unknown."],
+        entity: None,
     },
     Dimension {
         id: "destination_owner",
@@ -489,6 +567,7 @@ pub const DIMENSIONS: &[Dimension] = &[
         filterable: true,
         parameterised: false,
         warnings: &["Transfers whose destination owner PRISM could not resolve are grouped as unknown."],
+        entity: None,
     },
 ];
 
@@ -500,6 +579,26 @@ mod tests {
 
     fn d(id: &str) -> &'static Dimension {
         DIMENSIONS.iter().find(|d| d.id == id).unwrap()
+    }
+
+    #[test]
+    fn entity_hints_are_set_where_every_value_opens_as_one() {
+        let hinted: Vec<(&str, &str)> =
+            DIMENSIONS.iter().filter_map(|d| d.entity.map(|e| (d.id, e.as_str()))).collect();
+        assert_eq!(hinted, vec![("slot", "slot"), ("program", "program"), ("token_program", "program"), ("mint", "mint")]);
+        for d in DIMENSIONS {
+            d.validate().unwrap();
+        }
+        let bad = |entity| Dimension { entity: Some(entity), ..*d("tx_status") }.validate().is_err();
+        assert!(bad(EntityHint::Mint), "an enum is not an address");
+        assert!(bad(EntityHint::Slot));
+        assert!(bad(EntityHint::TxSignature));
+        assert!(Dimension { entity: Some(EntityHint::TxSignature), ..*d("program") }.validate().is_err());
+        assert!(Dimension { entity: Some(EntityHint::TokenAccount), ..*d("program") }.validate().is_ok());
+        assert_eq!(serde_json::to_value(EntityHint::TokenAccount).unwrap(), "token_account");
+        for e in EntityHint::ALL {
+            assert_eq!(serde_json::to_value(e).unwrap(), e.as_str());
+        }
     }
 
     #[test]

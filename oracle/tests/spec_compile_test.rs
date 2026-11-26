@@ -6,7 +6,7 @@
 
 mod spec_support;
 
-use oracle::catalog::{Catalog, DIMENSIONS, MEASURES, Measure, Pred, Table, Unit};
+use oracle::catalog::{Catalog, DIMENSIONS, EntityHint, MEASURES, Measure, Pred, Table, Unit};
 use oracle::spec::compile::*;
 use oracle::spec::guard::{ValidFilter, ValidSpec, validate};
 use oracle::spec::*;
@@ -143,9 +143,9 @@ fn the_design_example_compiles_to_exactly_this() {
     assert_eq!(
         out.columns,
         vec![
-            ColumnInfo { name: "mint", role: Role::Dimension, value_type: ValueType::Text, nullable: false, unit: None, bucket_width: None },
-            ColumnInfo { name: "transfer_count", role: Role::Measure, value_type: ValueType::Integer, nullable: false, unit: Some(Unit::Count), bucket_width: None },
-            ColumnInfo { name: "transfer_volume_raw", role: Role::Measure, value_type: ValueType::Decimal, nullable: true, unit: Some(Unit::RawTokenAmount), bucket_width: None },
+            ColumnInfo { name: "mint", role: Role::Dimension, value_type: ValueType::Text, nullable: false, unit: None, bucket_width: None, entity: Some(EntityHint::Mint) },
+            ColumnInfo { name: "transfer_count", role: Role::Measure, value_type: ValueType::Integer, nullable: false, unit: Some(Unit::Count), bucket_width: None, entity: None },
+            ColumnInfo { name: "transfer_volume_raw", role: Role::Measure, value_type: ValueType::Decimal, nullable: true, unit: Some(Unit::RawTokenAmount), bucket_width: None, entity: None },
         ]
     );
 }

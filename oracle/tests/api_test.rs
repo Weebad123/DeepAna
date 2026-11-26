@@ -402,7 +402,7 @@ fn anomaly(bucket: u64) -> NewAnomaly {
 #[tokio::test]
 async fn every_route_returns_its_documented_success_status() {
     let r = rig();
-    r.lens.answer(empty_profile_or_none);
+    r.lens.answer(|sql| detail_answer(sql).or_else(|| empty_profile_or_none(sql)));
     r.state.store.commit_scan("tx_count", &[anomaly(5)], 5).unwrap();
 
     let cases: Vec<(Method, String, Option<Value>, u16)> = vec![
@@ -416,6 +416,9 @@ async fn every_route_returns_its_documented_success_status() {
         (Method::PATCH, "/detectors/tx_count".into(), Some(json!({ "enabled": false })), 200),
         (Method::POST, "/detectors/tx_count/reset-progress".into(), None, 200),
         (Method::GET, format!("/profile/mint/{KEY}?window_slots=1000"), None, 200),
+        (Method::GET, format!("/profile/transaction/{}?slot=1000", signature()), None, 200),
+        (Method::GET, "/profile/slot/1000?limit=10".into(), None, 200),
+        (Method::POST, "/drill".into(), Some(json!({ "spec": fee_spec(), "row": {} })), 200),
         (Method::GET, "/quality".into(), None, 200),
         // No digest is stored yet.
         (Method::GET, "/digest".into(), None, 404),
@@ -433,6 +436,26 @@ async fn every_route_returns_its_documented_success_status() {
 
     r.state.store.insert_digest(0, 37_499, &json!({ "headline": ["x"] })).unwrap();
     get(&r.app, "/digest").await.ok();
+}
+
+/// A well-formed 64-byte signature.
+fn signature() -> String {
+    bs58::encode([7u8; 64]).into_string()
+}
+
+/// The detail reports over no data: the signature is not found, the slot
+/// has no row and no transactions. `None` for any other statement.
+fn detail_answer(sql: &str) -> Option<LensResponse> {
+    if sql.contains("log_messages")
+        || sql.starts_with("SELECT slot, blockhash, parent_slot")
+        || sql.starts_with("SELECT transaction_index, tx_signature")
+    {
+        return Some(response(sql, vec![]));
+    }
+    if sql.contains("AS stored_rows") {
+        return Some(response(sql, vec![json!({ "transactions": 0, "failed": 0, "stored_rows": 0 })]));
+    }
+    None
 }
 
 /// Profiles answer from [`empty_profile`]; everything else from the defaults.
@@ -704,6 +727,175 @@ async fn route_profile_returns_the_profile_and_validates() {
     assert_eq!(r.lens.log().len(), before, "nothing invalid reaches LENS");
     // as_of_slot above the snapshot needs the snapshot to judge.
     get(&r.app, &format!("/profile/mint/{KEY}?as_of_slot={}", W + 1)).await.expect_error(400, "InvalidRequest", Some("as_of_slot"));
+}
+
+#[tokio::test]
+async fn route_query_columns_say_what_their_values_are() {
+    let r = rig();
+    // Every column carries `entity`, null for measures and for dimensions
+    // whose values open as nothing; the other fields are as they were.
+    let v = post(&r.app, "/query", &fee_spec()).await.ok();
+    assert_eq!(
+        v["columns"][0],
+        json!({ "name": "fee_total_lamports", "role": "measure", "type": "decimal", "nullable": true, "unit": "lamports", "entity": null })
+    );
+    for (dimension, measure, entity) in [
+        ("mint", "transfer_count", json!("mint")),
+        ("program", "ix_count", json!("program")),
+        ("token_program", "transfer_count", json!("program")),
+        ("slot", "tx_count", json!("slot")),
+        ("slot_bucket", "tx_count", Value::Null),
+        ("source_owner", "transfer_count", Value::Null),
+        ("leader", "slot_count", Value::Null),
+        ("tx_status", "tx_count", Value::Null),
+    ] {
+        let mut group = json!({ "dimension": dimension });
+        if dimension == "slot_bucket" {
+            group["bucket_width"] = json!(10);
+        }
+        let spec = json!({ "measures": [measure], "group_by": [group], "window": { "last_slots": 100 } });
+        let v = post(&r.app, "/query", &spec).await.ok();
+        let columns = v["columns"].as_array().unwrap();
+        assert_eq!((&columns[0]["name"], &columns[0]["entity"]), (&json!(dimension), &entity), "{dimension}");
+        assert_eq!(columns[1]["entity"], Value::Null, "a measure is never an entity");
+        assert!(columns.iter().all(|c| c.as_object().unwrap().contains_key("entity")), "{columns:?}");
+    }
+    // /ask returns the same columns, hints included.
+    let asked = post(&r.app, "/ask", &json!({ "question": "transfers by mint in the last hour" })).await.ok();
+    assert_eq!(asked["answer"]["columns"][0]["entity"], "mint");
+    // /catalog says it per dimension.
+    let catalog = get(&r.app, "/catalog").await.ok();
+    let hints: Vec<(String, Value)> = catalog["dimensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| (d["id"].as_str().unwrap().to_owned(), d["entity"].clone()))
+        .filter(|(_, e)| !e.is_null())
+        .collect();
+    assert_eq!(
+        hints,
+        vec![
+            ("mint".to_owned(), json!("mint")),
+            ("program".to_owned(), json!("program")),
+            ("slot".to_owned(), json!("slot")),
+            ("token_program".to_owned(), json!("program")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn route_detail_reports_and_drill_answer_and_validate() {
+    let r = rig();
+    r.lens.answer(detail_answer);
+    let sig = signature();
+
+    // A signature that is not there is a 200 saying so, as an entity with no activity is.
+    let v = get(&r.app, &format!("/profile/transaction/{sig}?slot={}&as_of_slot={}", W - 5, W - 1)).await.ok();
+    assert_eq!((&v["kind"], &v["found"], &v["transaction"]), (&json!("transaction"), &json!(false), &Value::Null));
+    assert_eq!(v["as_of_slot"], W - 1);
+    assert_eq!(v["searched"], json!({ "from_slot": W - 5, "to_slot": W - 5, "slots": 1 }));
+    let v = get(&r.app, &format!("/profile/transaction/{sig}?window_slots=100")).await.ok();
+    assert_eq!(v["searched"], json!({ "from_slot": W - 99, "to_slot": W, "slots": 100 }));
+
+    let v = get(&r.app, &format!("/profile/slot/{}?limit=7&after_index=3", W - 5)).await.ok();
+    assert_eq!((&v["kind"], &v["found"], &v["slot"]), (&json!("slot"), &json!(false), &json!(W - 5)));
+    assert_eq!(v["page"], json!({ "after_index": 3, "limit": 7, "has_more": false, "next_after_index": null }));
+
+    let v = post(&r.app, "/drill", &json!({ "spec": fee_spec(), "row": {}, "limit": 5 })).await.ok();
+    assert_eq!((&v["table"], &v["detail"], &v["limit"]), (&json!("transactions"), &json!("transaction"), &json!(5)));
+    assert_eq!(
+        (&v["columns"][0], &v["columns"][1]),
+        (&json!({ "name": "slot", "entity": "slot" }), &json!({ "name": "tx_signature", "entity": "tx_signature" }))
+    );
+    assert_eq!(v["rows"], json!([]));
+
+    // Strict input: a 400 naming the field, and nothing sent to LENS for it.
+    let before = r.lens.log().len();
+    let key_as_sig = format!("/profile/transaction/{KEY}");
+    for (uri, field) in [
+        ("/profile/transaction/not-a-signature", "signature"),
+        (key_as_sig.as_str(), "signature"),
+        (&format!("/profile/transaction/{sig}?slot=1e3"), "slot"),
+        (&format!("/profile/transaction/{sig}?slot=1&window_slots=10"), "window_slots"),
+        (&format!("/profile/transaction/{sig}?window_slots=0"), "window_slots"),
+        (&format!("/profile/transaction/{sig}?window=1"), "window"),
+        ("/profile/slot/abc", "slot"),
+        ("/profile/slot/-1", "slot"),
+        ("/profile/slot/5?limit=0", "limit"),
+        ("/profile/slot/5?after_index=4294967296", "after_index"),
+        ("/profile/slot/5?page=2", "page"),
+    ] {
+        get(&r.app, uri).await.expect_error(400, "InvalidRequest", Some(field));
+    }
+    for (body, field) in [
+        (json!({ "spec": fee_spec(), "row": { "mint": KEY } }), "row"),
+        (json!({ "spec": fee_spec(), "limit": 0 }), "limit"),
+        (json!({ "spec": fee_spec(), "extra": 1 }), "extra"),
+        (json!({ "row": {} }), "spec"),
+        (json!({ "spec": { "measures": ["nope"], "window": { "last_slots": 5 } } }), "measures[0]"),
+    ] {
+        post(&r.app, "/drill", &body).await.expect_error(400, "InvalidRequest", Some(field));
+    }
+    assert_eq!(r.lens.log().len(), before, "an invalid request reached LENS");
+
+    // The snapshot is needed to judge these, so LENS is asked, and they are still a 400.
+    get(&r.app, &format!("/profile/transaction/{sig}?slot={}", W + 1)).await.expect_error(400, "InvalidRequest", Some("slot"));
+    get(&r.app, &format!("/profile/slot/{}", W + 1)).await.expect_error(400, "InvalidRequest", Some("slot"));
+    get(&r.app, &format!("/profile/slot/5?as_of_slot={}", W + 1)).await.expect_error(400, "InvalidRequest", Some("as_of_slot"));
+
+    // Wrong methods and media types are the router's, as everywhere.
+    raw(&r.app, Method::POST, &format!("/profile/transaction/{sig}"), None, Body::empty())
+        .await
+        .expect_error(405, "MethodNotAllowed", None);
+    raw(&r.app, Method::GET, "/drill", None, Body::empty()).await.expect_error(405, "MethodNotAllowed", None);
+    raw(&r.app, Method::POST, "/drill", Some("text/plain"), "{}").await.expect_error(415, "UnsupportedMediaType", None);
+}
+
+#[tokio::test]
+async fn failure_detail_reports_and_drill_map_lens_failures_like_profiles_and_queries() {
+    let sig = signature();
+    let calls = |r: &Rig| {
+        let app = r.app.clone();
+        let sig = sig.clone();
+        async move {
+            [
+                get(&app, &format!("/profile/transaction/{sig}")).await,
+                get(&app, "/profile/slot/5").await,
+                post(&app, "/drill", &json!({ "spec": fee_spec(), "row": {} })).await,
+            ]
+        }
+    };
+    for (fault, status, kind) in [
+        (Fault::Unreachable, 503, "UpstreamUnavailable"),
+        (Fault::MissingTable, 503, "NotReady"),
+        (Fault::Timeout, 504, "UpstreamTimeout"),
+        (Fault::Protocol, 500, "Internal"),
+    ] {
+        let r = rig();
+        r.lens.fault(fault);
+        for reply in calls(&r).await {
+            let body = reply.expect_error(status, kind, None);
+            assert!(!body.error.contains("secret"), "{body:?}");
+        }
+    }
+
+    // A result LENS cut short cannot be assembled into a report: 502.
+    let r = rig();
+    r.lens.answer(|sql| {
+        let mut response = detail_answer(sql)?;
+        response.truncated = true;
+        Some(response)
+    });
+    get(&r.app, &format!("/profile/transaction/{sig}")).await.expect_error(502, "UpstreamError", None);
+    get(&r.app, "/profile/slot/5").await.expect_error(502, "UpstreamError", None);
+
+    // Once ORACLE is stopping, all three say so.
+    let r = rig();
+    r.lens.fault(Fault::Hang);
+    r.state.shutdown.cancel();
+    for reply in calls(&r).await {
+        reply.expect_error(503, "ShuttingDown", None);
+    }
 }
 
 #[tokio::test]

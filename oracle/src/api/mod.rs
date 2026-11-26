@@ -4,6 +4,7 @@
 //! |----------------------------------------------------|---------|---------------|
 //! | `POST /query`                                      | 200     | [`query`]     |
 //! | `POST /ask`                                        | 200     | [`query`]     |
+//! | `POST /drill`                                      | 200     | [`query`]     |
 //! | `GET /suggest?prefix=&limit=`                      | 200     | [`query`]     |
 //! | `GET /templates`                                   | 200     | [`query`]     |
 //! | `GET /catalog`                                     | 200     | [`query`]     |
@@ -12,6 +13,8 @@
 //! | `PATCH /detectors/{id}`                            | 200     | [`anomalies`] |
 //! | `POST /detectors/{id}/reset-progress`              | 200     | [`anomalies`] |
 //! | `GET /profile/{kind}/{id}?window_slots=&as_of_slot=` | 200   | [`profile`]   |
+//! | `GET /profile/transaction/{signature}?slot=&window_slots=&as_of_slot=` | 200 | [`profile`] |
+//! | `GET /profile/slot/{slot}?after_index=&limit=&as_of_slot=` | 200 | [`profile`] |
 //! | `GET /quality?window_slots=&as_of_slot=&max_age_secs=` | 200 | [`quality`]   |
 //! | `GET /digest`                                      | 200, 404 if none yet | [`digest`] |
 //! | `GET /digest/preview?window_start=`                | 200     | [`digest`]    |
@@ -64,8 +67,8 @@
 //!
 //! # Routes that cost real work
 //!
-//! `/profile`, `/quality`, `/digest/preview` and `/ask` (when it executes)
-//! run LENS queries. Each is bounded by the module it calls, never by the
+//! `/profile` (the detail reports included), `/quality`, `/digest/preview`,
+//! `/query`, `/drill` and `/ask` (when it executes) run LENS queries. Each is bounded by the module it calls, never by the
 //! API: the spec runner and the profiler hold a small permit pool, the
 //! auditor runs one audit at a time and shares a fresh default report
 //! between callers, and only one preview runs at a time (a second is a 429).
@@ -724,10 +727,10 @@ pub struct Budgets {
     /// `/catalog`, `/templates`, `/suggest`, `/anomalies`, `/detectors`,
     /// `PATCH /detectors/{id}`, `/digest`, `/digests`, `/health`.
     pub cheap: Duration,
-    /// `/query`, `/ask`, and `reset-progress` (which waits for a detector's
+    /// `/query`, `/ask`, `/drill`, and `reset-progress` (which waits for a detector's
     /// turn in flight): [`SPEC_QUERIES`] LENS calls at the client timeout.
     pub query: Duration,
-    /// `/profile`: [`PROFILE_DEADLINE_SECS`].
+    /// `/profile`, its detail reports included: [`PROFILE_DEADLINE_SECS`].
     pub profile: Duration,
     /// `/quality`: [`AUDIT_DEADLINE_SECS`].
     pub quality: Duration,
@@ -785,8 +788,14 @@ pub fn router_with(state: Arc<AppState>, budgets: Budgets) -> Router {
     let query = Router::new()
         .route("/query", post(query::run_query))
         .route("/ask", post(query::ask))
+        .route("/drill", post(query::drill))
         .route("/detectors/{id}/reset-progress", post(anomalies::reset_progress));
-    let profile = Router::new().route("/profile/{kind}/{id}", get(profile::profile));
+    // The two literal segments win over `{kind}`: a transaction and a slot
+    // are not entity kinds, and their reports have their own shape.
+    let profile = Router::new()
+        .route("/profile/transaction/{signature}", get(profile::transaction))
+        .route("/profile/slot/{slot}", get(profile::slot))
+        .route("/profile/{kind}/{id}", get(profile::profile));
     let quality = Router::new().route("/quality", get(quality::quality));
     let preview = Router::new().route("/digest/preview", get(digest::preview));
 

@@ -275,7 +275,7 @@ impl Oracle {
 
         // 6. The modules.
         let specs = Arc::new(SpecRunner::new(Arc::clone(&catalog), Arc::clone(&lens), &config));
-        let profiler = Arc::new(Profiler::new(Arc::clone(&lens)));
+        let profiler = Arc::new(Profiler::new(Arc::clone(&lens)).with_catalog(Arc::clone(&catalog)));
         let auditor = Arc::new(Auditor::new(Arc::clone(&lens), Arc::clone(&clock)));
         let runner = Runner::with_detectors(
             store.clone(),

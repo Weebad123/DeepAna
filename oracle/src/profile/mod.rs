@@ -1,4 +1,16 @@
-//! Entity profiles: a fixed report about one mint, program or token account.
+//! Entity profiles: a fixed report about one mint, program or token account,
+//! and detail reports about one transaction or one slot.
+//!
+//! | File            | Holds                                                        |
+//! |-----------------|--------------------------------------------------------------|
+//! | `mod.rs`        | [`Profiler`], requests, validation, every statement, the three entity profiles |
+//! | [`transaction`] | the transaction report's types and its pure assembler        |
+//! | [`slot`]        | the slot report's types and its pure assembler               |
+//! | [`logs`]        | log lines grouped by invocation, memos read from logs, caps  |
+//! | [`decode`]      | read-time decoding of instructions PRISM stored undecoded    |
+//!
+//! The detail reports are described [further down](self#detail-reports);
+//! what follows first is the entity profile.
 //!
 //! A [`Profiler`] holds no state, schedules nothing and never touches the
 //! store. It takes an identifier from outside, so validation comes first and
@@ -77,7 +89,61 @@
 //! bytes. It is then rendered with FORGE's [`quote_sql_string`], the same
 //! routine saved queries use: base58 has no quote, but validation is not
 //! the only defence. Every other literal in the SQL is an integer this
-//! module computes, or a constant written here.
+//! module computes, or a constant written here. A transaction's signature
+//! is held to the same rule at its own size ([`validate_signature`]).
+//!
+//! # Detail reports
+//!
+//! An entity profile aggregates a window. A detail report shows one thing
+//! in full: [`Profiler::transaction`] one transaction (its block, accounts,
+//! instruction tree, token transfers, memos and grouped logs), and
+//! [`Profiler::slot`] one slot and a page of its transactions. They are
+//! what a client opens from a row of a query answer, by way of
+//! [`spec::drill`](crate::spec::drill).
+//!
+//! They share the profiler's permit pool and deadline, validate before
+//! anything reaches LENS, take the same snapshot `W` (so `as_of_slot` pins
+//! them the same way), run their queries one after another, and fail whole
+//! on any LENS failure or truncated result.
+//!
+//! ## The flow of [`Profiler::transaction`]
+//!
+//! | # | Query | Bounded by |
+//! |---|-------|------------|
+//! | 1 | [`MAX_SLOTS_SQL`] | |
+//! | 2 | [`MAX_TX_SLOT_SQL`] | |
+//! | 3 | the rows of `solana.transactions` with the signature | the slots searched |
+//! | 4 | the slot's row in `solana.slots` | the transaction's slot |
+//! | 5 | its rows in `solana.instructions` | the transaction's slot |
+//! | 6 | its rows in `solana.token_transfers` | the transaction's slot |
+//!
+//! A signature does not say which slot it is in, and scanning every file
+//! for one is the most expensive read there is. So the search is bounded:
+//! by `slot`, when the caller knows it (every row a client drills from
+//! carries its slot), else by the `window_slots` ending at `W`. Queries 4
+//! to 6 need the slot query 3 found, so a signature that is not found ends
+//! after query 3 with `found: false`: [`TRANSACTION_QUERIES`] when found,
+//! [`TRANSACTION_QUERIES_NOT_FOUND`] when not.
+//!
+//! ## The flow of [`Profiler::slot`]
+//!
+//! The snapshot, then the slot's row, its counts (`COUNT(DISTINCT
+//! tx_signature)`, so a replay does not inflate them), and one page of its
+//! transactions: [`SLOT_QUERIES`], always. A slot above `W` is refused as
+//! `as_of_slot` is; a slot with no row is `found: false`.
+//!
+//! ## Determinism
+//!
+//! Every statement that takes a `LIMIT` orders by a total key or is checked
+//! against its cap, and the assemblers sort and deduplicate by fixed rules
+//! instead of trusting row order. So the same pinned request gives the same
+//! bytes, except `duration_ms`. What can change them is the data under the
+//! snapshot changing: a replay shows up in `duplicates` and nowhere else.
+
+pub mod decode;
+pub mod logs;
+pub mod slot;
+pub mod transaction;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -92,7 +158,10 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
+use crate::catalog::Catalog;
 pub use crate::detect::{MAX_SLOTS_SQL, MAX_TX_SLOT_SQL};
+pub use slot::{DEFAULT_SLOT_PAGE, MAX_SLOT_PAGE, SlotReport};
+pub use transaction::TransactionReport;
 
 /// `window_slots` when the request has none: about 5.5 hours.
 pub const DEFAULT_WINDOW_SLOTS: u64 = 50_000;
@@ -115,6 +184,27 @@ pub const MAX_ID_CHARS: usize = 44;
 pub const ID_BYTES: usize = 32;
 /// Queries every profile runs to fix its snapshot.
 pub const SNAPSHOT_QUERIES: u32 = 2;
+
+/// Shortest base58 text of a 64-byte signature (all zero bytes).
+pub const MIN_SIGNATURE_CHARS: usize = 64;
+/// Longest base58 text of a 64-byte signature.
+pub const MAX_SIGNATURE_CHARS: usize = 88;
+/// Bytes a signature must decode to.
+pub const SIGNATURE_BYTES: usize = 64;
+/// LENS queries a transaction report runs when the signature is found.
+pub const TRANSACTION_QUERIES: u32 = SNAPSHOT_QUERIES + 4;
+/// LENS queries a transaction report runs when it is not.
+pub const TRANSACTION_QUERIES_NOT_FOUND: u32 = SNAPSHOT_QUERIES + 1;
+/// LENS queries a slot report runs.
+pub const SLOT_QUERIES: u32 = SNAPSHOT_QUERIES + 3;
+/// Most `solana.transactions` rows one signature may have (replays and
+/// forks together) before the report is refused as truncated.
+pub const MAX_TRANSACTION_ROWS: u64 = 64;
+/// Most `solana.slots` rows one slot may have.
+pub const MAX_SLOT_ROWS: u64 = 64;
+/// Most instruction rows, and most token transfer rows, one transaction
+/// may have, replays included.
+pub const MAX_INSTRUCTION_ROWS: u64 = 4_096;
 
 const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -199,6 +289,56 @@ pub struct ProfileRequest {
 impl ProfileRequest {
     pub fn new(kind: Kind, id: impl Into<String>) -> Self {
         Self { kind, id: id.into(), window_slots: None, as_of_slot: None }
+    }
+}
+
+/// One transaction report request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionRequest {
+    /// The transaction's first signature, base58.
+    pub signature: String,
+    /// The slot it is in, if known: only that slot is searched.
+    #[serde(default)]
+    pub slot: Option<u64>,
+    /// Without `slot`: search this many slots ending at the snapshot,
+    /// [`DEFAULT_WINDOW_SLOTS`] if `None`. Not allowed together with `slot`.
+    #[serde(default)]
+    pub window_slots: Option<u64>,
+    /// Pin the snapshot to this slot for a reproducible report.
+    #[serde(default)]
+    pub as_of_slot: Option<u64>,
+}
+
+impl TransactionRequest {
+    pub fn new(signature: impl Into<String>) -> Self {
+        Self { signature: signature.into(), slot: None, window_slots: None, as_of_slot: None }
+    }
+
+    /// The request a client makes from a row that carries its slot.
+    pub fn in_slot(signature: impl Into<String>, slot: u64) -> Self {
+        Self { slot: Some(slot), ..Self::new(signature) }
+    }
+}
+
+/// One slot report request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotRequest {
+    pub slot: u64,
+    /// List transactions after this `transaction_index`; from the first if
+    /// `None`.
+    #[serde(default)]
+    pub after_index: Option<u32>,
+    /// Transactions per page, [`DEFAULT_SLOT_PAGE`] if `None`.
+    #[serde(default)]
+    pub limit: Option<u64>,
+    /// Pin the snapshot to this slot for a reproducible report.
+    #[serde(default)]
+    pub as_of_slot: Option<u64>,
+}
+
+impl SlotRequest {
+    pub fn new(slot: u64) -> Self {
+        Self { slot, after_index: None, limit: None, as_of_slot: None }
     }
 }
 
@@ -308,6 +448,81 @@ pub fn validate_id(id: &str) -> Result<(), ProfileError> {
         return Err(invalid(format!("decodes to {} bytes, expected {ID_BYTES}", bytes.len())));
     }
     Ok(())
+}
+
+/// Check `signature` is the base58 text of a 64-byte signature.
+///
+/// As with [`validate_id`], the reason never quotes the input.
+pub fn validate_signature(signature: &str) -> Result<(), ProfileError> {
+    let invalid = |reason: String| ProfileError::invalid("signature", reason);
+    if let Some((at, _)) = signature.char_indices().find(|(_, c)| !BASE58_ALPHABET.contains(*c)) {
+        return Err(invalid(format!("character at byte {at} is not in the base58 alphabet")));
+    }
+    if !(MIN_SIGNATURE_CHARS..=MAX_SIGNATURE_CHARS).contains(&signature.len()) {
+        return Err(invalid(format!(
+            "is {} characters, expected {MIN_SIGNATURE_CHARS} to {MAX_SIGNATURE_CHARS}",
+            signature.len()
+        )));
+    }
+    let bytes = bs58::decode(signature).into_vec().map_err(|e| invalid(format!("is not valid base58: {e}")))?;
+    if bytes.len() != SIGNATURE_BYTES {
+        return Err(invalid(format!("decodes to {} bytes, expected {SIGNATURE_BYTES}", bytes.len())));
+    }
+    Ok(())
+}
+
+fn check_slot_fits(field: &str, slot: Option<u64>) -> Result<(), ProfileError> {
+    match slot {
+        Some(slot) if i64::try_from(slot).is_err() => {
+            Err(ProfileError::invalid(field, format!("{slot} does not fit in i64")))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A transaction request that passed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidTransaction {
+    signature: String,
+    slot: Option<u64>,
+    window_slots: u64,
+    as_of_slot: Option<u64>,
+}
+
+fn validate_transaction(req: &TransactionRequest) -> Result<ValidTransaction, ProfileError> {
+    validate_signature(&req.signature)?;
+    check_slot_fits("slot", req.slot)?;
+    if req.slot.is_some() && req.window_slots.is_some() {
+        return Err(ProfileError::invalid("window_slots", "cannot be given together with slot"));
+    }
+    let window_slots = req.window_slots.unwrap_or(DEFAULT_WINDOW_SLOTS);
+    if !(MIN_WINDOW_SLOTS..=MAX_WINDOW_SLOTS).contains(&window_slots) {
+        return Err(ProfileError::invalid(
+            "window_slots",
+            format!("{window_slots} is outside {MIN_WINDOW_SLOTS}..={MAX_WINDOW_SLOTS}"),
+        ));
+    }
+    check_slot_fits("as_of_slot", req.as_of_slot)?;
+    Ok(ValidTransaction { signature: req.signature.clone(), slot: req.slot, window_slots, as_of_slot: req.as_of_slot })
+}
+
+/// A slot request that passed validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidSlot {
+    slot: u64,
+    after_index: Option<u32>,
+    limit: u64,
+    as_of_slot: Option<u64>,
+}
+
+fn validate_slot(req: &SlotRequest) -> Result<ValidSlot, ProfileError> {
+    check_slot_fits("slot", Some(req.slot))?;
+    let limit = req.limit.unwrap_or(DEFAULT_SLOT_PAGE);
+    if !(1..=MAX_SLOT_PAGE).contains(&limit) {
+        return Err(ProfileError::invalid("limit", format!("{limit} is outside 1..={MAX_SLOT_PAGE}")));
+    }
+    check_slot_fits("as_of_slot", req.as_of_slot)?;
+    Ok(ValidSlot { slot: req.slot, after_index: req.after_index, limit, as_of_slot: req.as_of_slot })
 }
 
 /// A request that passed validation.
@@ -658,6 +873,79 @@ pub mod sql {
     pub fn program_series(id: &str, w: &Window) -> String {
         series(program_ok(id, w), "i.slot", w)
     }
+
+    // --- transaction ---
+
+    use super::{MAX_INSTRUCTION_ROWS, MAX_SLOT_ROWS, MAX_TRANSACTION_ROWS};
+
+    /// Every row of `solana.transactions` with the signature, in the slots
+    /// `from..=to`. One row more than the cap, so "at the cap" and "over
+    /// it" can be told apart.
+    pub fn transaction_rows(signature: &str, from: u64, to: u64) -> String {
+        format!(
+            "SELECT slot, blockhash, transaction_index, tx_signature, fee, status, err, accounts, log_messages, \
+               compute_units_consumed \
+             FROM solana.transactions \
+             WHERE slot >= {from} AND slot <= {to} AND tx_signature = {signature} \
+             ORDER BY slot DESC, transaction_index ASC LIMIT {}",
+            MAX_TRANSACTION_ROWS + 1
+        )
+    }
+
+    /// The rows of `solana.slots` for `slot`; `block_time` as Unix seconds.
+    pub fn slot_rows(slot: u64) -> String {
+        format!(
+            "SELECT slot, blockhash, parent_slot, CAST(block_time AS BIGINT) AS block_time, block_height, \
+               transaction_count, leader \
+             FROM solana.slots WHERE slot >= {slot} AND slot <= {slot} ORDER BY blockhash ASC LIMIT {}",
+            MAX_SLOT_ROWS + 1
+        )
+    }
+
+    pub fn transaction_instructions(signature: &str, slot: u64) -> String {
+        format!(
+            "SELECT instruction_index, inner_instruction_index, program_id, accounts, data_base58, \
+               instruction_type, decoded_data \
+             FROM solana.instructions \
+             WHERE slot >= {slot} AND slot <= {slot} AND tx_signature = {signature} \
+             ORDER BY instruction_index ASC, inner_instruction_index ASC NULLS FIRST LIMIT {}",
+            MAX_INSTRUCTION_ROWS + 1
+        )
+    }
+
+    pub fn transaction_transfers(signature: &str, slot: u64) -> String {
+        format!(
+            "SELECT instruction_index, inner_instruction_index, spl_token_program_id, source_token_account, \
+               destination_token_account, source_owner, destination_owner, mint_token_address, amount_raw, decimals \
+             FROM solana.token_transfers \
+             WHERE slot >= {slot} AND slot <= {slot} AND tx_signature = {signature} \
+             ORDER BY instruction_index ASC, inner_instruction_index ASC NULLS FIRST LIMIT {}",
+            MAX_INSTRUCTION_ROWS + 1
+        )
+    }
+
+    // --- slot ---
+
+    /// Distinct signatures, so a replayed slot counts each transaction once.
+    pub fn slot_counts(slot: u64) -> String {
+        format!(
+            "SELECT COUNT(DISTINCT tx_signature) AS transactions, \
+               COUNT(DISTINCT CASE WHEN status <> 'success' THEN tx_signature END) AS failed, \
+               COUNT(*) AS stored_rows \
+             FROM solana.transactions WHERE slot >= {slot} AND slot <= {slot}"
+        )
+    }
+
+    /// `limit + 1` rows after `after_index`, in a total order.
+    pub fn slot_transactions(slot: u64, after_index: Option<u32>, limit: u64) -> String {
+        let after = after_index.map(|a| format!(" AND transaction_index > {a}")).unwrap_or_default();
+        format!(
+            "SELECT transaction_index, tx_signature, status, err, fee, compute_units_consumed \
+             FROM solana.transactions WHERE slot >= {slot} AND slot <= {slot}{after} \
+             ORDER BY transaction_index ASC, tx_signature ASC, status ASC, fee ASC LIMIT {}",
+            limit + 1
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +1073,8 @@ pub struct Profiler {
     lens: Arc<dyn LensApi>,
     permits: Arc<Semaphore>,
     deadline: Duration,
+    /// Names for the addresses in a detail report; none without it.
+    catalog: Option<Arc<Catalog>>,
 }
 
 impl fmt::Debug for Profiler {
@@ -820,6 +1110,39 @@ impl Session<'_> {
     }
 }
 
+impl Session<'_> {
+    /// The snapshot slot `W`: the newest slot both tables cover, or `pin`
+    /// if given and not above it.
+    async fn snapshot(&mut self, pin: Option<u64>) -> Result<u64, ProfileError> {
+        let slots = self.max_slot(MAX_SLOTS_SQL, "solana.slots").await?;
+        let txs = self.max_slot(MAX_TX_SLOT_SQL, "solana.transactions").await?;
+        let visible = slots.min(txs);
+        let w = match pin {
+            Some(pin) if pin > visible => {
+                return Err(ProfileError::invalid(
+                    "as_of_slot",
+                    format!("{pin} is above {visible}, the newest fully visible slot"),
+                ));
+            }
+            Some(pin) => pin,
+            None => visible,
+        };
+        if i64::try_from(w).is_err() {
+            return Err(protocol(format!("snapshot slot {w} does not fit in i64")));
+        }
+        Ok(w)
+    }
+
+    /// `sql`, refused as truncated if it returns more than `cap` rows.
+    async fn capped(&mut self, sql: &str, cap: u64) -> Result<LensResponse, ProfileError> {
+        let response = self.query(sql).await?;
+        if response.rows.len() as u64 > cap {
+            return Err(ProfileError::Truncated);
+        }
+        Ok(response)
+    }
+}
+
 /// What the per-kind part of a profile produces.
 struct Body {
     found: bool,
@@ -837,7 +1160,14 @@ impl Profiler {
 
     /// For tests: a different concurrency limit or deadline.
     pub fn with_limits(lens: Arc<dyn LensApi>, max_concurrent: usize, deadline: Duration) -> Self {
-        Self { lens, permits: Arc::new(Semaphore::new(max_concurrent.max(1))), deadline }
+        Self { lens, permits: Arc::new(Semaphore::new(max_concurrent.max(1))), deadline, catalog: None }
+    }
+
+    /// Name the programs, mints and accounts of detail reports from
+    /// `catalog`'s entities.
+    pub fn with_catalog(mut self, catalog: Arc<Catalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     /// Validate `req`, then build its profile. See the [module docs](self).
@@ -861,23 +1191,7 @@ impl Profiler {
             .map_err(|_| ProfileError::Unavailable("the profiler is shut down".to_owned()))?;
         let mut s = Session { lens: self.lens.as_ref(), window_slots: valid.window_slots, queries: 0 };
 
-        // Snapshot.
-        let slots = s.max_slot(MAX_SLOTS_SQL, "solana.slots").await?;
-        let txs = s.max_slot(MAX_TX_SLOT_SQL, "solana.transactions").await?;
-        let visible = slots.min(txs);
-        let w = match valid.as_of_slot {
-            Some(pin) if pin > visible => {
-                return Err(ProfileError::invalid(
-                    "as_of_slot",
-                    format!("{pin} is above {visible}, the newest fully visible slot"),
-                ));
-            }
-            Some(pin) => pin,
-            None => visible,
-        };
-        if i64::try_from(w).is_err() {
-            return Err(protocol(format!("snapshot slot {w} does not fit in i64")));
-        }
+        let w = s.snapshot(valid.as_of_slot).await?;
 
         let window = Window::ending_at(w, valid.window_slots);
         let id = quote_sql_string(&valid.id);
@@ -907,6 +1221,139 @@ impl Profiler {
             warnings: body.warnings,
             queries_run: s.queries,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+impl Profiler {
+    /// Validate `req`, then build the report on its transaction. See the
+    /// [module docs](self#detail-reports).
+    pub async fn transaction(&self, req: TransactionRequest) -> Result<TransactionReport, ProfileError> {
+        let valid = validate_transaction(&req)?;
+        let started = Instant::now();
+        self.within_deadline("transaction report", self.run_transaction(valid, started)).await
+    }
+
+    /// Validate `req`, then build the report on its slot. See the
+    /// [module docs](self#detail-reports).
+    pub async fn slot(&self, req: SlotRequest) -> Result<SlotReport, ProfileError> {
+        let valid = validate_slot(&req)?;
+        let started = Instant::now();
+        self.within_deadline("slot report", self.run_slot(valid, started)).await
+    }
+
+    async fn within_deadline<T>(
+        &self,
+        what: &str,
+        work: impl Future<Output = Result<T, ProfileError>>,
+    ) -> Result<T, ProfileError> {
+        match tokio::time::timeout(self.deadline, work).await {
+            Ok(result) => result,
+            Err(_) => Err(ProfileError::Timeout(format!(
+                "the {what} did not finish within {} s",
+                self.deadline.as_secs()
+            ))),
+        }
+    }
+
+    async fn permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ProfileError> {
+        self.permits.acquire().await.map_err(|_| ProfileError::Unavailable("the profiler is shut down".to_owned()))
+    }
+
+    fn name_of(&self, address: &str) -> Option<String> {
+        self.catalog.as_ref().and_then(|c| c.entity_name(address)).map(str::to_owned)
+    }
+
+    async fn run_transaction(&self, valid: ValidTransaction, started: Instant) -> Result<TransactionReport, ProfileError> {
+        let _permit = self.permit().await?;
+        let mut s = Session { lens: self.lens.as_ref(), window_slots: valid.window_slots, queries: 0 };
+        let w = s.snapshot(valid.as_of_slot).await?;
+        let searched = match valid.slot {
+            Some(slot) if slot > w => {
+                return Err(ProfileError::invalid(
+                    "slot",
+                    format!("{slot} is above {w}, the newest fully visible slot"),
+                ));
+            }
+            Some(slot) => Window { from_slot: slot, to_slot: slot, slots: 1 },
+            None => Window::ending_at(w, valid.window_slots),
+        };
+        let signature = quote_sql_string(&valid.signature);
+
+        let found = s
+            .capped(&sql::transaction_rows(&signature, searched.from_slot, searched.to_slot), MAX_TRANSACTION_ROWS)
+            .await?;
+        let report = |transaction: Option<transaction::TransactionDetail>, warnings, queries_run| TransactionReport {
+            kind: "transaction",
+            signature: valid.signature.clone(),
+            found: transaction.is_some(),
+            as_of_slot: w,
+            searched,
+            transaction,
+            warnings,
+            queries_run,
+            duration_ms: elapsed_ms(started),
+        };
+        let Some(picked) = transaction::pick(&found.rows)? else {
+            debug_assert_eq!(s.queries, TRANSACTION_QUERIES_NOT_FOUND);
+            return Ok(report(None, vec![transaction::WARN_NOT_FOUND.to_owned()], s.queries));
+        };
+
+        let slot = picked.slot;
+        let slots = s.capped(&sql::slot_rows(slot), MAX_SLOT_ROWS).await?;
+        let instructions = s.capped(&sql::transaction_instructions(&signature, slot), MAX_INSTRUCTION_ROWS).await?;
+        let transfers = s.capped(&sql::transaction_transfers(&signature, slot), MAX_INSTRUCTION_ROWS).await?;
+        debug_assert_eq!(s.queries, TRANSACTION_QUERIES);
+
+        let rows = transaction::Rows {
+            slots: &slots.rows,
+            instructions: &instructions.rows,
+            token_transfers: &transfers.rows,
+        };
+        let (detail, warnings) = transaction::assemble(picked, rows, &|a| self.name_of(a))?;
+        Ok(report(Some(detail), warnings, s.queries))
+    }
+
+    async fn run_slot(&self, valid: ValidSlot, started: Instant) -> Result<SlotReport, ProfileError> {
+        let _permit = self.permit().await?;
+        let mut s = Session { lens: self.lens.as_ref(), window_slots: 1, queries: 0 };
+        let w = s.snapshot(valid.as_of_slot).await?;
+        if valid.slot > w {
+            return Err(ProfileError::invalid(
+                "slot",
+                format!("{} is above {w}, the newest fully visible slot", valid.slot),
+            ));
+        }
+
+        let slots = s.capped(&sql::slot_rows(valid.slot), MAX_SLOT_ROWS).await?;
+        let counts = s.query(&sql::slot_counts(valid.slot)).await?;
+        let transactions =
+            s.capped(&sql::slot_transactions(valid.slot, valid.after_index, valid.limit), valid.limit + 1).await?;
+        debug_assert_eq!(s.queries, SLOT_QUERIES);
+
+        let rows = slot::SlotRows {
+            slots: &slots.rows,
+            counts: single_row(&counts, "slot counts")?,
+            transactions: &transactions.rows,
+        };
+        let body = slot::assemble(valid.slot, valid.after_index, valid.limit, rows, &|a| self.name_of(a))?;
+        Ok(SlotReport {
+            kind: "slot",
+            slot: valid.slot,
+            found: body.block.is_some(),
+            as_of_slot: w,
+            block: body.block,
+            counts: body.counts,
+            transactions: body.transactions,
+            page: body.page,
+            duplicates: body.duplicates,
+            warnings: body.warnings,
+            queries_run: s.queries,
+            duration_ms: elapsed_ms(started),
         })
     }
 }

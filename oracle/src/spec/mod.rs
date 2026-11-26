@@ -11,6 +11,7 @@
 //! | `mod.rs`      | [`QuerySpec`], [`SpecRunner`], [`SpecAnswer`], [`SpecError`], windows |
 //! | [`guard`]     | [`validate`](guard::validate): spec → [`ValidSpec`](guard::ValidSpec), pure |
 //! | [`compile`]   | [`compile`](compile::compile): valid spec + window → [`Compiled`](compile::Compiled), pure |
+//! | [`drill`]     | [`SpecRunner::drill`]: the rows behind one row of an answer |
 //!
 //! # Decisions
 //!
@@ -68,6 +69,7 @@
 //! | `truncated: true`                                    | the answer, flagged |
 
 pub mod compile;
+pub mod drill;
 pub mod guard;
 
 use std::fmt;
@@ -472,6 +474,30 @@ impl Session<'_> {
     }
 }
 
+impl Session<'_> {
+    /// The snapshot slot `W`: the newest slot both tables cover, or `pin`
+    /// if given and not above it.
+    async fn snapshot(&mut self, pin: Option<u64>) -> Result<u64, SpecError> {
+        let slots = self.max_slot(MAX_SLOTS_SQL, "solana.slots").await?;
+        let txs = self.max_slot(MAX_TX_SLOT_SQL, "solana.transactions").await?;
+        let visible = slots.min(txs);
+        let w = match pin {
+            Some(pin) if pin > visible => {
+                return Err(SpecError::invalid(
+                    "as_of_slot",
+                    format!("{pin} is above {visible}, the newest fully visible slot"),
+                ));
+            }
+            Some(pin) => pin,
+            None => visible,
+        };
+        if w > crate::catalog::MAX_SLOT {
+            return Err(SpecError::Internal(format!("snapshot slot {w} does not fit in i64")));
+        }
+        Ok(w)
+    }
+}
+
 impl SpecRunner {
     /// `config` supplies `max_rows` and `max_slot_span`.
     pub fn new(catalog: Arc<Catalog>, lens: Arc<dyn LensApi>, config: &OracleConfig) -> Self {
@@ -507,23 +533,7 @@ impl SpecRunner {
         let started = Instant::now();
         let mut s = Session { lens: self.lens.as_ref(), queries: 0 };
 
-        // Snapshot.
-        let slots = s.max_slot(MAX_SLOTS_SQL, "solana.slots").await?;
-        let txs = s.max_slot(MAX_TX_SLOT_SQL, "solana.transactions").await?;
-        let visible = slots.min(txs);
-        let w = match valid.as_of_slot {
-            Some(pin) if pin > visible => {
-                return Err(SpecError::invalid(
-                    "as_of_slot",
-                    format!("{pin} is above {visible}, the newest fully visible slot"),
-                ));
-            }
-            Some(pin) => pin,
-            None => visible,
-        };
-        if w > crate::catalog::MAX_SLOT {
-            return Err(SpecError::Internal(format!("snapshot slot {w} does not fit in i64")));
-        }
+        let w = s.snapshot(valid.as_of_slot).await?;
 
         // Window.
         let requested = resolve_window(valid.window, w)?;

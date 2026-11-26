@@ -101,6 +101,32 @@
   #commons .wrap, #commons .meta { overflow-wrap: anywhere; }
   #commons td { white-space: nowrap; } #commons td.wrap { white-space: normal; }
   #commons td .tag { margin: 1px 0; }
+  /* Click-through: links and the detail panel that replaces the results */
+  a.lnk { color: var(--blue); text-decoration: none; cursor: pointer; }
+  a.lnk:hover { text-decoration: underline; }
+  td.go { white-space: nowrap; font-size: 12px; }
+  #detail-bar { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+  #detail-bar .crumb { flex: 1; min-width: 0; color: var(--dim); font: 12px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #detail-bar button { padding: 4px 12px; }
+  #detail-body h3 { margin: 0 0 8px; font-size: 15px; overflow-wrap: anywhere; }
+  #detail-body h4 { margin: 16px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); }
+  #detail-body .kv dd { overflow-wrap: anywhere; }
+  #detail-body .kv dd .kv { margin: 2px 0; }
+  .loading { color: var(--dim); padding: 18px 0; }
+  .loading::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 8px; border-radius: 50%; border: 2px solid var(--blue); border-right-color: transparent; animation: spin .8s linear infinite; vertical-align: -1px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .ix { border-left: 2px solid var(--line); padding: 4px 0 4px 10px; margin: 4px 0; }
+  .ix .ix { margin-left: 14px; }
+  .ix.focus { border-left-color: var(--blue); background: #1f6feb1a; }
+  .ix.skipped { opacity: .55; }
+  .ix-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+  .ix-head .path { font-family: var(--mono); color: var(--dim); }
+  .ix-head .cu { color: var(--dim); font-size: 12px; margin-left: auto; }
+  .tag.success, .tag.oracle, .tag.prism { background: #3fb95033; color: var(--green); }
+  .tag.unfinished, .tag.undecoded, .tag.skipped { background: #d2992233; color: var(--amber); }
+  .failure { border: 1px solid #f8514966; border-radius: 6px; padding: 8px 10px; margin: 8px 0; color: var(--red); overflow-wrap: anywhere; }
+  .failure .mono { font-family: var(--mono); font-size: 12px; }
+
   .progress { font-size: 12px; color: var(--dim); margin-top: 8px; }
   .progress div { font-family: var(--mono); overflow-wrap: anywhere; }
 </style>
@@ -149,7 +175,14 @@
       <div class="chips" id="sql-chips"></div>
       <button id="sql-btn">Run on LENS</button>
     </div>
-    <div class="ask-body"><div class="answer" id="answer"></div></div>
+    <div class="ask-body" id="ask-body">
+      <div class="answer" id="answer"></div>
+      <!-- A detail view replaces the results while the URL names one: #/tx/…, #/mint/…, … -->
+      <div id="detail" hidden>
+        <div id="detail-bar"><button class="secondary" id="detail-back" type="button">‹ Back</button><span class="crumb" id="detail-crumb"></span></div>
+        <div id="detail-body"></div>
+      </div>
+    </div>
   </section>
 
   <!-- Changelog feed -->
@@ -204,10 +237,169 @@
   </section>
 </main>
 
+
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
+/* <link-rules> ----------------------------------------------------------------
+ * Everything that decides what becomes a link and where it goes. Pure: no DOM,
+ * no network, no state, so the tests load exactly this block and check it.
+ *
+ *   linkify(columnName, entityHint, value, rowSlot) -> HTML: an <a> or plain text
+ *     entityHint: what the column's values are, as ORACLE says on every answer
+ *       column ("tx_signature" | "mint" | "program" | "token_account" | "slot"),
+ *       or null for "nothing to open". For ORACLE output the page never guesses.
+ *       `undefined` means "no metadata" (raw SQL on LENS): only then is the hint
+ *       looked up from the column name, in SQL_HINTS.
+ *     A value is linked only if it is what the hint says: a base58 signature, a
+ *     32-byte base58 address, a slot number. A placeholder ("unattributed") or
+ *     null stays text.
+ *     rowSlot: the row's slot, if it has one; a signature link carries it so the
+ *       report reads one slot instead of searching.
+ *     An optional 5th argument, focus ("1.0"), marks a signature link with the
+ *     instruction to open at (&ix=1.0); it does not change what is fetched.
+ *   linkAs(hint, value, text, rowSlot) -> the same link with other text
+ *   hrefFor(hint, value, rowSlot, focus) -> "#/tx/<sig>?slot=N" | "#/mint/<id>" |
+ *     "#/program/<id>" | "#/account/<id>" | "#/slot/<n>" | null
+ *   parseRoute(hash) -> null (the results), or {view, title, api: {path, body?}}
+ *   answerTable(spec, answer, label), rowsTable(drillAnswer), sqlTable(rows)
+ *     -> the HTML of a result table: every cell through linkify, and for an
+ *     ORACLE answer a "details ›" link per row to "#/rows?q=…".
+ */
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const SIG_RE = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
+const KEY_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const ENTITY_HINTS = ["tx_signature", "mint", "program", "token_account", "slot"];
+// Raw SQL has no column metadata; these names are what PRISM's tables call them.
+const SQL_HINTS = {
+  tx_signature: "tx_signature", signature: "tx_signature",
+  slot: "slot", parent_slot: "slot", first_slot: "slot", last_slot: "slot", observed_slot: "slot",
+  mint: "mint", mint_token_address: "mint", mint_address: "mint",
+  program: "program", program_id: "program", spl_token_program_id: "program", token_program: "program",
+  source_token_account: "token_account", destination_token_account: "token_account", token_account: "token_account",
+};
+// The route segment of each hint, and the ORACLE path of each route.
+const ROUTE_OF = { tx_signature: "tx", mint: "mint", program: "program", token_account: "account", slot: "slot" };
+const PROFILE_KIND = { mint: "mint", program: "program", account: "token_account" };
+const asSlot = (v) => {
+  const n = typeof v === "number" ? v : (typeof v === "string" && /^\d{1,19}$/.test(v) ? Number(v) : NaN);
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+};
+const IX_RE = /^\d{1,9}(\.\d{1,9})?$/;
+function hrefFor(hint, value, rowSlot, focus) {
+  if (hint === "slot") { const n = asSlot(value); return n === null ? null : `#/slot/${n}`; }
+  if (typeof value !== "string") return null;
+  if (hint === "tx_signature") {
+    if (!SIG_RE.test(value)) return null;
+    const slot = asSlot(rowSlot);
+    const params = [slot === null ? null : `slot=${slot}`, IX_RE.test(String(focus ?? "")) ? `ix=${focus}` : null].filter(Boolean);
+    return `#/tx/${value}` + (params.length ? "?" + params.join("&") : "");
+  }
+  if (ROUTE_OF[hint] && KEY_RE.test(value)) return `#/${ROUTE_OF[hint]}/${value}`;
+  return null;
+}
+function linkAs(hint, value, text, rowSlot, focus) {
+  const href = ENTITY_HINTS.includes(hint) ? hrefFor(hint, value, rowSlot, focus) : null;
+  if (!href) return esc(text);
+  return `<a class="lnk" href="${esc(href)}" data-entity="${hint}" title="${esc(`open ${hint.replace("_", " ")} ${value}`)}">${esc(text)}</a>`;
+}
+function linkify(columnName, entityHint, value, rowSlot, focus) {
+  const hint = entityHint === undefined ? (SQL_HINTS[columnName] ?? null) : entityHint;
+  const text = value === null || value === undefined ? "∅" : typeof value === "number" ? value.toLocaleString("en-US") : String(value);
+  return linkAs(hint, value, text, rowSlot, focus);
+}
+// `#/rows?q=<base64url of {"spec","row","label"}>`: the rows behind one answer row.
+function encodeRows(payload) {
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  let bin = ""; for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function decodeRows(q) {
+  try {
+    const bin = atob(q.replace(/-/g, "+").replace(/_/g, "/"));
+    const v = JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0))));
+    return v && typeof v.spec === "object" && typeof v.row === "object" ? v : null;
+  } catch (_) { return null; }
+}
+const rowsHref = (spec, row, label) => "#/rows?q=" + encodeRows({ spec, row, label });
+function parseRoute(hash) {
+  const h = String(hash || "").replace(/^#/, "");
+  if (!h.startsWith("/") || h === "/") return null;
+  const [path, query = ""] = h.slice(1).split("?");
+  const params = new URLSearchParams(query);
+  const [kind, id, ...rest] = path.split("/");
+  const bad = (why) => ({ view: "invalid", title: "unknown link", reason: why, api: null });
+  if (rest.length) return bad("the link has extra path segments");
+  if (kind === "tx") {
+    if (!SIG_RE.test(id || "")) return bad("not a transaction signature");
+    const slot = params.has("slot") ? asSlot(params.get("slot")) : null;
+    if (params.has("slot") && slot === null) return bad("slot must be a number");
+    const focus = IX_RE.test(params.get("ix") || "") ? params.get("ix") : null;
+    return { view: "tx", title: `transaction ${id}`, id, slot, focus, api: { path: `/profile/transaction/${id}` + (slot === null ? "" : `?slot=${slot}`) } };
+  }
+  if (PROFILE_KIND[kind]) {
+    if (!KEY_RE.test(id || "")) return bad("not an address");
+    return { view: "profile", kind: PROFILE_KIND[kind], title: `${PROFILE_KIND[kind].replace("_", " ")} ${id}`, id, api: { path: `/profile/${PROFILE_KIND[kind]}/${id}` } };
+  }
+  if (kind === "slot") {
+    const slot = asSlot(id);
+    if (slot === null) return bad("not a slot number");
+    const after = params.has("after") ? asSlot(params.get("after")) : null;
+    return { view: "slot", title: `slot ${slot}`, slot, after, api: { path: `/profile/slot/${slot}?limit=100` + (after === null ? "" : `&after_index=${after}`) } };
+  }
+  if (kind === "rows" && !id) {
+    const q = decodeRows(params.get("q") || "");
+    if (!q) return bad("the rows link is damaged");
+    return { view: "rows", title: `rows behind ${q.label || "a row"}`, label: q.label, api: { path: "/drill", body: { spec: q.spec, row: q.row, limit: 50 } } };
+  }
+  return bad(`no such view: ${kind}`);
+}
+
+// ---- Result tables: every value through linkify ----
+// `cell(value, columnIndex, row, rowIndex)` returns the HTML of one <td>; `lead(row, rowIndex)` an extra first cell.
+function resultTable(columns, rows, cell, lead) {
+  if (!rows.length) return `<div class="empty">no rows</div>`;
+  const plain = (v) => typeof v === "number" ? `<td class="num">${v.toLocaleString()}</td>` : `<td class="mono">${esc(v ?? "∅")}</td>`;
+  return `<div class="scroll"><table><thead><tr><th class="num">#</th>${lead ? "<th></th>" : ""}${columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${
+    rows.map((r, i) => `<tr><td class="num">${i + 1}</td>${lead ? lead(r, i) : ""}${r.map((v, j) => (cell && cell(v, j, r, i)) || plain(v)).join("")}</tr>`).join("")
+  }</tbody></table></div>`;
+}
+
+const plainCell = (html, v) => `<td class="${typeof v === "number" ? "num" : "mono"}">${html}</td>`;
+const ixPath = (index, inner) => inner == null ? String(index) : `${index}.${inner}`;
+// An ORACLE answer: every cell through linkify with its column's own hint, and
+// a "details ›" link per row to the rows it counted.
+function answerTable(spec, a, label) {
+  const cols = a.columns;
+  const slotAt = cols.findIndex((c) => c.entity === "slot");
+  const pinned = Object.assign({}, spec, { as_of_slot: a.as_of_slot }); // the drill reads the answer's window
+  const dims = cols.map((c, j) => c.role === "dimension" ? j : -1).filter((j) => j >= 0);
+  const lead = (r) => {
+    const row = Object.fromEntries(dims.map((j) => [cols[j].name, r[j]]));
+    const what = dims.length ? dims.map((j) => `${cols[j].name} ${r[j]}`).join(", ") : (label || "all rows");
+    return `<td class="go"><a class="lnk" href="${esc(rowsHref(pinned, row, what))}" data-entity="rows" title="the rows behind this one">details ›</a></td>`;
+  };
+  const cell = (v, j, r) => plainCell(linkify(cols[j].name, cols[j].entity ?? null, v, slotAt >= 0 ? r[slotAt] : null), v);
+  return resultTable(cols.map((c) => c.unit ? `${c.name} (${c.unit})` : c.name), a.rows, cell, lead);
+}
+// Raw SQL on LENS: no metadata, so linkify looks the column name up.
+const sqlCell = (col, v, row) => plainCell(linkify(col, undefined, v, row.slot,
+  typeof row.instruction_index === "number" ? ixPath(row.instruction_index, row.inner_instruction_index) : null), v);
+
+// The rows behind an answer row (POST /drill): its columns carry hints too.
+function rowsTable(r) {
+  const cols = r.columns, at = (name) => cols.findIndex((c) => c.name === name);
+  const slotAt = cols.findIndex((c) => c.entity === "slot"), ixAt = at("instruction_index"), innerAt = at("inner_instruction_index");
+  const cell = (x, j, row) => plainCell(linkify(cols[j].name, cols[j].entity ?? null, x, slotAt >= 0 ? row[slotAt] : null,
+    ixAt >= 0 ? ixPath(row[ixAt], row[innerAt]) : null), x);
+  return resultTable(cols.map((c) => c.name), r.rows, cell);
+}
+// A raw SQL result: rows are objects, columns in the order of the first row.
+function sqlTable(rows) {
+  const cols = rows.length ? Object.keys(rows[0]) : [];
+  return resultTable(cols, rows.map((r) => cols.map((c) => r[c])), (v, j, _r, i) => sqlCell(cols[j], v, rows[i]));
+}
+/* </link-rules> ------------------------------------------------------------- */
 const num = (v) => (v === null || v === undefined || v === "") ? "–" : (typeof v === "number" ? v.toLocaleString() : esc(v));
 const fixed = (v, d = 2) => (typeof v === "number") ? v.toFixed(d) : "–";
 const short = (s, n = 10) => { s = String(s ?? ""); return s.length > 2 * n + 1 ? s.slice(0, n) + "…" + s.slice(-n) : s; };
@@ -324,7 +516,7 @@ function renderFeed() {
     if (e.event === "new") detail = `${num(e.transaction_count)} txs · ${num(e.files)} files`;
     else if (e.event === "skip") detail = esc(e.reason);
     else if (e.event === "final") detail = `from ${num(e.previous_slot)}`;
-    return `<tr><td class="num">${num(e.id)}</td><td>${tag(e.event)}</td><td class="num">${num(e.slot)}</td><td>${detail}</td><td>${ago(e.emitted_at)}</td></tr>`;
+    return `<tr><td class="num">${num(e.id)}</td><td>${tag(e.event)}</td><td class="num">${e.event === "new" ? slotLink(e.slot) : num(e.slot)}</td><td>${detail}</td><td>${ago(e.emitted_at)}</td></tr>`;
   }).join("") : `<tr><td colspan="5" class="empty">no events yet: PRISM writes its first ones on its first flush (about 10 s after it starts)</td></tr>`;
 }
 
@@ -457,7 +649,7 @@ function renderAnomalies() {
   const rows = state.anomalies;
   $("anom-sub").textContent = rows.length ? `${rows.length} newest` : "";
   $("anomalies").innerHTML = rows.length ? rows.map((a) =>
-    `<tr><td class="mono">${esc(a.metric)}</td><td class="mono" title="${esc(a.subject)}">${esc(short(a.subject) || "(global)")}</td><td>${tag(a.kind)}</td>
+    `<tr><td class="mono">${esc(a.metric)}</td><td class="mono" title="${esc(a.subject)}">${subjectLink(a)}</td><td>${tag(a.kind)}</td>
      <td class="num">${fixed(a.score)}</td><td class="num">${fixed(a.value, 0)}</td><td class="num">${fixed(a.baseline, 1)}</td>
      <td class="num">${num(a.start_slot)}–${num(a.end_slot)}</td><td>${ago(a.detected_at / 1000)}</td></tr>`).join("")
     : `<tr><td colspan="8" class="empty">no anomalies yet${detectorLines().length ? ": see each detector's state below" : ""}</td></tr>`;
@@ -609,13 +801,6 @@ async function postJson(url, body) {
   return { ok: res.ok, status: res.status, data };
 }
 
-function resultTable(columns, rows) {
-  if (!rows.length) return `<div class="empty">no rows</div>`;
-  return `<div class="scroll"><table><thead><tr><th class="num">#</th>${columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${
-    rows.map((r, i) => `<tr><td class="num">${i + 1}</td>${r.map((v) => typeof v === "number" ? `<td class="num">${v.toLocaleString()}</td>` : `<td class="mono">${esc(v ?? "∅")}</td>`).join("")}</tr>`).join("")
-  }</tbody></table></div>`;
-}
-
 // The last 10 questions, newest first, kept in this browser; a click asks again.
 const RECENT_KEY = "deepana.recentQuestions";
 let recent = [];
@@ -640,6 +825,7 @@ async function ask() {
   const question = $("ask-input").value.trim();
   if (!question) return;
   remember(question);
+  showResults();
   $("ask-btn").disabled = true; $("ask-status").textContent = "asking…";
   try {
     const { ok, status, data } = await postJson("/api/oracle/ask", { question });
@@ -659,8 +845,8 @@ function renderAnswer(d) {
     if ((d.assumptions || []).length) html += `<ul class="notes">${d.assumptions.map((x) => `<li>assuming ${esc(x)}</li>`).join("")}</ul>`;
     if (!a) return html + `<div class="meta">not executed</div>`;
     if ((a.warnings || []).length) html += `<div class="warnings">${a.warnings.map((w) => `⚠ ${esc(w)}`).join("<br>")}</div>`;
-    html += `<div class="meta">slots ${num(a.window?.start_slot)}–${num(a.window?.end_slot)} · as of slot ${num(a.as_of_slot)} · ${num(a.rows.length)} rows · ${num(a.duration_ms)} ms</div>`;
-    html += resultTable(a.columns.map((c) => c.unit ? `${c.name} (${c.unit})` : c.name), a.rows);
+    html += `<div class="meta">slots ${num(a.window?.from_slot)}–${num(a.window?.to_slot)} · as of slot ${num(a.as_of_slot)} · ${num(a.rows.length)} rows · ${num(a.duration_ms)} ms · click a value to open it, or a row's <b>details ›</b> for what it counted</div>`;
+    html += answerTable(d.spec, a, d.understood_as);
     // Below the table: whether it is the whole result.
     const notes = [];
     if (a.truncated) notes.push("truncated: LENS's row cap cut the result short of the limit, so not every row is shown");
@@ -681,19 +867,256 @@ function renderAnswer(d) {
 async function runSql() {
   const sql = $("sql-input").value.trim();
   if (!sql) return;
+  showResults();
   $("sql-btn").disabled = true; $("ask-status").textContent = "running…";
   try {
     const { ok, status, data } = await postJson("/api/lens/query", { sql });
     if (!ok) $("answer").innerHTML = `<div class="error">${esc(data?.error || "HTTP " + status)}</div>`;
     else {
-      const rows = data.rows || [];
-      const cols = rows.length ? Object.keys(rows[0]) : [];
       $("answer").innerHTML = `<div class="meta">${num(data.row_count)} rows · ${num(data.duration_ms)} ms${data.truncated ? " · truncated" : ""}</div>` +
-        resultTable(cols, rows.map((r) => cols.map((c) => r[c])));
+        sqlTable(data.rows || []);
     }
   } catch (err) { $("answer").innerHTML = `<div class="error">${esc(err)}</div>`; }
   $("sql-btn").disabled = false; $("ask-status").textContent = "";
 }
+
+// ---- Click-through ----------------------------------------------------------
+const ORACLE = "/api/oracle";
+const slotLink = (slot) => linkify("slot", "slot", slot);
+const addr = (a, name) => a == null ? "∅" : `<span title="${esc(a)}">${esc(name ? `${name} (${short(a, 4)})` : short(a, 8))}</span>`;
+const when = (secs) => secs == null ? "–" : `${new Date(secs * 1000).toISOString().replace("T", " ").replace(".000Z", " UTC")} (${ago(secs)})`;
+const sol = (lamports) => typeof lamports === "number" ? `${lamports.toLocaleString()} lamports (${(lamports / 1e9).toFixed(9)} SOL)` : "–";
+const kv = (pairs) => `<dl class="kv">${pairs.filter(Boolean).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("")}</dl>`;
+const warnList = (ws) => (ws || []).length ? `<div class="warnings">${ws.map((w) => `⚠ ${esc(w)}`).join("<br>")}</div>` : "";
+
+function subjectLink(a) {
+  const m = String(a.metric || "");
+  const hint = m.includes("mint") ? "mint" : m.includes("program") ? "program" : null;
+  const html = linkify("subject", hint, a.subject ?? null, null);
+  return a.subject ? html : "(global)";
+}
+
+// ---- The hash router: the URL is the view ----
+// One request per navigation; the last 20 detail answers are kept, so Back and
+// Forward redraw from memory. Failures and "not found" are not kept.
+const DETAIL_CACHE_SIZE = 20;
+const detailCache = new Map();
+// `depth`: how many views this page navigated through to reach this one; kept
+// in history.state so Back, Forward and reload all agree on it.
+const router = { seq: 0, current: null, requests: 0, depth: history.state?.depth ?? 0 };
+function cacheGet(key) {
+  if (!detailCache.has(key)) return undefined;
+  const v = detailCache.get(key); detailCache.delete(key); detailCache.set(key, v); return v;
+}
+function cachePut(key, v) {
+  detailCache.delete(key); detailCache.set(key, v);
+  while (detailCache.size > DETAIL_CACHE_SIZE) detailCache.delete(detailCache.keys().next().value);
+}
+async function fetchDetail(api) {
+  router.requests++;
+  const res = api.body === undefined ? await fetch(ORACLE + api.path)
+    : await fetch(ORACLE + api.path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(api.body) });
+  let data = null; try { data = await res.json(); } catch (_) {}
+  if (!res.ok || !data) { const e = new Error(data?.error || `HTTP ${res.status}`); e.status = res.status; throw e; }
+  return data;
+}
+const apiKey = (api) => api.path + (api.body === undefined ? "" : " " + JSON.stringify(api.body));
+
+async function route(force) {
+  const r = parseRoute(location.hash);
+  const key = r ? location.hash : "";
+  if (!force && key === router.current) return;
+  router.current = key;
+  const seq = ++router.seq;
+  if (!r) { $("detail").hidden = true; $("answer").hidden = false; document.title = "DeepAna"; return; }
+  $("answer").hidden = true; $("detail").hidden = false;
+  $("detail-crumb").textContent = r.title;
+  document.title = `DeepAna · ${r.title}`;
+  const body = $("detail-body");
+  const show = (html) => { if (seq === router.seq) { body.innerHTML = html; afterRender(); } };
+  if (r.view === "invalid") return show(`<div class="notice warn">This link does not name anything DeepAna can show: ${esc(r.reason)}.</div>`);
+  const k = apiKey(r.api);
+  let data = force ? undefined : cacheGet(k);
+  if (data === undefined) {
+    show(`<div class="loading">loading ${esc(r.title)}…</div>`);
+    try { data = await fetchDetail(r.api); }
+    catch (err) {
+      return show(`<div class="notice warn">Could not load ${esc(r.title)}: ${esc(err.message)}</div>
+        <div style="margin-top:8px"><button class="secondary" type="button" data-retry="1">Retry</button></div>`);
+    }
+    if (data.found !== false) cachePut(k, data);
+  }
+  show(RENDER[r.view](data, r));
+}
+function afterRender() {
+  const body = $("detail-body");
+  body.scrollTop = 0;
+  const focus = body.querySelector(".ix.focus");
+  if (focus) focus.scrollIntoView({ block: "center" });
+}
+// Links are plain hrefs, so the browser's own history does Back/Forward; a
+// click on one outside the Ask panel also brings the panel into view.
+document.addEventListener("click", (e) => {
+  const a = e.target.closest("a.lnk[href^='#/']");
+  if (a && !a.closest("#ask-body")) setTimeout(() => $("ask-body").scrollIntoView({ block: "nearest" }), 0);
+  if (e.target.closest("[data-retry]")) route(true);
+});
+window.addEventListener("hashchange", () => {
+  // A link click makes a fresh history entry (state null): one deeper than the last.
+  if (history.state === null && parseRoute(location.hash)) {
+    try { history.replaceState({ depth: router.depth + 1 }, ""); } catch (_) {}
+  }
+  router.depth = history.state?.depth ?? 0;
+  route(false);
+});
+window.addEventListener("popstate", () => { router.depth = history.state?.depth ?? 0; route(false); });
+// The visible Back: the previous view if this page navigated here, else the results.
+$("detail-back").addEventListener("click", () => {
+  if (router.depth > 0) history.back();
+  else showResults();
+});
+function showResults() {
+  if (!parseRoute(location.hash)) return;
+  history.pushState({ depth: 0 }, "", location.pathname + location.search);
+  router.depth = 0;
+  route(false);
+}
+
+// ---- Renderers ----
+function renderInstruction(i, t, focus) {
+  const type = i.instruction_type ? `<span class="tag ${esc(i.decoded_by || "")}" title="decoded by ${esc(i.decoded_by || "")}">${esc(i.instruction_type)}</span>` : tag("undecoded");
+  const group = i.log_group != null ? t.logs.groups[i.log_group] : null;
+  const xfer = i.token_transfer != null ? t.token_transfers[i.token_transfer] : null;
+  const isFocus = focus != null && focus === i.path;
+  return `<div class="ix${isFocus ? " focus" : ""}${i.ran ? "" : " skipped"}" data-path="${esc(i.path)}">
+    <div class="ix-head"><span class="path">#${esc(i.path)}</span>
+      <b>${linkAs("program", i.program_id, i.program_name || i.program_id)}</b> ${type}
+      ${i.outcome ? tag(i.outcome) : ""}${i.ran ? "" : tag("skipped")}
+      ${xfer ? `<span class="meta">transfers ${esc(xfer.amount_ui ?? xfer.amount_raw)}${xfer.mint ? " of " + linkify("mint", "mint", xfer.mint) : ""}</span>` : ""}
+      <span class="cu">${i.stack_height != null ? `depth ${i.stack_height}` : ""}${i.compute_units_consumed != null ? ` · ${num(i.compute_units_consumed)} CU` : ""}</span></div>
+    <details${isFocus ? " open" : ""}><summary>details</summary>
+      ${i.decoded != null ? `<pre>${esc(JSON.stringify(i.decoded, null, 2))}</pre>` : ""}
+      ${kv([["accounts", i.accounts.length ? i.accounts.map((a) => `<div class="mono">${esc(a)}</div>`).join("") : "–"],
+        ["data", `${i.data_bytes ?? "?"} bytes · <span class="mono">${esc(short(i.data_base58, 24)) || "(empty)"}</span>`]])}
+      ${group ? `<pre>${esc(group.lines.join("\n"))}</pre>` : `<div class="meta">no log group</div>`}
+    </details>
+    ${(i.inner || []).map((c) => renderInstruction(c, t, focus)).join("")}</div>`;
+}
+
+function renderTx(r, route) {
+  const head = `<h3>Transaction <span class="mono">${esc(r.signature)}</span></h3>`;
+  if (!r.found) {
+    return head + `<div class="notice warn" data-state="not-found">Not found in slots ${num(r.searched.from_slot)}–${num(r.searched.to_slot)} (as of slot ${num(r.as_of_slot)}).
+      ${route.slot != null ? `It may be in another slot: <a class="lnk" href="#/tx/${esc(r.signature)}">search the last ${num(50000)} slots</a>.` : "PRISM may not have ingested it, or it is older than the slots searched."}</div>` + warnList(r.warnings);
+  }
+  const t = r.transaction, b = t.block || {};
+  let html = head + `<div style="margin:-2px 0 8px">${tag(t.status)}</div>` + kv([
+    ["slot", `${slotLink(t.slot)} · index ${num(t.transaction_index)}`],
+    ["time", when(b.block_time)], ["fee", sol(t.fee_lamports)],
+    ["compute units", num(t.compute_units_consumed)],
+    ["fee payer", `<span class="mono">${esc(t.fee_payer ?? "∅")}</span>`],
+    ["blockhash", `<span class="mono">${esc(t.blockhash)}</span>`],
+    b.leader ? ["leader", addr(b.leader, b.leader_name)] : null,
+    ["contents", `${num(t.counts.instructions)} instructions (${num(t.counts.inner_instructions)} inner, ${num(t.counts.decoded_instructions)} decoded) · ${num(t.counts.programs)} programs · ${num(t.counts.token_transfers)} token transfers`],
+  ]);
+  if (t.error) {
+    const e = t.error;
+    html += `<div class="failure"><b>Failed</b>${e.program_id ? ` in ${esc(e.program_name || short(e.program_id, 6))}` : ""}${e.path != null ? ` at instruction #${esc(e.path)}` : e.instruction_index != null ? ` at instruction #${e.instruction_index}` : ""}${e.reason ? `: ${esc(e.reason)}` : ""}
+      <div class="mono">${esc(e.message)}</div></div>`;
+  }
+  html += warnList(r.warnings);
+  html += `<h4>Memo</h4>` + (t.memos.length ? t.memos.map((m) => `<div class="notice" data-memo>${esc(m.text)} <span class="meta">· ${m.path != null ? "#" + esc(m.path) + " · " : ""}from ${esc(m.source.replace("_", " "))}</span></div>`).join("") : `<div class="empty">none</div>`);
+  html += `<h4>Token transfers</h4>` + (t.token_transfers.length ? `<table><thead><tr><th>ix</th><th>mint</th><th class="num">amount</th><th>from → to (token accounts)</th><th>owners</th></tr></thead><tbody>${
+    t.token_transfers.map((x) => `<tr><td class="mono">#${esc(x.path)}</td>
+      <td class="mono">${x.mint ? linkify("mint", "mint", x.mint) + (x.mint_name ? ` <span class="meta">${esc(x.mint_name)}</span>` : "") : "unattributed"}</td>
+      <td class="num" title="${esc(x.amount_raw)} base units">${esc(x.amount_ui ?? x.amount_raw + " raw")}</td>
+      <td class="mono">${linkify("source_token_account", "token_account", x.source_token_account)} → ${linkify("destination_token_account", "token_account", x.destination_token_account)}</td>
+      <td class="mono">${addr(x.source_owner)} → ${addr(x.destination_owner)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">none</div>`);
+  html += `<h4>Instructions</h4>` + (t.instructions.length ? t.instructions.map((i) => renderInstruction(i, t, route.focus)).join("") : `<div class="empty">no instruction rows</div>`);
+  if (t.orphan_instructions.length) html += `<h4>Inner instructions without a parent</h4>` + t.orphan_instructions.map((i) => renderInstruction(i, t, route.focus)).join("");
+  html += `<h4>Accounts (${t.accounts.length})</h4><details><summary>show</summary><table><tbody>${
+    t.accounts.map((a) => `<tr><td class="num">${a.index}</td><td class="mono">${esc(a.address)}</td><td>${esc(a.name || "")}${a.index === 0 ? " (fee payer)" : ""}</td></tr>`).join("")}</tbody></table></details>`;
+  const L = t.logs;
+  html += `<h4>Logs (${num(L.shown_lines)} of ${num(L.total_lines)} lines)</h4><details><summary>show</summary>${
+    L.groups.map((g) => `<div class="ix" style="margin-left:${(g.depth - 1) * 14}px"><div class="ix-head"><b>${esc(short(g.program_id, 6))}</b> ${tag(g.outcome)}<span class="cu">${g.compute_units_consumed != null ? num(g.compute_units_consumed) + " CU" : ""}</span></div><pre>${esc(g.lines.join("\n"))}</pre></div>`).join("")}
+    ${L.ungrouped.length ? `<pre>${esc(L.ungrouped.join("\n"))}</pre>` : ""}</details>`;
+  const d = t.duplicates, dropped = d.transaction_rows + d.slot_rows + d.instruction_rows + d.token_transfer_rows;
+  return html + `<div class="progress">as of slot ${num(r.as_of_slot)} · ${num(r.queries_run)} queries · ${num(r.duration_ms)} ms${dropped ? ` · ${dropped} repeated rows dropped` : ""}${t.other_slots.length ? ` · also in slots ${t.other_slots.join(", ")}` : ""}</div>`;
+}
+
+function renderSlot(r) {
+  const b = r.block;
+  let html = `<h3>Slot ${num(r.slot)}</h3>`;
+  if (!r.found) return html + `<div class="notice warn" data-state="not-found">No row for slot ${num(r.slot)}: it was skipped, or PRISM has not ingested it.</div>` + warnList(r.warnings);
+  html += kv([
+    ["time", when(b.block_time)], ["blockhash", `<span class="mono">${esc(b.blockhash)}</span>`],
+    ["parent", slotLink(b.parent_slot)], ["height", num(b.block_height)],
+    ["leader", b.leader ? addr(b.leader, b.leader_name) : "unknown"],
+    ["transactions", `${num(r.counts.transactions)} (${num(r.counts.failed_transactions)} failed)`],
+  ]) + warnList(r.warnings);
+  html += `<h4>Transactions${r.page.after_index != null ? ` after index ${r.page.after_index}` : ""}</h4>` + (r.transactions.length
+    ? `<table><thead><tr><th class="num">index</th><th>signature</th><th>status</th><th class="num">fee</th><th class="num">CU</th></tr></thead><tbody>${
+      r.transactions.map((t) => `<tr><td class="num">${t.transaction_index}</td><td class="mono">${linkify("tx_signature", "tx_signature", t.signature, r.slot)}</td><td>${tag(t.status)}</td><td class="num">${num(t.fee_lamports)}</td><td class="num">${num(t.compute_units_consumed)}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="empty">no transactions</div>`);
+  if (r.page.has_more) html += `<div class="meta" style="margin-top:6px"><a class="lnk" href="#/slot/${r.slot}?after=${r.page.next_after_index}">next page ›</a></div>`;
+  return html + `<div class="progress">as of slot ${num(r.as_of_slot)} · ${num(r.queries_run)} queries · ${num(r.duration_ms)} ms</div>`;
+}
+
+// A mint, program or token account profile, rendered from its JSON: scalars and
+// objects as key-value blocks, lists of objects as tables. A few fields are known
+// to hold something that opens (PROFILE_HINTS, "section.field").
+const PROFILE_HINTS = {
+  "summary.mint": "mint", "summary.first_seen_slot": "slot", "summary.last_seen_slot": "slot",
+  "window.from_slot": "slot", "window.to_slot": "slot", "as_of_slot": "slot",
+  "series.from_slot": "slot", "series.to_slot": "slot",
+  "top_sources.key": "token_account", "top_destinations.key": "token_account", "top_counterparties.key": "token_account",
+};
+const PROFILE_SKIP = new Set(["kind", "id", "found", "warnings", "queries_run", "duration_ms"]);
+const label = (k) => k.replace(/_/g, " ");
+const fmtValue = (v) => v === null || v === undefined ? "–" : typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(4)) : typeof v === "boolean" ? String(v) : esc(v);
+function profileValue(path, v) {
+  const hint = PROFILE_HINTS[path];
+  if (hint) return linkify(path, hint, v, null);
+  if (Array.isArray(v)) return profileList(path, v);
+  if (v && typeof v === "object") return kv(Object.entries(v).map(([k, x]) => [label(k), profileValue(`${path}.${k}`, x)]));
+  return fmtValue(v);
+}
+function profileList(path, items) {
+  if (!items.length) return `<div class="empty">none</div>`;
+  if (!items.every((x) => x && typeof x === "object" && !Array.isArray(x))) return items.map((x) => `<div>${fmtValue(x)}</div>`).join("");
+  const cols = [...new Set(items.flatMap((x) => Object.keys(x)))];
+  return `<table data-list="${esc(path)}"><thead><tr>${cols.map((c) => `<th>${esc(label(c))}</th>`).join("")}</tr></thead><tbody>${
+    items.map((x) => `<tr>${cols.map((c) => { const v = x[c]; const html = profileValue(`${path}.${c}`, v);
+      return `<td class="${typeof v === "number" ? "num" : "mono"}">${v === null && c === "key" ? "(undecoded)" : html}</td>`; }).join("")}</tr>`).join("")}</tbody></table>`;
+}
+function renderProfile(p, route) {
+  let html = `<h3>${esc(label(route.kind))} <span class="mono">${esc(p.id)}</span></h3>`;
+  if (!p.found) html += `<div class="notice warn" data-state="not-found">No successful activity in slots ${num(p.window?.from_slot)}–${num(p.window?.to_slot)} (as of slot ${num(p.as_of_slot)}).</div>`;
+  // The rows behind it: its transfers or instructions, each a transaction link.
+  const behind = { mint: ["transfer_count", "mint", "recent transfers ›"], program: ["ix_count", "program", "recent instructions ›"] }[route.kind];
+  if (behind && p.found) {
+    const spec = { measures: [behind[0]], filters: [{ dimension: behind[1], op: "eq", values: [p.id] }],
+      window: { from_slot: p.window.from_slot, to_slot: p.window.to_slot }, as_of_slot: p.as_of_slot };
+    html += `<div style="margin:6px 0"><a class="lnk" data-entity="rows" href="${esc(rowsHref(spec, {}, `${route.kind} ${short(p.id, 4)}`))}">${behind[2]}</a></div>`;
+  }
+  const entries = Object.entries(p).filter(([k]) => !PROFILE_SKIP.has(k));
+  const scalars = entries.filter(([, v]) => v === null || typeof v !== "object");
+  html += kv(scalars.map(([k, v]) => [label(k), profileValue(k, v)]));
+  for (const [k, v] of entries.filter(([, v]) => v !== null && typeof v === "object")) {
+    html += `<h4>${esc(label(k))}</h4>` + profileValue(k, v);
+  }
+  return html + warnList(p.warnings) + `<div class="progress">${num(p.queries_run)} queries · ${num(p.duration_ms)} ms</div>`;
+}
+
+function renderRows(r, route) {
+  return `<h3>Rows behind: ${esc(route.label || "the answer")}</h3>
+    <div class="meta">${esc(r.table)} · slots ${num(r.window.from_slot)}–${num(r.window.to_slot)} · as of slot ${num(r.as_of_slot)} · newest first · open a ${r.detail === "slot" ? "slot" : "signature"} for the full report</div>` +
+    rowsTable(r) +
+    (r.has_more ? `<div class="warnings">showing the newest ${num(r.limit)} rows; more exist</div>` : "") +
+    `<details><summary>SQL</summary><pre>${esc(r.sql)}</pre></details><div class="progress">${num(r.queries_run)} queries · ${num(r.duration_ms)} ms</div>`;
+}
+
+const RENDER = { tx: renderTx, slot: renderSlot, profile: renderProfile, rows: renderRows };
 
 // ---- COMMONS --------------------------------------------------------------
 $("verify-btn").addEventListener("click", async () => {
@@ -710,6 +1133,7 @@ $("verify-btn").addEventListener("click", async () => {
 setInterval(() => { renderPrism(); }, 5000);
 connect();
 loadQuality(false);
+route(false);
 </script>
 </body>
 </html>
